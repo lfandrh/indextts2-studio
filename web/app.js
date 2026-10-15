@@ -736,8 +736,8 @@ async function updateSegments() {
       idx.textContent = s.index;
       const text = document.createElement("span");
       text.className = "seg-text";
-      // 后端返回 BPE 分词文本（▁ = 空格），展示时还原为正常空格便于阅读
-      text.textContent = s.text.replace(/▁/g, " ");
+      // 后端已把 BPE 词元反解码成可读文本（且是真正会被念出来的规范化文本）
+      text.textContent = s.text;
       const tok = document.createElement("span");
       tok.className = "seg-tok";
       tok.textContent = `${s.tokens} tok`;
@@ -748,10 +748,12 @@ async function updateSegments() {
     const totalTok = segs.reduce((a, s) => a + s.tokens, 0);
     $("segInfo").textContent = `分句 ${segs.length} 段 · ${totalTok} tok`;
     // 耗时预估：每段固定开销 + 每 token 线性项（按本机 RTX 3060 Ti 默认配置标定，
-    // 粗略值只为给长文本用户一个心理预期，不是精确基准）
+    // 粗略值只为给长文本用户一个心理预期，不是精确基准）。
+    // 注意不含【首次模型加载】（实测冷启动约 30~60 秒），也不含排队等待。
     const estSec = Math.round(segs.length * 4 + totalTok * 0.06);
     const est = estSec >= 60 ? `约 ${Math.round(estSec / 60)} 分钟` : `约 ${estSec} 秒`;
-    $("estDurEcho").textContent = `共 ${segs.length} 段 · ${$("text").value.trim().length} 字 · 预估 ${est}`;
+    $("estDurEcho").textContent =
+      `共 ${segs.length} 段 · ${$("text").value.trim().length} 字 · 预估 ${est}（不含首次加载模型）`;
     if (segs.length > 10) {
       $("estDurEcho").textContent += "（长文本，建议分段生成）";
     }

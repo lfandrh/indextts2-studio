@@ -1480,9 +1480,26 @@ def segments_preview(text: str = Form(""), max_text_tokens_per_segment: int = Fo
     tts._ensure_light()
     tokens = tts.tokenizer.tokenize(text)
     segs = tts.tokenizer.split_segments(tokens, max_text_tokens_per_segment=max_text_tokens_per_segment)
+
+    def _readable(seg):
+        """把 BPE 词元还原成可读文本。
+
+        直接 "".join(seg) 出来的是词元序列（"这 是 一 段 用 于 验 证"），
+        用户看不出这一段到底是什么内容。decode 回原文后可读性完全不同。
+
+        注意这是【规范化之后】的文本，也就是真正会被念出来的内容：数字
+        会变成中文读法、英文单词会变成 tn 库的占位符（<sent_0>/<num_0>），
+        那说明该处被特殊处理过，不是 bug。
+        """
+        try:
+            return tts.tokenizer.decode(tts.tokenizer.convert_tokens_to_ids(seg))
+        except Exception as e:                       # 兜底：绝不让预览挂掉
+            logger.warning("segment decode failed, falling back to raw tokens: %s", e)
+            return "".join(seg).replace("▁", " ")
+
     return JSONResponse({
         "segments": [
-            {"index": i, "text": "".join(s), "tokens": len(s)}
+            {"index": i, "text": _readable(s), "tokens": len(s)}
             for i, s in enumerate(segs)
         ]
     })
