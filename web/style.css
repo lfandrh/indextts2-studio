@@ -102,7 +102,9 @@ header {
 
 /* ---------- two-column layout ---------- */
 main {
-  width: 100%; max-width: 1440px; margin: 0 auto; padding: var(--gap) 24px 48px;
+  /* 1440 -> 1680：三栏的固定部分是 左栏最小 520 + 历史栏 268 + 间距 32 = 820，
+     1440 的上限会让中间栏最多只能到 484px，2560 屏上白白浪费一半屏幕。 */
+  width: 100%; max-width: 1680px; margin: 0 auto; padding: var(--gap) 24px 48px;
   display: grid; grid-template-columns: minmax(360px, 470px) minmax(0, 1fr);
   gap: var(--gap); align-items: stretch; flex: 1;
 }
@@ -746,7 +748,12 @@ main#pages { display: block; }
   #tabs { order: 4; margin-left: auto; }
   #themeBtn { order: 5; }
 }
-@media (max-width: 1100px) {
+/* 单列回退点：1100 -> 1240。
+   三栏的固定部分最少要 520(左) + 268(右) + 32(间距) = 820，中间栏拿剩下的。
+   实测：1101px 时中间栏只剩 145px，播放按钮/波形/操作按钮/编辑滑块
+   全被压扁（标题与按钮文字折行、文件名折成 4 行）。断点应该设在
+   「三栏刚好够用」的位置，而不是「单列还塞得下」的位置。 */
+@media (max-width: 1240px) {
   .page[data-page="gen"].cur,
   .page[data-page="gen"].cur.hist-collapsed { grid-template-columns: minmax(0, 1fr); }
   .resultcard { min-height: 300px; }
@@ -755,6 +762,13 @@ main#pages { display: block; }
   .histbar.collapsed .hb-body { display: flex; }
   .histbar.collapsed .hb-rail { display: none; }
   .hb-list { max-height: 260px; }
+}
+/* 宽屏档：1680 的上限下，中间栏已能给到 660px；再放宽两侧固定档，
+   免得 1920/2560 屏上把富余空间全浪费在留白里。 */
+@media (min-width: 1600px) {
+  .page[data-page="gen"].cur {
+    grid-template-columns: minmax(560px, 620px) minmax(0, 1fr) 300px;
+  }
 }
 @media (max-width: 768px) {
   :root { --pad: 16px; --gap: 12px; }
