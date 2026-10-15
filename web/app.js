@@ -628,6 +628,12 @@ function setSpkFile(f, persist = true) {
       spkBuffer = buf;
       spkPlaying = false; spkSeekFrac = 0;
       $("spkTime").textContent = `0.00s / ${spkBuffer.duration.toFixed(2)}s`;
+      // 参考音频超过 15 秒时，服务端只取前 15 秒做音色克隆（infer_v2 的
+      // _load_and_cut_audio 硬截断），超出部分白传。这里明确提示，免得用户
+      // 以为整段都用了，或把音色偏归咎于 bug。正常长度则恢复默认提示。
+      $("spkSub").textContent = spkBuffer.duration > 15
+        ? `音频 ${spkBuffer.duration.toFixed(0)} 秒，只会用前 15 秒做音色克隆；建议先截出目标音色段再上传`
+        : "约 3~10 秒参考音频效果最好";
       spkTick();
     }).catch(() => {
       resetSpkSelection();
