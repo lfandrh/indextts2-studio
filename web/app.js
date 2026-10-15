@@ -720,7 +720,9 @@ $("segTokens").addEventListener("input", scheduleSegments);
 /* ---------------- segments preview (collapsible, capped scroll) ---------------- */
 const segList = $("segList");
 let segTimer = null;
+let segSeq = 0;          // 请求序号：防止慢的旧请求后到、覆盖新内容
 async function updateSegments() {
+  const mine = ++segSeq;
   const text = $("text").value;
   if (!text.trim()) {
     segList.replaceChildren();
@@ -734,6 +736,11 @@ async function updateSegments() {
   try {
     const r = await fetch(`${API}/segments`, { method: "POST", body: fd });
     const j = await r.json();
+    // 期间用户又改过文本、发出了更新的请求：丢掉这次结果，否则慢的旧请求
+    // 后到会把新内容盖回旧内容。实测：服务刚启动时第一个 /segments 要走
+    // _ensure_light 加载分词器（几秒），第二个请求几十毫秒就回来了——
+    // 老的慢请求后到，预览就变回第一次输入的内容。
+    if (mine !== segSeq) return;
     const segs = j.segments || [];
     if (!segs.length) { segList.replaceChildren(); return; }
     const rows = segs.map((s) => {

@@ -1624,20 +1624,30 @@ def segments_preview(text: str = Form(""), max_text_tokens_per_segment: int = Fo
     segs = tts.tokenizer.split_segments(tokens, max_text_tokens_per_segment=max_text_tokens_per_segment)
 
     def _readable(seg):
-        """把 BPE 词元还原成可读文本。
+        """把 BPE 词元拼回可读文本。
 
-        直接 "".join(seg) 出来的是词元序列（"这 是 一 段 用 于 验 证"），
-        用户看不出这一段到底是什么内容。decode 回原文后可读性完全不同。
+        词元序列本身就是【规范化之后】的文本（也就是真正会被念出来的内容），
+        只是被 BPE 切碎、每个词元用 ▁ 标记词首。所以直接拼起来、去掉 ▁ 就行。
 
-        注意这是【规范化之后】的文本，也就是真正会被念出来的内容：数字
-        会变成中文读法、英文单词会变成 tn 库的占位符（<sent_0>/<num_0>），
-        那说明该处被特殊处理过，不是 bug。
+        这里刻意【不】用 tokenizer.decode()：它会走 indextts/utils/common.py 的
+        de_tokenized_by_CJK_char，那函数先��英文词替换成 <sent_N> 占位符再还原，
+        还原的条件是 `if len(all_matches) > 1`——单个英文词只产生 1 个占位符，
+        于是永远还原不回来。实测后果（改用 decode 时的数据）：
+
+            这里有 English 这个单词。 -> 这里有<sent_0>这个单词.
+            Hello world, this is a test. -> <sent_0>,<sent_1>.   信息全丢
+            test@example.com -> test<sent_2>?example.com        内容还被改坏
+
+        纯中文 / 纯数字场景下 decode 的输出与直接拼词元完全一致，所以换成直接拼
+        没有任何损失，英文场景则是从「看不见」变成「看得见」。
+
+        不用 sp_model.Decode 也不行：它会给汉字之间也插空格（"这 是 一 段"），
+        等于退回更早的碎片显示。
+
+        decode() 本身在 indextts/infer_v2.py:886 解析 Qwen 情绪 JSON 时被真实
+        用到，那个上游函数的还原判断不该为了预览去动。
         """
-        try:
-            return tts.tokenizer.decode(tts.tokenizer.convert_tokens_to_ids(seg))
-        except Exception as e:                       # 兜底：绝不让预览挂掉
-            logger.warning("segment decode failed, falling back to raw tokens: %s", e)
-            return "".join(seg).replace("▁", " ")
+        return "".join(seg).replace("▁", "")
 
     return JSONResponse({
         "segments": [
