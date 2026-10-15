@@ -981,6 +981,7 @@ def do_tts(
     num_beams: int = Form(3),
     repetition_penalty: float = Form(10.0),
     max_mel_tokens: int = Form(1500),
+    interval_silence: int = Form(200),      # 段间停顿（毫秒）
     file_naming: str = Form("title_time"),   # title_time / title / default
 ):
     if file_naming not in ("title_time", "title", "default"):
@@ -999,6 +1000,14 @@ def do_tts(
             f"文本过长（{len(text)} 字，上限 {TEXT_CHARS_HARD} 字）。"
             "这个上限只是防止误粘贴卡死服务；正常长文请分几次生成。",
         )
+    # 段间停顿。infer_v2 原本把它写死成 200ms，这里放开给调用方。
+    # 下限 10 而不是 0：完全不留停顿时多段文本会连成一串，听起来像漏气。
+    # 上限 500：再大就不是「停顿」而是「朗读课文」了，超出请分段生成。
+    try:
+        interval_silence = int(interval_silence)
+    except (TypeError, ValueError):
+        interval_silence = 200
+    interval_silence = max(10, min(500, interval_silence))
     text_warn = None
     if len(text) > TEXT_CHARS_SOFT:
         # 只警告不拦。段数估算按中文约 1.31 token/字、默认每段 120 token
@@ -1224,6 +1233,7 @@ def do_tts(
                 num_beams=num_beams,
                 repetition_penalty=repetition_penalty,
                 max_mel_tokens=max_mel_tokens,
+                interval_silence=interval_silence,
             )
             if result is None or not os.path.exists(out_path):
                 record_event({"type": "error", "detail": "Inference produced no output"})

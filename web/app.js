@@ -211,6 +211,7 @@ function saveDraft() {
     repPen: $("repPen").value,
     maxMel: $("maxMel").value,
     segTokens: $("segTokens").value,
+    gapMs: $("gapMs").value,
     emoVector: vec,
     savedAt: Date.now(),
   };
@@ -236,6 +237,7 @@ function applyDraft(draft) {
   if (draft.repPen != null) $("repPen").value = draft.repPen;
   if (draft.maxMel != null) $("maxMel").value = draft.maxMel;
   if (draft.segTokens != null) $("segTokens").value = draft.segTokens;
+  if (draft.gapMs != null) $("gapMs").value = draft.gapMs;
   if (Array.isArray(draft.emoVector)) setVecInputs(draft.emoVector);
   $("charCount").textContent = `${$("text").value.trim().length} 字`;
   bindSliders();
@@ -691,7 +693,7 @@ const SLIDERS = [
   { id: "maxMel", out: "maxMelOut", dec: 0 },
   { id: "segTokens", out: "segTokensOut", dec: 0 },
 ];
-const DEFAULTS = { emoWeight: 0.65, temperature: 0.8, topP: 0.8, topK: 30, numBeams: 3, maxMel: 1500, segTokens: 120, repPen: 10, lenPen: 0, doSample: true };
+const DEFAULTS = { emoWeight: 0.65, temperature: 0.8, topP: 0.8, topK: 30, numBeams: 3, maxMel: 1500, segTokens: 120, repPen: 10, lenPen: 0, gapMs: 200, doSample: true };
 
 function sliderFill(el) {
   const min = +el.min, max = +el.max, v = +el.value;
@@ -1060,6 +1062,9 @@ genBtn.addEventListener("click", async () => {
   fd.append("num_beams", $("numBeams").value);
   fd.append("repetition_penalty", $("repPen").value);
   fd.append("max_mel_tokens", $("maxMel").value);
+  // 段间停顿（毫秒）。只随本次生成走，不进预设——它是「这次怎么念」的偏好，
+  // 存进预设会让同一份音色参数因预设不同而发出不同的声音，没道理。
+  fd.append("interval_silence", $("gapMs").value);
   fd.append("file_naming", "title_time");
 
   try {

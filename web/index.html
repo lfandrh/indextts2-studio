@@ -137,8 +137,9 @@
       <div class="grid-num">
         <div><label for="repPen">重复惩罚 <span>repetition_penalty</span></label><input type="number" id="repPen" min="0.1" max="20" step="0.1" value="10"></div>
         <div><label for="lenPen">长度惩罚 <span>length_penalty</span></label><input type="number" id="lenPen" min="-2" max="2" step="0.1" value="0"></div>
+        <div><label for="gapMs">段间停顿 <span>interval_silence</span></label><input type="number" id="gapMs" min="10" max="500" step="10" value="200"></div>
       </div>
-      <div class="slider"><label for="segTokens">分句最大 Token <span>max_text_tokens_per_segment</span></label><div class="srow"><input type="range" id="segTokens" min="20" max="600" step="2" value="120"><output id="segTokensOut">120</output></div></div>
+      <div class="hint-line">段间停顿只在文本被切成多段时生效（单段无效）；每多一段就多一个这样的停顿。</div>
       <button class="linkbtn" id="resetParams" type="button">恢复推荐默认值</button>
     </details>
 
