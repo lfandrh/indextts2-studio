@@ -407,8 +407,22 @@ def _clean_legacy_prompts():
 _clean_legacy_prompts()
 
 
-# 输入硬上限（超限直接 4xx 拒绝，避免超长文本把 GPU 任务拖到分钟级才静默截断）
-MAX_TEXT_CHARS = 2000     # /tts 合成文本；长文本应分段生成
+# 文本长度：软提示 + 硬上限
+#
+# TEXT_CHARS_SOFT = 2000 是应用层的经验值，没有任何模型依据
+# （模型侧的真实约束是单段 600 token，由 SEG_TOKENS_MAX 管，见下）。
+# 它原本是硬拒绝，但实测发现拦不住真正想用的人，只会把长文本需求逼到别处去，
+# 所以改成软提示：超过只回一个 warn 字段让前端显示警告照常生成。
+#
+# TEXT_CHARS_HARD = 10000 是防跑飞的兜底。手滑粘贴几十万字会切出上千段、
+# 攒几百 MB 内存、并把 GPU 锁死几十分钟，这一档必须拒。
+#
+# 提示里必须说清的三件事（否则用户按下生成才发现）：
+#   1. 会切成多少段——决定推理耗时（串行，每段都要完整跑 GPT+s2mel+声码器）
+#   2. 期间 GPU 被占，其他生成请求全部排队
+#   3. 页面关闭/刷新不会中断任务（job 在服务端继续跑）
+TEXT_CHARS_SOFT = 2000
+TEXT_CHARS_HARD = 10000
 MAX_EMO_TEXT_CHARS = 500  # 情感描述文本（送 Qwen 做情感分析）
 
 # 每段 token 上限的合法区间。与 web/index.html 的 #segTokens 滑块
@@ -881,10 +895,24 @@ def do_tts(
     # 前端已经拦了一道，这里是给 API 调用方的第二道。
     if not text.strip():
         raise HTTPException(400, "文本为空或只含空白字符，请输入要合成的文本")
-    if len(text) > MAX_TEXT_CHARS:
+    if len(text) > TEXT_CHARS_HARD:
         raise HTTPException(
             413,
-            f"文本过长（{len(text)} 字，上限 {MAX_TEXT_CHARS} 字）；请分段生成",
+            f"文本过长（{len(text)} 字，上限 {TEXT_CHARS_HARD} 字）。"
+            "这个上限只是防止误粘贴卡死服务；正常长文请分几次生成。",
+        )
+    text_warn = None
+    if len(text) > TEXT_CHARS_SOFT:
+        # 只警告不拦。段数估算按中文约 1.31 token/字、默认每段 120 token
+        # 折算（实测 2000 字 -> 2628 token -> 28 段）。这里只给量级，
+        # 前端有更准的分段预览可看。
+        est_tokens = int(len(text) * 1.31)
+        est_segs = max(1, est_tokens // max(1, max_text_tokens_per_segment))
+        est_min = round(est_segs * 8 / 60)          # 每段约 8s 的保守估计
+        text_warn = (
+            f"文本较长（{len(text)} 字，约切 {est_segs} 段，预计 {est_min} 分钟以上）。"
+            "生成期间会独占 GPU，其他任务需排队；"
+            "关闭或刷新页面不会中断，服务端会继续跑完。"
         )
     if emo_text and len(emo_text) > MAX_EMO_TEXT_CHARS:
         raise HTTPException(
@@ -999,6 +1027,10 @@ def do_tts(
     def run_infer():
         try:
             record_event({"type": "started", "job_id": job_id})
+            if text_warn:
+                # 软提示：文本过长。不拦，照常生成，但把「会等多久、
+                # 期间不能干别的、刷新页面不会中断」讲清楚。
+                record_event({"type": "warn", "detail": text_warn})
             if not tts.loaded:
                 record_event({"type": "load", "value": 0.0, "desc": "model loading..."})
             if jobs_ahead > 0:
@@ -1438,10 +1470,11 @@ def segments_preview(text: str = Form(""), max_text_tokens_per_segment: int = Fo
     text = text.strip()
     if not text:
         return JSONResponse({"segments": []})
-    if len(text) > MAX_TEXT_CHARS:
+    if len(text) > TEXT_CHARS_HARD:
         raise HTTPException(
             413,
-            f"文本过长（{len(text)} 字，上限 {MAX_TEXT_CHARS} 字）；请分段生成",
+            f"文本过长（{len(text)} 字，上限 {TEXT_CHARS_HARD} 字）。"
+            "这个上限只是防止误粘贴卡死服务；正常长文请分几次生成。",
         )
     max_text_tokens_per_segment = _clamp_seg_tokens(max_text_tokens_per_segment)
     tts._ensure_light()

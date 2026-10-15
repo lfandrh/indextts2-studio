@@ -8,8 +8,11 @@ const $ = (id) => document.getElementById(id);
    音频/静态资源（/audio、/assets）不带前缀。 */
 const API = "/api/v1";
 
-/* 合成文本字数上限：与后端 MAX_TEXT_CHARS 同口径（textarea maxlength 已同步硬限） */
-const MAX_TEXT_CHARS = 2000;
+/* 文本字数：软阈值 + 硬上限，与后端 server.py 同口径
+   - TEXT_CHARS_SOFT 只做提示，超过照常生成
+   - TEXT_CHARS_HARD 之后 textarea 会被 maxlength 挡住，服务端也会 400 */
+const TEXT_CHARS_SOFT = 2000;
+const TEXT_CHARS_HARD = 10000;
 
 /* fetch 封装：自动拼 API 前缀 + 统一错误信息提取 */
 async function apiFetch(path, opts) {
@@ -762,9 +765,14 @@ $("text").addEventListener("input", () => {
   const len = $("text").value.trim().length;
   const cc = $("charCount");
   cc.textContent = `${len} 字`;
-  // 接近/到达上限时计数标红（textarea 已加 maxlength=2000 硬限；此处提示分段生成）
-  cc.classList.toggle("warn", len >= MAX_TEXT_CHARS);
-  if (len >= MAX_TEXT_CHARS) cc.textContent += "（已达上限，请分段生成）";
+  // 软上限提示：超过 TEXT_CHARS_SOFT 只是提醒，不再拦着不让生成
+  // （后端 /tts 只在 TEXT_CHARS_HARD=10000 处才拒）
+  cc.classList.toggle("warn", len > TEXT_CHARS_SOFT);
+  if (len > TEXT_CHARS_HARD) {
+    cc.textContent += `（超过 ${TEXT_CHARS_HARD} 字上限，服务端会拒绝）`;
+  } else if (len > TEXT_CHARS_SOFT) {
+    cc.textContent += "（文本较长，生成会很慢，期间无法生成其他内容）";
+  }
   scheduleSegments();
   scheduleDraftSave();
 });
@@ -1093,6 +1101,10 @@ genBtn.addEventListener("click", async () => {
           pollStatus();
         } else if (ev.type === "error") {
           throw new Error(ev.detail || "生成失败");
+        } else if (ev.type === "warn") {
+          // 软提示：文本过长。不中断生成，只把「等多久/期间不能干别的/
+          // 刷新不中断」讲清楚，免得用户按下按钮才知道要等半小时。
+          showActionHint(ev.detail || "文本较长，生成会很慢");
         } else if (ev.type === "stopping") {
           curJobState = "stopping";
           updateCancelUi();
