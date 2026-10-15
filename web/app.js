@@ -813,7 +813,7 @@ function updateGenSummary() {
   $(id).addEventListener("input", updateGenSummary);
   $(id).addEventListener("change", updateGenSummary);
 });
-["emoText", "emoRandom", "doSample", "topP", "topK", "temperature", "lenPen", "numBeams", "repPen", "maxMel", "segTokens", "emoWeight"].forEach((id) => {
+["emoText", "emoRandom", "doSample", "topP", "topK", "temperature", "lenPen", "numBeams", "repPen", "maxMel", "segTokens", "emoWeight", "gapMs"].forEach((id) => {
   $(id).addEventListener("input", scheduleDraftSave);
   $(id).addEventListener("change", scheduleDraftSave);
 });
