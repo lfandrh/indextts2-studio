@@ -1003,10 +1003,9 @@ def do_tts(
     # 段间停顿。infer_v2 原本把它写死成 200ms，这里放开给调用方。
     # 下限 10 而不是 0：完全不留停顿时多段文本会连成一串，听起来像漏气。
     # 上限 500：再大就不是「停顿」而是「朗读课文」了，超出请分段生成。
-    try:
-        interval_silence = int(interval_silence)
-    except (TypeError, ValueError):
-        interval_silence = 200
+    # 注意：签名已是 int = Form(200)，非数字输入在进函数体前就被 FastAPI 以
+    # 422 拒绝，和其它 int 参数（max_text_tokens_per_segment 等）行为一致，
+    # 这里只需要夹一下范围，不需要再转一次。
     interval_silence = max(10, min(500, interval_silence))
     text_warn = None
     if len(text) > TEXT_CHARS_SOFT:
