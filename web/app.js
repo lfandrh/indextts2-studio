@@ -2017,42 +2017,55 @@ async function refreshModelPage() {
     mmFlashErr("无法读取模型状态: " + e);
   }
 }
-$("btnModelLoad").addEventListener("click", async () => {
-  const btn = $("btnModelLoad");
-  if (btn.disabled) return;               // 防止加载期间重复点击
-  btn.disabled = true;
+/* 模型管理这 4 个按钮统一走这里发请求。
+
+   为什么要抽出来：这些操作可能要排队等推理锁（生成语音进行中时，卸载/重启
+   都要等），实测一次生成 85.8 秒、期间点保存配置阻塞 60.76 秒。而原来
+   「卸载模型」和「保存配置」点了完全没反应——既不置灰也不改文案，用户以为
+   没点上就反复点；保存配置的「已保存 ✓」还要等响应回来才出现，那 60 秒里
+   页面看起来跟没点过一样。
+
+   所以统一成：请求发出前立刻置灰 + 换文案，状态区同步走秒表，结束后还原。
+   onDone 在按钮还原之后调用，用来放「已保存 ✓」这类收尾文案。 */
+async function withBusyBtn(btn, busyLabel, run, onDone) {
+  if (btn.disabled) return;                 // 同一按钮不重复提交
   const old = btn.textContent;
-  btn.textContent = "加载中…";
+  btn.disabled = true;
+  btn.textContent = busyLabel;
   mmFlashErr("");
-  const iv = mmElapsedTimer("加载中");     // 首次加载 30~120s，状态区实时计时
+  const iv = mmElapsedTimer(busyLabel.replace(/…$/, ""));
+  let failed = false;
   try {
+    await run();
+  } catch (e) {
+    failed = true;
+    mmFlashErr(e.message || String(e));
+  } finally {
+    clearInterval(iv);
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+  await refreshModelPage();                 // 无论成败都刷新状态位，清掉计时文案
+  if (!failed && onDone) onDone();
+}
+
+$("btnModelLoad").addEventListener("click", () => withBusyBtn(
+  $("btnModelLoad"), "加载中…", async () => {   // 首次加载 30~120s
     const r = await (await fetch(`${API}/model/load`, { method: "POST" })).json();
     if (!r.ok) throw new Error(r.error || "加载失败");
     pollStatus();
-  } catch (e) { mmFlashErr(e.message); }
-  clearInterval(iv);
-  btn.disabled = false;
-  btn.textContent = old;
-  await refreshModelPage();               // 无论成败都刷新状态位，清掉计时文案
-});
+  }));
 $("btnModelUnload").addEventListener("click", async () => {
   if (!await uiConfirm({ title: "卸载模型", body: "卸载后首次生成需重新加载（约 30~60 秒）。", okText: "卸载" })) return;
-  try {
+  await withBusyBtn($("btnModelUnload"), "卸载中…", async () => {
     const r = await (await fetch(`${API}/model/unload`, { method: "POST" })).json();
     if (!r.ok) throw new Error(r.error || "卸载失败");
-    await refreshModelPage();
     pollStatus();
-  } catch (e) { mmFlashErr(e.message); }
+  });
 });
 $("btnModelRestart").addEventListener("click", async () => {
   if (!await uiConfirm({ title: "重启模型", body: "将应用当前页面上的加速配置，期间无法生成。", okText: "重启" })) return;
-  const btn = $("btnModelRestart");
-  btn.disabled = true;
-  const old = btn.textContent;
-  btn.textContent = "重启中…";
-  mmFlashErr("");
-  const iv = mmElapsedTimer("重启中");
-  try {
+  await withBusyBtn($("btnModelRestart"), "重启中…", async () => {
     const body = {};
     for (const k of CFG_KEYS) body[k] = $(CFG_BOX[k]).checked;
     body.diffusion_steps = parseInt($("cfgSteps").value, 10);
@@ -2064,11 +2077,7 @@ $("btnModelRestart").addEventListener("click", async () => {
     })).json();
     if (!r.ok) throw new Error(r.error || "重启失败");
     pollStatus();
-  } catch (e) { mmFlashErr(e.message); }
-  clearInterval(iv);
-  btn.disabled = false;
-  btn.textContent = old;
-  await refreshModelPage();
+  });
 });
 /* 推荐配置：FP16 + S2MEL_FP16 开（几乎无损、显著提速），W2V_FP16 开（8G 卡省 ~1GB 显存），
    QWEN_FP16 开，cuDNN 自动调优关（实测负优化：BigVGAN 3.35s → 97s）；步数 25、CFG 0.7 */
@@ -2088,25 +2097,29 @@ $("btnPresetCfg").addEventListener("click", () => {
   mmFlashErr("");
 });
 
-$("btnCfgSave").addEventListener("click", async () => {
+$("btnCfgSave").addEventListener("click", () => {
   const body = {};
   for (const k of CFG_KEYS) body[k] = $(CFG_BOX[k]).checked;
   body.diffusion_steps = parseInt($("cfgSteps").value, 10);
   body.inference_cfg_rate = parseFloat($("cfgRate").value);
-  try {
-    const r = await fetch(`${API}/model/config`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const j = await r.json();
-    if (!j.ok) throw new Error(j.detail || "保存失败");
-    await refreshModelPage();
+  return withBusyBtn($("btnCfgSave"), "保存中…", async () => {
+    try {
+      const r = await fetch(`${API}/model/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.detail || "服务未返回失败原因");
+    } catch (e) {
+      throw new Error("保存配置失败: " + e.message);
+    }
     pollStatus();
+  }, () => {
     const save = $("btnCfgSave");
     save.textContent = "已保存 ✓";
     setTimeout(() => { save.textContent = "保存配置"; }, 1600);
-  } catch (e) { mmFlashErr("保存配置失败: " + e.message); }
+  });
 });
 
 /* ---------------- keyboard shortcuts ----------------

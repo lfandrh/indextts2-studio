@@ -182,6 +182,10 @@ class LazyTTS:
         self._tts = None
         self._load_lock = threading.Lock()
         self._light_lock = threading.Lock()
+        # init_kwargs 的写入锁。不与 _INFER_LOCK 混用：set_runtime 只是改
+        # 几个标量，推理在开始时读一次就没再动了（infer_v2.py 在 infer_generator
+        # 开头把它们 pop 进局部变量），没必要为它去抢 GPU 锁。
+        self._cfg_lock = threading.Lock()
         self.cfg = None
         self.glossary_path = os.path.join(model_dir, "glossary.yaml")
         self.normalizer = None
@@ -313,22 +317,33 @@ class LazyTTS:
     def set_runtime(self, **kw):
         """Apply a config dict. fp16 / s2mel_fp16 take effect on the next
         (re)build; diffusion steps, CFG rate and the cuDNN benchmark flag apply
-        live."""
-        for key, val in kw.items():
-            real = self._FLAG_MAP.get(key, key)
-            if key in ("fp16", "s2mel_fp16", "w2v_fp16", "qwen_fp16", "cudnn_benchmark"):
-                val = bool(val)
-            elif key == "diffusion_steps":
-                val = int(max(1, min(50, val)))
-            elif key == "inference_cfg_rate":
-                val = float(max(0.0, min(1.0, val)))
-            self.init_kwargs[real] = val
-        # cuDNN benchmark is a process-global torch flag: apply immediately,
-        # no model reload needed.
-        self._apply_backend_flags()
-        if self._tts is not None:
-            self._tts.diffusion_steps = int(self.init_kwargs.get("diffusion_steps", 25))
-            self._tts.inference_cfg_rate = float(self.init_kwargs.get("inference_cfg_rate", 0.7))
+        live.
+
+        不占用 _INFER_LOCK：这里只写几个标量，不碰模型实例也不碰显存。正在
+        进行的那次生成早就在 infer_generator 开头把 diffusion_steps /
+        inference_cfg_rate 读进了局部变量（infer_v2.py:557-558），本次生成不受
+        影响；下一次生成才用新值。原来包着推理锁，导致生成期间点「保存配置」
+        实测阻塞 60.76 秒（生成总耗时 85.8 秒）——纯粹的等待，零收益。
+
+        init_kwargs 的写入仍用 _cfg_lock 串起来，免得与 /model/restart 里那次
+        set_runtime 交错，出现「一半新一半旧」的组合。
+        """
+        with self._cfg_lock:
+            for key, val in kw.items():
+                real = self._FLAG_MAP.get(key, key)
+                if key in ("fp16", "s2mel_fp16", "w2v_fp16", "qwen_fp16", "cudnn_benchmark"):
+                    val = bool(val)
+                elif key == "diffusion_steps":
+                    val = int(max(1, min(50, val)))
+                elif key == "inference_cfg_rate":
+                    val = float(max(0.0, min(1.0, val)))
+                self.init_kwargs[real] = val
+            # cuDNN benchmark is a process-global torch flag: apply immediately,
+            # no model reload needed.
+            self._apply_backend_flags()
+            if self._tts is not None:
+                self._tts.diffusion_steps = int(self.init_kwargs.get("diffusion_steps", 25))
+                self._tts.inference_cfg_rate = float(self.init_kwargs.get("inference_cfg_rate", 0.7))
 
     def unload(self):
         """Drop the loaded TTS model. Only call while no inference is running."""
@@ -669,15 +684,15 @@ _MODEL_CONFIG_KEYS = frozenset({
 
 @api.post("/model/config")
 def model_config(req: dict = Body(...)):
+    """存加速配置。不排队、不等推理锁——set_runtime 只写标量，见其 docstring。"""
     unknown = [k for k in req if k not in _MODEL_CONFIG_KEYS]
     if unknown:
         raise HTTPException(400, f"Unknown config keys: {', '.join(sorted(unknown))}")
-    with _INFER_LOCK:
-        for key, val in req.items():
-            tts.set_runtime(**{key: val})
-        cfg = tts.state()
-        logger.info("Runtime config updated: steps=%s cfg_rate=%s s2mel_fp16=%s fp16=%s",
-                    cfg["diffusion_steps"], cfg["inference_cfg_rate"], cfg["s2mel_fp16"], cfg["fp16"])
+    for key, val in req.items():
+        tts.set_runtime(**{key: val})
+    cfg = tts.state()
+    logger.info("Runtime config updated: steps=%s cfg_rate=%s s2mel_fp16=%s fp16=%s",
+                cfg["diffusion_steps"], cfg["inference_cfg_rate"], cfg["s2mel_fp16"], cfg["fp16"])
     return {"ok": True, **tts.state()}
 
 
@@ -714,9 +729,9 @@ def model_restart(req: dict | None = Body(None)):
         unknown = [k for k in req if k not in _MODEL_CONFIG_KEYS]
         if unknown:
             raise HTTPException(400, f"Unknown config keys: {', '.join(sorted(unknown))}")
-        with _INFER_LOCK:
-            for key, val in req.items():
-                tts.set_runtime(**{key: val})
+        # 和 /model/config 一致：写配置不占推理锁，只有 rebuild 才需要
+        for key, val in req.items():
+            tts.set_runtime(**{key: val})
     cfg = json.dumps(tts.state(), ensure_ascii=False)
     with _INFER_LOCK:
         try:

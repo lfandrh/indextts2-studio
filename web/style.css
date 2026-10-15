@@ -347,6 +347,11 @@ textarea:focus, select:focus, input:focus {
 }
 .btn.ghost { background: transparent; color: var(--ink); border: 1px solid var(--border); font-weight: 600; }
 .btn.ghost:hover { background: var(--surface-2); }
+/* ghost 变体没有 :disabled 规则：置灰后 cursor 还是 pointer、hover 还会变底色，
+   看起来照样能点。模型管理的「加载模型 / 卸载模型」都是 ghost 按钮，请求进行中
+   置灰全靠这条撑着。 */
+.btn.ghost:disabled { opacity: .45; cursor: not-allowed; }
+.btn.ghost:disabled:hover { background: transparent; }
 .btn.ghost.danger { color: var(--danger); }
 /* 实底 danger 只服务非 ghost 变体；ghost danger 是描边样式，
    :not(.ghost) 防止这里把红底灌给 ghost（红底红字不可读） */
