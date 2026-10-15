@@ -292,7 +292,7 @@ async function restoreJob() {
               histCurId = s.result.history_id || "";
               // 恢复路径与 SSE 路径对齐:先释放按钮/计时器/波形动画,再展示结果
               stopUi();
-              await loadResult(s.result.wav, s.result.elapsed, s.result.file, { melCapped: s.result.mel_capped });
+              await loadResult(s.result.wav, s.result.elapsed, s.result.file, { melCapped: s.result.mel_capped, normalizeFallback: s.result.normalize_fallback });
               await refreshHistory();
             } else if (s.state === "cancelled") {
               showError("已取消（排队中的任务未开始生成）");
@@ -313,7 +313,7 @@ async function restoreJob() {
       histCurId = job.result.history_id || "";
       // 与 SSE done 路径一致:先释放按钮/计时器,再展示已恢复的结果
       stopUi();
-      await loadResult(job.result.wav, job.result.elapsed, job.result.file, { melCapped: job.result.mel_capped });
+      await loadResult(job.result.wav, job.result.elapsed, job.result.file, { melCapped: job.result.mel_capped, normalizeFallback: job.result.normalize_fallback });
       await refreshHistory();
     } else if (job.state === "error") {
       showError(job.error || "生成失败");
@@ -1088,7 +1088,7 @@ genBtn.addEventListener("click", async () => {
           loadingBox.hidden = true;
           stopUi();
           histCurId = ev.history_id || "";
-          await loadResult(ev.wav, ev.elapsed, ev.file, { melCapped: ev.mel_capped });
+          await loadResult(ev.wav, ev.elapsed, ev.file, { melCapped: ev.mel_capped, normalizeFallback: ev.normalize_fallback });
           await refreshHistory();
           pollStatus();
         } else if (ev.type === "error") {
@@ -1118,9 +1118,38 @@ const PAUSE2 = '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>';
 let curUrl = null;
 let curServerFile = "";       // 服务端实际保存的文件名（下载时与它保持一致）
 
+/* ---- 文本规范化退化提示：只打扰一次，之后降级成小铃铛 ----
+   后端在 wetext 内部失败时会退回原文继续跑（音频能出来，但读音可能不准）。
+   那是「无声的降级」，所以这里补一条提示。修完底层那些已知触发点之后，
+   这条提示正常使用时几乎不该出现；真出现了说明确实有不对劲，值得打断一下。
+   但也不该每次都弹——第一次完整展开，之后只留小铃铛，点击随时能展开。
+   完整记录始终在 logs/server.log 里，和界面提示次数无关。 */
+const NORM_SEEN_KEY = "tts.normalizeFallbackSeen";
+function showNormFallbackNote(lang) {
+  const el = $("normCapNote");
+  if (!el) return;
+  el.hidden = false;
+  el.title = `本次退化的语种：${lang}`;
+  let seen = false;
+  try { seen = localStorage.getItem(NORM_SEEN_KEY) === "1"; } catch (e) { /* 隐私模式 */ }
+  el.classList.toggle("quiet", seen);          // 已提示过 -> 小铃铛
+  if (!seen) {
+    try { localStorage.setItem(NORM_SEEN_KEY, "1"); } catch (e) { /* 存不下就每次都展开 */ }
+  }
+}
+function hideNormFallbackNote() { const el = $("normCapNote"); if (el) el.hidden = true; }
+(function () {
+  const el = $("normCapNote");
+  if (!el) return;
+  const mini = el.querySelector(".capnote-mini");
+  if (mini) mini.addEventListener("click", () => el.classList.remove("quiet"));
+})();
+
 async function loadResult(url, elapsed, serverFile, opts) {
-  const { melCapped = false } = opts || {};
+  const { melCapped = false, normalizeFallback = null } = opts || {};
   $("melCapNote").hidden = !melCapped;
+  if (normalizeFallback) showNormFallbackNote(normalizeFallback);
+  else hideNormFallbackNote();
   curUrl = url;
   // 下载名与服务端 outputs/ 里的实际文件一致；文本改动不再影响已生成的结果名
   curServerFile = serverFile || (url || "").split("/").pop() || "";

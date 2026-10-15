@@ -214,6 +214,13 @@
       </div>
       <div class="trim-hint">在波形上按下拖动选择要保留的片段</div>
       <div class="capnote" id="melCapNote" hidden>⚠ 文本超过单段生成长度上限，结尾被截断——请减少每段 Token（分句上限）或调高「最大 mel tokens」后重新生成</div>
+        <!-- 文本规范化退化的提示。第一次完整展开；提示过一次之后再发生就降级成
+             右上角的小铃铛，点击可随时展开——不重复打扰，但不丢信息。
+             完整记录始终在 logs/server.log 里。 -->
+        <div class="capnote capnote-soft" id="normCapNote" hidden>
+          <span class="capnote-full">⚠ 文本规范化异常，已按原文合成，部分术语读音可能不准。完整原因见 logs/server.log</span>
+          <button class="capnote-mini" type="button" aria-label="文本规范化异常，点此展开详情">⚠️</button>
+        </div>
       <div class="result-actions">
         <button class="btn ghost" id="playFromStart">从头播放</button>
         <button class="btn ghost" id="playSel">播放选中</button>

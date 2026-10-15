@@ -412,6 +412,18 @@ textarea:focus, select:focus, input:focus {
   border: 1px solid color-mix(in srgb, var(--warn) 38%, var(--border));
   color: var(--warn);
 }
+/* 规范化退化提示：第一次完整展开，之后降级成小铃铛（见 app.js 的 normCapNoteSeen） */
+.capnote-soft { align-items: flex-start; }
+.capnote-soft .capnote-full { flex: 1; min-width: 0; }
+.capnote-mini {
+  display: none; flex: none; border: 0; background: none; cursor: pointer;
+  font-size: 15px; line-height: 1; padding: 0 0 0 8px; color: var(--warn);
+}
+.capnote-soft.quiet { padding: 4px 8px; width: fit-content; margin-top: 6px; }
+.capnote-soft.quiet .capnote-full { display: none; }
+.capnote-soft.quiet .capnote-mini { display: block; }
+.capnote-mini:hover { filter: brightness(1.15); }
+.capnote-mini:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 .err {
   display: none; margin: 12px 2px; padding: 10px 13px; border-radius: 10px; font-size: 13px;
   background: color-mix(in srgb, var(--danger) 12%, var(--surface));
