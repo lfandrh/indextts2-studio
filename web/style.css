@@ -73,7 +73,9 @@ header {
   backdrop-filter: blur(10px); border-bottom: 1px solid var(--border);
 }
 .hdr-row {
-  max-width: 1440px; margin: 0 auto; padding: 8px 24px;
+  /* 与 main 的 max-width 必须一致，否则超过 1440px 的屏幕上导航栏比工作区窄，
+     两边对不齐。改 main 时记得一起改这里。 */
+  max-width: 1680px; margin: 0 auto; padding: 8px 24px;
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
 }
 /* 单行 header：波形弹性伸展吃掉中间空隙，避免大块空白堆在一处 */
@@ -590,7 +592,7 @@ textarea:focus, select:focus, input:focus {
 .hb-rail-count { font-size: 10.5px; color: var(--faint); }
 
 /* ---------- footer & a11y ---------- */
-footer { max-width: 1440px; width: 100%; margin: 0 auto; padding: 0 24px 30px; color: var(--faint); font-size: 12px; }
+footer { max-width: 1680px; width: 100%; margin: 0 auto; padding: 0 24px 30px; color: var(--faint); font-size: 12px; }
 footer a { color: var(--muted); }
 
 /* ---------- modal dialog (replaces native confirm/prompt) ---------- */
