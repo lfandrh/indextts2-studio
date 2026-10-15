@@ -36,12 +36,25 @@ def safe_preset_name(name: str) -> str:
 
     Strips surrounding whitespace, replaces filesystem-unfriendly characters
     with underscores, and prevents empty or purely-special names.
+
+    Two Windows-specific hazards, both verified against real inference and a
+    real ``mkdir``:
+
+    - Reserved device names. A preset directory is created with
+      ``outputs/presets/<name>/``, and CON / PRN / AUX / NUL / COM1-9 /
+      LPT1-9 all fail there -- ``mkdir`` raises NotADirectoryError (WinError
+      267) or FileNotFoundError, so the preset simply cannot be saved.
+    - Invisible format characters. U+202E makes Explorer display a directory
+      as a different name, and U+200B / U+FEFF create two directories that
+      look identical but are impossible to tell apart.
     """
-    name = name.strip()
+    from indextts.utils.server_helpers import escape_win_reserved, strip_invisible
+
+    name = strip_invisible(str(name or "")).strip()
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
     name = re.sub(r"\s+", "_", name)
     name = name.strip("._")
-    return name or "untitled"
+    return escape_win_reserved(name) or "untitled"
 
 
 def list_presets() -> List[str]:

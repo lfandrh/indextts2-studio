@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 
@@ -58,7 +59,7 @@ def fix_mojibake(s: str) -> str:
 
 def safe_title(text, maxlen=15):
     """Normalize arbitrary text into a filename-safe title."""
-    t = fix_mojibake(str(text or ""))
+    t = strip_invisible(fix_mojibake(str(text or "")))
     t = re.sub(r"[\r\n\t]+", " ", t)
     t = re.sub(r'[\\/:*?"<>|]+', " ", t)
     t = t.replace("\ufffd", "")                 # drop decode-failure markers
@@ -67,7 +68,49 @@ def safe_title(text, maxlen=15):
     t = t.strip(" .")
     if not t:
         return ""
-    return t[:maxlen]
+    t = t[:maxlen].strip(" .")                  # 截断后可能又露出尾点/尾空格
+    return escape_win_reserved(t) or ""
+
+
+# Windows 保留设备名 ----------------------------------------------------------
+# CON / PRN / AUX / NUL / COM1-9 / LPT1-9 即使带扩展名也仍被当成设备：
+#   outputs/NUL.wav  -> open() 写到空设备，文件根本不落盘
+#   mkdtemp()/NUL    -> FileNotFoundError
+# 实测：文本为 "LPT1" 时 output_name() 产出裸的 LPT1.wav，
+# 真实推理报 "Error opening 'outputs\\LPT1.wav': System error"，
+# 烧完整轮 GPU 算力只换来一句与模型毫无关系的报错。
+# WebUI 默认用 title_time 命名（带时间戳后缀）侥幸躲过，
+# 但 file_naming=title 是 API 的合法取值，必然踩中。
+# 预设名走的是 safe_preset_name -> 目录名，七个保留名全部 mkdir 失败。
+_WIN_RESERVED = (
+    {"con", "prn", "aux", "nul"}
+    | {"com%d" % i for i in range(1, 10)}
+    | {"lpt%d" % i for i in range(1, 10)}
+)
+
+
+def is_win_reserved(name: str) -> bool:
+    """True if *name* collides with a Windows device, ignoring extension/case."""
+    stem = str(name or "").strip().rstrip(" .").split(".")[0].strip().lower()
+    return stem in _WIN_RESERVED
+
+
+def escape_win_reserved(name: str) -> str:
+    """Prefix reserved device names with "_" so they become ordinary files."""
+    return "_" + name if is_win_reserved(name) else name
+
+
+def strip_invisible(text: str) -> str:
+    """Drop Unicode format characters (category Cf).
+
+    它们在界面上完全看不见，却会进文件名造成两种麻烦：
+      - U+202E 右到左覆盖让资源管理器把
+        "报告<U+202E>gpj.exe_20261015.wav" 显示成 "报告gpj.exe_20261015.wav"，
+        扩展名被伪装，看图和实际文件对不上；
+      - U+200B / U+FEFF / U+00AD 让 "含零宽" 和 "含零宽" 生成两个肉眼
+        完全相同的文件，肉眼根本删不掉其中之一。
+    """
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
 
 
 def unique_path(path: str) -> str:
