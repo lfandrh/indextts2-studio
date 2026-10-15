@@ -1,18 +1,52 @@
 # -*- coding: utf-8 -*-
 from functools import lru_cache
+import logging
 import os
-import traceback
 import re
 from typing import List, Union, overload
 import warnings
 from indextts.utils.common import tokenize_by_CJK_char, de_tokenized_by_CJK_char
 from sentencepiece import SentencePieceProcessor
 
+# 接进 server.py 已经配好的日志系统（logs/server.log，按天轮转）。
+# 之前这里一律用 print()，异常只落在 stdout 的黑窗口里，
+# 排查「为什么这次合成的读音不对」时看不到任何记录。
+logger = logging.getLogger("indextts.front")
+
+
+@lru_cache(maxsize=512)
+def get_term_pattern(term: str):
+    """编译术语匹配正则（模块级缓存，避免每条文本重复编译）。
+
+    边界策略：只对纯 ASCII 的单词型术语补边界断言，否则 "TTS" 会命中
+    "ATTS"。边界字符集是 ``[\\w+]`` 而不是 ``\\w``——``+`` 不是单词字符，
+    只用 ``\\w`` 的话 "C" 会命中 "C++" 里的 C（那是个运算符，不是字母）。
+    含中文等非 ASCII 字符的术语不加边界——中文没有词边界，加了会让
+    "人工智能" 匹配不到 "人工智能技术" 这类连用场景。
+
+    空词条返回 None（由调用方跳过）：术语表是用户可手写的，空 key 会让
+    这里的 term[0] 抛 IndexError，进而让整条文本规范化链崩掉。
+    """
+    if not term:
+        return None
+    pattern = re.escape(term)
+    if term.isascii():
+        if re.match(r"\w", term[0]):
+            pattern = r"(?<![\w+])" + pattern
+        if re.match(r"\w", term[-1]):
+            pattern = pattern + r"(?![\w+])"
+    return re.compile(pattern, re.IGNORECASE)
+
 
 class TextNormalizer:
     def __init__(self, enable_glossary=False):
         self.zh_normalizer = None
         self.en_normalizer = None
+        # 最近一次 normalize() 是否退化成了「按原文处理」。
+        # None = 正常；"zh"/"en" = 该语种的规范化失败过。
+        # 上层（infer_v2 -> server -> 前端）据此提示用户，
+        # 避免「读音不对但系统一声不吭」。
+        self.normalize_fallback = None
         self.char_rep_map = {
             "：": ",",
             "；": ",",
@@ -139,8 +173,10 @@ class TextNormalizer:
 
     def normalize(self, text: str) -> str:
         if not self.zh_normalizer or not self.en_normalizer:
-            print("Error, text normalizer is not initialized !!!")
-            return ""
+            logger.error("TextNormalizer is not initialized; returning raw text")
+            self.normalize_fallback = "uninitialized"
+            return text
+        self.normalize_fallback = None      # 每次调用复位
         if self.use_chinese(text):
             text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
             # 应用术语词汇表（优先级最高，在所有保护之前）
@@ -154,8 +190,13 @@ class TextNormalizer:
             try:
                 result = self.zh_normalizer.normalize(replaced_text)
             except Exception:
-                result = ""
-                print(traceback.format_exc())
+                # 绝不能返回 ""。空串会让下游 split_segments 得到空列表、
+                # 最终 torch.cat([]) 抛出 "expected a non-empty list of Tensors"
+                # —— 一句和真实原因毫无关系的误导性报错。
+                # 退回未规范化的原文：读音可能不标准，但至少能出声。
+                logger.exception("zh normalization failed; falling back to pre-normalized text")
+                self.normalize_fallback = "zh"
+                result = replaced_text
             # 恢复人名
             result = self.restore_names(result, original_name_list)
             # 恢复拼音声调
@@ -176,8 +217,12 @@ class TextNormalizer:
                 # 恢复技术术语
                 result = self.restore_tech_terms(result, tech_list)
             except Exception:
+                # 中文分支原来退回原文，英文分支却退回空串，
+                # 导致「英文偶尔还能出个东西、中文直接报错」的不对称。
+                # 两边统一退回原文。
+                logger.exception("en normalization failed; falling back to raw text")
+                self.normalize_fallback = self.normalize_fallback or "en"
                 result = text
-                print(traceback.format_exc())
             pattern = re.compile("|".join(re.escape(p) for p in self.char_rep_map.keys()))
             result = pattern.sub(lambda x: self.char_rep_map[x.group()], result)
         return result
@@ -285,22 +330,33 @@ class TextNormalizer:
         if not self.term_glossary:
             return text
 
+        # 先取快照再遍历：术语表可以被 HTTP 线程增删（服务器端已改成
+        # 复制写入，但这里是纯库代码，自己也要对快照负责），
+        # 否则遍历中途改 size 会抛 RuntimeError。
+        glossary = dict(self.term_glossary)
         # 按术语长度降序排列，避免短术语先匹配导致长术语无法匹配
         # 例如："PCIe 5.0" 应该在 "PCIe" 之前匹配
-        sorted_terms = sorted(self.term_glossary.keys(), key=len, reverse=True)
-        @lru_cache(maxsize=42)
-        def get_term_pattern(term: str):
-            return re.compile(re.escape(term), re.IGNORECASE)
+        sorted_terms = sorted(glossary.keys(), key=len, reverse=True)
         transformed_text = text
         for term in sorted_terms:
-            term_value = self.term_glossary[term]
+            term_value = glossary[term]
             if isinstance(term_value, dict):
                 replacement = term_value.get(lang, term_value.get(lang, term))
             else:
                 replacement = term_value
             # 使用正则进行大小写不敏感的替换
             pattern = get_term_pattern(term)
-            transformed_text = pattern.sub(replacement, transformed_text)
+            if pattern is None:
+                logger.warning("Skipping empty glossary term")
+                continue
+            if not isinstance(replacement, str):
+                # YAML 里写成数字/列表时的兜底，否则 re.sub 抛 TypeError
+                logger.warning("Coercing non-string reading for term %r: %r", term, replacement)
+                replacement = str(replacement)
+            # replacement 是用户填的自由文本，必须按【字面量】替换。
+            # 直接传给 sub() 会被当成正则模板：读音里含 \1 会抛
+            # re.error("invalid group reference")，整条链崩掉。
+            transformed_text = pattern.sub(lambda _m, r=replacement: r, transformed_text)
 
         return transformed_text
 
@@ -318,7 +374,7 @@ class TextNormalizer:
             })
         """
         if glossary_dict and isinstance(glossary_dict, dict):
-            self.term_glossary.update(glossary_dict)
+            self.term_glossary.update(self._clean_glossary(glossary_dict))
 
     def load_glossary_from_yaml(self, glossary_path):
         """
@@ -341,9 +397,33 @@ class TextNormalizer:
             with open(glossary_path, 'r', encoding='utf-8') as f:
                 external_glossary = yaml.safe_load(f)
                 if external_glossary and isinstance(external_glossary, dict):
-                    self.term_glossary = external_glossary
+                    self.term_glossary = self._clean_glossary(external_glossary)
                     return True
         return False
+
+    @staticmethod
+    def _clean_glossary(data):
+        """丢弃会让规范化链崩掉的词条，并返回新字典。
+
+        术语表是可以手写的 YAML，一条脏数据的后果是【每一次】合成都崩：
+          - 空 / 非字符串 key -> get_term_pattern 里 term[0] 抛 IndexError
+          - 读音不是字符串   -> re.sub 抛 TypeError（在 apply_glossary_terms 兜底）
+        这里静默跳过 + 记 warning，坏数据不应该拖垮整个服务。
+        """
+        if not isinstance(data, dict):
+            return {}
+        cleaned = {}
+        dropped = 0
+        for k, v in data.items():
+            if not isinstance(k, str) or not k.strip():
+                dropped += 1
+                logger.warning("Dropping glossary entry with invalid key: %r", k)
+                continue
+            cleaned[k] = v
+        if dropped:
+            logger.warning("Dropped %d invalid glossary entr%s",
+                           dropped, "y" if dropped == 1 else "ies")
+        return cleaned
 
     def save_glossary_to_yaml(self, glossary_path):
         """

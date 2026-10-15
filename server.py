@@ -939,6 +939,7 @@ def do_tts(
                     "elapsed": ev.get("elapsed"),
                     "history_id": ev.get("history_id"),
                     "mel_capped": ev.get("mel_capped", False),
+                    "normalize_fallback": ev.get("normalize_fallback"),
                 }
                 logger.info("TTS job %s done: file=%s elapsed=%ss mel_capped=%s",
                             job_id, ev.get("file"), ev.get("elapsed"), ev.get("mel_capped", False))
@@ -1050,6 +1051,9 @@ def do_tts(
                 entry = _history_add(wav_name, text, elapsed, mode)
                 # 触到 max_mel_tokens 上限的生成是静默截断，前端必须提示
                 mel_capped = bool(getattr(model, "mel_tokens_capped", False))
+                # 文本规范化失败并退回原文同样是无声的（读音不标准但音频出来了），
+                # 一起透给前端。None 表示一切正常。
+                normalize_fallback = getattr(model, "text_normalize_fallback", None)
                 record_event({
                     "type": "done",
                     "wav": f"{API_V1}/audio/{wav_name}",
@@ -1057,6 +1061,7 @@ def do_tts(
                     "elapsed": elapsed,
                     "history_id": entry["id"],
                     "mel_capped": mel_capped,
+                    "normalize_fallback": normalize_fallback,
                 })
         except _InferenceStop:
             record_event({"type": "stopping", "detail": "正在停止生成并重新加载模型…"})
@@ -1441,7 +1446,10 @@ def glossary_add(
     else:
         reading = {"en": reading_en}
 
-    tts.normalizer.term_glossary[term] = reading
+    # 复制写入：不要原地往 term_glossary 上加 key（见 _glossary_replace）
+    new_glossary = dict(tts.normalizer.term_glossary)
+    new_glossary[term] = reading
+    _glossary_replace(new_glossary)
     try:
         tts.normalizer.save_glossary_to_yaml(tts.glossary_path)
     except Exception as e:
@@ -1449,10 +1457,45 @@ def glossary_add(
     return JSONResponse({"glossary": _glossary_dict()})
 
 
+def _glossary_replace(new_dict):
+    """整本换掉术语表，不做原地修改。
+
+    推理线程可能正在遍历 term_glossary（front.py 的 apply_glossary_terms）。
+    原地增删会抛 RuntimeError: dictionary changed size during iteration，
+    该异常又会被 normalize() 的兜底接住，表现为「读音不对但一声不吭」。
+    重新赋值是原子操作，遍历中的线程继续用旧对象，不受影响。
+    """
+    tts.normalizer.term_glossary = new_dict
+
+
 @api.delete("/glossary")
 def glossary_clear():
     tts._ensure_light()
-    tts.normalizer.term_glossary.clear()
+    _glossary_replace({})
+    try:
+        tts.normalizer.save_glossary_to_yaml(tts.glossary_path)
+    except Exception as e:
+        raise HTTPException(500, f"保存词汇表出错: {e}")
+    return JSONResponse({"glossary": _glossary_dict()})
+
+
+@api.delete("/glossary/{term}")
+def glossary_remove(term: str):
+    """删除单条术语。
+
+    路径参数里的术语可能带空格/中文/符号（"PCIe 5.0"、"C++"），前端必须
+    encodeURIComponent 后再拼 URL，FastAPI 会自动做百分号解码。
+    """
+    tts._ensure_light()
+    term = _fix_mojibake(term).strip()
+    if not term:
+        raise HTTPException(400, "术语不能为空")
+    glossary = tts.normalizer.term_glossary
+    if not glossary or term not in glossary:
+        raise HTTPException(404, "术语不存在")
+    new_glossary = dict(glossary)
+    del new_glossary[term]
+    _glossary_replace(new_glossary)
     try:
         tts.normalizer.save_glossary_to_yaml(tts.glossary_path)
     except Exception as e:

@@ -206,6 +206,9 @@ class IndexTTS2:
 
         # 进度引用显示（可选）
         self.gr_progress = None
+        # 上一次生成是否遇到文本规范化失败并退回原文（读音可能不标准）。
+        # server 读取后随 done 事件提示前端，详见 infer_generator 中 tokenize 之后。
+        self.text_normalize_fallback = None
         # 段内各子阶段耗时占比（gpt生成/gpt前向/s2mel/bigvgan），每次生成后 EMA 自校准
         self._phase_ema = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
@@ -520,7 +523,12 @@ class IndexTTS2:
             emo_cond_emb = self.cache_emo_cond
 
         self._set_gr_progress(0.1, "text processing...")
+        # 文本规范化可能失败并退回原文（见 front.py normalize 的兜底），
+        # 那样读音会不标准。这里把结果透出去，让 server 提示用户，
+        # 免得「合成成功但读音不对」变成无声无息。
+        self.text_normalize_fallback = None
         text_tokens_list = self.tokenizer.tokenize(text)
+        self.text_normalize_fallback = getattr(self.normalizer, "normalize_fallback", None)
         segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment, quick_streaming_tokens = quick_streaming_tokens)
         segments_count = len(segments)
 
