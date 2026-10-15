@@ -144,6 +144,11 @@
 
     <details class="fold">
       <summary>术语读音 <span class="q" title="自定义个别专业术语的读音，如 IndexTTS2">?</span></summary>
+      <label class="switch gl-cascade"><input type="checkbox" id="glCascade"><span class="tk"></span>级联替换读音
+        <b class="qinfo" title="关闭（默认）：每条术语只作用于你输入的原文，读音里如果含有其它术语，不会被再次改写。
+打开：替换结果会留在文本里，后面的术语会继续改写它——适合把读音拆成多条来组合，比如「集团」读作「控股」、「控股」读作「母公司」。
+注意：替换顺序固定按术语长度从长到短，你控制不了先后。">?</b>
+      </label>
       <div class="gl-add">
         <input type="text" id="glTerm" placeholder="术语（如 IndexTTS2）">
         <input type="text" id="glZh" placeholder="中文读法">
@@ -152,11 +157,6 @@
       </div>
       <div class="gl-error" id="glError" hidden></div>
       <div class="gl-table" id="glTable"></div>
-      <label class="switch gl-cascade"><input type="checkbox" id="glCascade"><span class="tk"></span>级联替换读音
-        <b class="qinfo" title="关闭（默认）：每条术语只作用于你输入的原文，读音里如果含有其它术语，不会被再次改写。
-打开：替换结果会留在文本里，后面的术语会继续改写它——适合把读音拆成多条来组合，比如「集团」读作「控股」、「控股」读作「母公司」。
-注意：替换顺序固定按术语长度从长到短，你控制不了先后。">?</b>
-      </label>
     </details>
 
     <!-- main CTA pinned at panel bottom -->

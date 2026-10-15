@@ -320,8 +320,10 @@ textarea:focus, select:focus, input:focus {
   min-width: 0; white-space: normal; word-break: break-word; overflow-wrap: anywhere;
 }
 
-/* 级联替换读音开关：术语表下方 */
-.gl-cascade { margin: 0 12px; font-size: 12.5px; }
+/* 级联替换读音开关：放在术语面板最上面。
+   左右 12px 是这个面板的基准（.fold summary 的 padding、.gl-add、.gl-table
+   都是 12px），上边距 10px 与下面的添加行一致。 */
+.gl-cascade { margin: 10px 12px 0; font-size: 12.5px; }
 .gl-cascade .qinfo { vertical-align: baseline; }
 
 /* ---------- main CTA ---------- */
