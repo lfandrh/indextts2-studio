@@ -38,8 +38,14 @@ desktop.ini
 # Local tool scratch
 .playwright-cli/
 .workbuddy/
+.workbuddy-ai/
 # GUI smoke-test evidence (kept locally, not part of the repo)
 /gui-test-screenshots/
+
+# 一次性调试/审查脚本的临时产物（文件名可能带空格，按字面匹配）
+/_audit tmp/
+/_audit_tmp/
+/.review_tmp_names.py
 
 # Example audio files (downloaded on demand, not stored in git)
 /examples/*.wav
