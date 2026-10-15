@@ -461,6 +461,7 @@ async function pollStatus() {
     const s = await (await fetch(`${API}/status`)).json();
     renderModelPill(s);
     renderMetrics(s);
+    applyModelBusy(s);            // 2 秒一次，模型页据此置灰「加载 / 重启」
   } catch (e) {
     $("modelPill").dataset.s = "unloaded";
     $("modelPillText").textContent = "服务连接中断…";
@@ -1979,6 +1980,24 @@ for (const s of mmCfgSliders) {
   upd();
 }
 function mmFlashErr(msg) { mmErr.textContent = msg; mmErr.classList.toggle("on", !!msg); }
+/* 生成中时，模型页要能提前说出「现在动模型会打断生成」。
+   加载模型 / 重启模型会重建模型、必然打断生成，生成中一律置灰；
+   卸载模型不同——后端支持 force=1 打断后直接卸载（不重建），所以保持可点，
+   由确认框告知后果。用户已经决定要卸载了，不该被拒绝后再点一次。 */
+let mmGenerating = false;
+const mmBusyBtns = new Set();      // withBusyBtn 正在用的按钮，2 秒轮询不许改它们的 disabled
+function applyModelBusy(s) {
+  mmGenerating = !!s.generating;
+  const hint = mmGenerating
+    ? "正在生成语音，此刻加载/重启模型会打断本次生成"
+    : "";
+  for (const id of ["btnModelLoad", "btnModelRestart"]) {
+    const b = $(id);
+    if (!mmBusyBtns.has(b)) b.disabled = mmGenerating;
+    b.title = hint;
+  }
+  $("btnModelUnload").title = mmGenerating ? "将中断当前生成后卸载模型（会先确认）" : "";
+}
 /* 模型加载/重启期间的实时耗时提示，写在状态位上；返回 interval id，调用方负责 clearInterval */
 function mmElapsedTimer(label) {
   const t0 = Date.now();
@@ -1991,6 +2010,7 @@ function mmElapsedTimer(label) {
 async function refreshModelPage() {
   try {
     const s = await (await fetch(`${API}/model`)).json();
+    applyModelBusy(s);
     const phase = s.phase || (s.loaded ? "ready" : "unloaded");
     const stateNames = {
       ready: "已加载", loading: "加载中", reloading: "重载中",
@@ -2032,6 +2052,7 @@ async function withBusyBtn(btn, busyLabel, run, onDone) {
   const old = btn.textContent;
   btn.disabled = true;
   btn.textContent = busyLabel;
+  mmBusyBtns.add(btn);                      // 挡住 2 秒轮询的 applyModelBusy
   mmFlashErr("");
   const iv = mmElapsedTimer(busyLabel.replace(/…$/, ""));
   let failed = false;
@@ -2042,6 +2063,7 @@ async function withBusyBtn(btn, busyLabel, run, onDone) {
     mmFlashErr(e.message || String(e));
   } finally {
     clearInterval(iv);
+    mmBusyBtns.delete(btn);
     btn.disabled = false;
     btn.textContent = old;
   }
@@ -2052,14 +2074,31 @@ async function withBusyBtn(btn, busyLabel, run, onDone) {
 $("btnModelLoad").addEventListener("click", () => withBusyBtn(
   $("btnModelLoad"), "加载中…", async () => {   // 首次加载 30~120s
     const r = await (await fetch(`${API}/model/load`, { method: "POST" })).json();
-    if (!r.ok) throw new Error(r.error || "加载失败");
+    if (!r.ok) throw new Error(r.error || r.detail || "加载失败");
     pollStatus();
   }));
 $("btnModelUnload").addEventListener("click", async () => {
+  // 生成中：后端支持 force=1 打断后直接卸载（跳过重建），所以不拒绝，
+  // 换一句把后果说清楚的确认框。用户已经决定要卸载，不该被拒后再点一次。
+  if (mmGenerating) {
+    const ok = await uiConfirm({
+      title: "卸载会中断当前生成",
+      body: "正在生成语音。卸载会中断本次生成，已生成的部分结果将丢弃；"
+          + "下次生成需要重新加载模型（约 30~60 秒）。确定继续吗？",
+      okText: "中断并卸载", danger: true,
+    });
+    if (!ok) return;
+    await withBusyBtn($("btnModelUnload"), "停止并卸载中…", async () => {
+      const r = await (await fetch(`${API}/model/unload?force=1`, { method: "POST" })).json();
+      if (!r.ok) throw new Error(r.error || r.detail || "卸载失败");
+      pollStatus();
+    });
+    return;
+  }
   if (!await uiConfirm({ title: "卸载模型", body: "卸载后首次生成需重新加载（约 30~60 秒）。", okText: "卸载" })) return;
   await withBusyBtn($("btnModelUnload"), "卸载中…", async () => {
     const r = await (await fetch(`${API}/model/unload`, { method: "POST" })).json();
-    if (!r.ok) throw new Error(r.error || "卸载失败");
+    if (!r.ok) throw new Error(r.error || r.detail || "卸载失败");
     pollStatus();
   });
 });
@@ -2075,7 +2114,7 @@ $("btnModelRestart").addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     })).json();
-    if (!r.ok) throw new Error(r.error || "重启失败");
+    if (!r.ok) throw new Error(r.error || r.detail || "重启失败");
     pollStatus();
   });
 });

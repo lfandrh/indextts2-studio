@@ -664,14 +664,50 @@ def status():
     前端 Header 每 2s 轮询一次这里即可（此前 /model 与 /metrics 各发一次，
     多标签页叠加时请求数翻倍）。
     """
-    data = {"ok": True, **tts.state()}
+    data = {"ok": True, "generating": _INFER_LOCK.locked(), **tts.state()}
     data.update(metrics())
     return data
 
 
 @api.get("/model")
 def model_state():
-    return {"ok": True, **tts.state()}
+    # generating 让模型页在用户点之前就知道「现在动模型会被打断」，
+    # 从而把不可用的按钮置灰、并给「卸载」换上会说明后果的确认框。
+    return {"ok": True, "generating": _INFER_LOCK.locked(), **tts.state()}
+
+
+def _generation_elapsed():
+    """返回 (是否在生成, 已经跑了多少秒)。
+
+    推理锁在整个生成期间被持有（run_infer 里 acquire 之后包着整段推理），
+    所以 locked() 就是可靠信号，不用另建一份状态。秒数从任务注册表的
+    started_at 算——它在拿到锁的那一刻才打点。
+
+    只短暂持 _JOBS_LOCK 且不嵌套拿 _INFER_LOCK：推理线程的顺序恒为
+    _INFER_LOCK -> _JOBS_LOCK，这里反过来嵌套会死锁。
+    """
+    if not _INFER_LOCK.locked():
+        return False, 0.0
+    now = time.time()
+    with _JOBS_LOCK:
+        starts = [j["started_at"] for j in _JOBS.values()
+                  if j.get("started_at") and j["state"] in ("running", "stop_requested")]
+    if not starts:
+        return True, 0.0
+    return True, max(0.0, now - min(starts))
+
+
+def _reject_if_generating():
+    """加载 / 重启模型在生成期间一律拒绝，而不是让调用方静默排队。
+
+    这两个都会重建模型，跑在生成中途等于把正在用的模型换掉。前端已经把按钮
+    置灰，这里是给 API 调用方和「2 秒轮询还没刷新到」的竞态兜底。
+    卸载不走这条——它有 force=1 的正当中断路径（用户已经确认过后果了）。
+    """
+    busy, elapsed = _generation_elapsed()
+    if busy:
+        raise HTTPException(
+            409, f"正在生成语音（已进行 {int(elapsed)} 秒），请等本次生成结束后再操作模型。")
 
 
 # Keys that POST /model/config accepts. `loaded` is state, not a setting;
@@ -698,6 +734,7 @@ def model_config(req: dict = Body(...)):
 
 @api.post("/model/load")
 def model_load():
+    _reject_if_generating()
     with _INFER_LOCK:
         try:
             tts.ensure_loaded()
@@ -709,7 +746,35 @@ def model_load():
 
 
 @api.post("/model/unload")
-def model_unload():
+def model_unload(force: bool = False):
+    """Unload the model. With force=1, interrupt a running generation first.
+
+    用户在模型页明确要卸载时，不该被拒绝后再点一次——那是在替他做决定。
+    force=1 的语义是「打断当前生成也要卸」，前端会先弹确认框告知后果。
+
+    推理线程在整个生成期间持有 _INFER_LOCK，所以这里不与它抢锁：只置停止
+    标志（stop_unload 让推理线程停下后直接卸载、不重建），真正的等待发生在
+    下面的 with _INFER_LOCK 上，通常 1~3 秒。
+    """
+    stopped = False
+    if _INFER_LOCK.locked():
+        if not force:
+            _, elapsed = _generation_elapsed()
+            raise HTTPException(
+                409,
+                f"正在生成语音（已进行 {int(elapsed)} 秒）。"
+                "如需中断本次生成并卸载，请带 force=1。",
+            )
+        with _JOBS_LOCK:
+            for job in _JOBS.values():
+                if job["state"] == "running":
+                    job["stop_unload"] = True
+                    job["state"] = "stop_requested"
+                    job["stop_event"].set()
+                    stopped = True
+                    break
+        if stopped:
+            logger.info("Unload requested with force: interrupting running generation")
     with _INFER_LOCK:
         tts.unload()
     try:
@@ -719,12 +784,13 @@ def model_unload():
             torch.cuda.empty_cache()
     except Exception:
         pass
-    return {"ok": True, **tts.state()}
+    return {"ok": True, "interrupted": stopped, **tts.state()}
 
 
 @api.post("/model/restart")
 def model_restart(req: dict | None = Body(None)):
     """Apply the page config (when supplied), then rebuild the model."""
+    _reject_if_generating()
     if req:
         unknown = [k for k in req if k not in _MODEL_CONFIG_KEYS]
         if unknown:
@@ -795,6 +861,10 @@ def _register_job(client_id):
             "client_id": client_id,
             "state": "queued",
             "stop_event": threading.Event(),
+            # 停止后不要重建模型，直接卸载（见 /model/unload?force=1）。
+            # 停止本身要 rebuild 是因为半途停止会留下脏缓存；卸载是把模型整个
+            # 丢掉，脏状态自然消失，没必要先花十几秒建一个马上又要扔的。
+            "stop_unload": False,
             "created_at": time.time(),
             "started_at": None,
             "finished_at": None,
@@ -1151,23 +1221,42 @@ def do_tts(
                     "normalize_fallback": normalize_fallback,
                 })
         except _InferenceStop:
-            record_event({"type": "stopping", "detail": "正在停止生成并重新加载模型…"})
-            # Unwind the local model reference first so CUDA memory can be released.
-            model.gr_progress = prev_progress
-            model = None
-            try:
-                tts.rebuild()
-                gc.collect()
+            # 用户在模型页点「卸载模型」时会带上 stop_unload：这时不要重建，
+            # 直接卸载即可。重建是「停止」的必要收尾（清掉半途停止留下的脏
+            # 缓存），而卸载把模型整个丢掉，脏状态随之消失——先建再扔是白等
+            # 十几秒。/model/unload 拿到推理锁后还会再调一次 tts.unload()，
+            # 那次是空操作（_tts 已是 None），无害。
+            unload_only = False
+            with _JOBS_LOCK:
+                j = _JOBS.get(job_id)
+                unload_only = bool(j and j.get("stop_unload"))
+            if unload_only:
+                record_event({"type": "stopping", "detail": "正在停止生成并卸载模型…"})
+                model = None
                 try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                detail = "已停止生成，模型已重新加载"
-            except Exception as e:
-                logger.error("TTS job %s: model reload after stop failed: %s", job_id, e, exc_info=True)
-                detail = f"已停止生成，模型重新加载失败，下次生成将自动加载: {e}"
+                    tts.unload()
+                    detail = "已停止生成，模型已卸载"
+                except Exception as e:
+                    logger.error("TTS job %s: unload after stop failed: %s", job_id, e, exc_info=True)
+                    detail = f"已停止生成，卸载失败: {e}"
+            else:
+                record_event({"type": "stopping", "detail": "正在停止生成并重新加载模型…"})
+                # Unwind the local model reference first so CUDA memory can be released.
+                model.gr_progress = prev_progress
+                model = None
+                try:
+                    tts.rebuild()
+                    gc.collect()
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    detail = "已停止生成，模型已重新加载"
+                except Exception as e:
+                    logger.error("TTS job %s: model reload after stop failed: %s", job_id, e, exc_info=True)
+                    detail = f"已停止生成，模型重新加载失败，下次生成将自动加载: {e}"
             record_event({"type": "error", "detail": detail})
         except Exception as e:
             logger.error("TTS job %s inference error: %s", job_id, e, exc_info=True)
