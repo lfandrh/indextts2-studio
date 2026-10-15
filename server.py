@@ -411,6 +411,34 @@ _clean_legacy_prompts()
 MAX_TEXT_CHARS = 2000     # /tts 合成文本；长文本应分段生成
 MAX_EMO_TEXT_CHARS = 500  # 情感描述文本（送 Qwen 做情感分析）
 
+# 每段 token 上限的合法区间。与 web/index.html 的 #segTokens 滑块
+# （min=20 max=600）同口径，前端只是 UI 约束，API 必须自己把关。
+#
+# 这个值此前完全没校验，后果实测过：
+#   0  -> front.py 的 range(0, len, 0) 抛 "range() arg 3 must not be zero"
+#         -> HTTP 500，用户看到的是与输入毫无关系的 Internal Server Error
+#   -5 -> 片段列表为空 -> split_segments 返回 [] -> 推理端 torch.cat([])
+#         -> "expected a non-empty list of Tensors"，同样是指南南的报错
+#   1  -> 能跑，但每个 1-token 片段都要走完整的 GPT + s2mel + BigVGAN，
+#         一段 30 字的话能切出 38 段，是个没有底的性能悬崖
+SEG_TOKENS_MIN, SEG_TOKENS_MAX = 20, 600
+
+
+def _clamp_seg_tokens(value: int) -> int:
+    """把每段 token 上限夹到合法区间，超界给出可读的 400。"""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "每段 Token 上限必须是整数")
+    if n < SEG_TOKENS_MIN or n > SEG_TOKENS_MAX:
+        raise HTTPException(
+            400,
+            f"每段 Token 上限 {n} 超出范围（允许 {SEG_TOKENS_MIN}~{SEG_TOKENS_MAX}）；"
+            "调太小会把一句话切成大量碎片，每段都要完整跑一遍 GPT + s2mel + 声码器，"
+            "耗时反而暴涨",
+        )
+    return n
+
 
 def _validate_audio_upload(data: bytes, label: str) -> None:
     """上传校验：大小上限 + 常见音频容器的魔数嗅探，在落盘前给出可读的 4xx。
@@ -848,6 +876,11 @@ def do_tts(
     # 文本可能在到达 HTTP 之前就已乱码（见 _fix_mojibake），先还原再用于合成与命名
     text = _fix_mojibake(text)
     emo_text = _fix_mojibake(emo_text)
+    # 纯空白文本：分词后得到空片段列表，推理端 torch.cat([]) 会抛
+    # "expected a non-empty list of Tensors" —— 与真实原因无关的误导性报错。
+    # 前端已经拦了一道，这里是给 API 调用方的第二道。
+    if not text.strip():
+        raise HTTPException(400, "文本为空或只含空白字符，请输入要合成的文本")
     if len(text) > MAX_TEXT_CHARS:
         raise HTTPException(
             413,
@@ -858,6 +891,7 @@ def do_tts(
             413,
             f"情感描述文本过长（{len(emo_text)} 字，上限 {MAX_EMO_TEXT_CHARS} 字）",
         )
+    max_text_tokens_per_segment = _clamp_seg_tokens(max_text_tokens_per_segment)
     try:
         spk_data = spk_audio.file.read()
     except Exception as e:
@@ -1409,9 +1443,10 @@ def segments_preview(text: str = Form(""), max_text_tokens_per_segment: int = Fo
             413,
             f"文本过长（{len(text)} 字，上限 {MAX_TEXT_CHARS} 字）；请分段生成",
         )
+    max_text_tokens_per_segment = _clamp_seg_tokens(max_text_tokens_per_segment)
     tts._ensure_light()
     tokens = tts.tokenizer.tokenize(text)
-    segs = tts.tokenizer.split_segments(tokens, max_text_tokens_per_segment=int(max_text_tokens_per_segment))
+    segs = tts.tokenizer.split_segments(tokens, max_text_tokens_per_segment=max_text_tokens_per_segment)
     return JSONResponse({
         "segments": [
             {"index": i, "text": "".join(s), "tokens": len(s)}

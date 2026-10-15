@@ -598,7 +598,16 @@ class TextTokenizer:
     ) -> List[List[str]]:
         """
         将tokenize后的结果按特定token进一步分割
+
+        max_text_tokens_per_segment 必须是正整数：0 会让下面的
+        range(0, len, 0) 抛 "range() arg 3 must not be zero"，负数则
+        range 步长为负导致片段列表为空。上游（server.py 的 _clamp_seg_tokens）
+        已经挡住 HTTP 入口，这里是纯库调用方的兜底。
         """
+        if max_text_tokens_per_segment < 1:
+            raise ValueError(
+                "max_text_tokens_per_segment 必须 >= 1，收到 %r" % (max_text_tokens_per_segment,)
+            )
         # 处理特殊情况
         if len(tokenized_str) == 0:
             return []
