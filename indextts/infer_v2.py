@@ -87,8 +87,6 @@ class IndexTTS2:
         self.diffusion_steps = 25
         self.inference_cfg_rate = 0.7
 
-        self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path), use_fp16=self.use_qwen_fp16)
-
         self.gpt = UnifiedVoice(**self.cfg.gpt)
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
         load_checkpoint(self.gpt, self.gpt_path)
@@ -204,6 +202,11 @@ class IndexTTS2:
         self.cache_emo_audio_prompt = None
         self.cache_mel = None
 
+        # Qwen 情感模型懒加载：只在用到「情绪文本」模式（use_emo_text）时才初始化。
+        # 直接在这里加载会让每次加载主模型都白占 ~1.57GB 显存，而默认的 emoMode=1
+        # （用参考音频带情绪）根本用不到它。改由 qwen_emo 属性在首次访问时建出来。
+        self._qwen_emo = None
+
         # 进度引用显示（可选）
         self.gr_progress = None
         # 上一次生成是否遇到文本规范化失败并退回原文（读音可能不标准）。
@@ -226,6 +229,22 @@ class IndexTTS2:
         if device_type not in ("cuda", "cpu", "xpu", "mps", "mtia"):
             device_type = "cpu"
         return torch.amp.autocast(device_type=device_type, enabled=True, dtype=torch.float16)
+
+    @property
+    def qwen_emo(self):
+        """Qwen 情感模型，用到才初始化（懒加载）。
+
+        直接在 __init__ 里建会让每次加载主模型都白占 ~1.57GB 显存，而它只在
+        use_emo_text（前端 emoMode=3，情绪文本模式）时才被访问。默认的
+        emoMode=1 用参考音频带情绪，根本用不到它。首次访问才 from_pretrained
+        （多等 ~1.2s，之后正常）。
+        """
+        if self._qwen_emo is None:
+            self._qwen_emo = QwenEmotion(
+                os.path.join(self.model_dir, self.cfg.qwen_emo_path),
+                use_fp16=self.use_qwen_fp16,
+            )
+        return self._qwen_emo
 
     @torch.no_grad()
     def get_emb(self, input_features, attention_mask):
