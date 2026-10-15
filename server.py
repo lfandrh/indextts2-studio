@@ -188,6 +188,9 @@ class LazyTTS:
         self._cfg_lock = threading.Lock()
         self.cfg = None
         self.glossary_path = os.path.join(model_dir, "glossary.yaml")
+        # 级联替换开关单独存。塞进 glossary.yaml 会被当成「术语 -> 读音」，
+        # _clean_glossary 只查 key 不查 value，一个 bool 会活下来变成术语。
+        self.glossary_settings_path = os.path.join(model_dir, "glossary_settings.yaml")
         self.normalizer = None
         self.tokenizer = None
         self.model_version = None
@@ -231,6 +234,10 @@ class LazyTTS:
                     normalizer.load_glossary_from_yaml(self.glossary_path)
                 except Exception as e:
                     logger.warning("Failed to load glossary: %s", e)
+            try:
+                normalizer.load_glossary_settings(self.glossary_settings_path)
+            except Exception as e:
+                logger.warning("Failed to load glossary settings: %s", e)
             # 全部就绪后才发布，中途不暴露半成品
             self.cfg = cfg
             self.normalizer = normalizer
@@ -1662,9 +1669,17 @@ def _glossary_dict():
     return {k: v for k, v in (tts.normalizer.term_glossary or {}).items()}
 
 
+def _glossary_payload():
+    tts._ensure_light()
+    return {
+        "glossary": _glossary_dict(),
+        "cascade": bool(getattr(tts.normalizer, "cascade_glossary", False)),
+    }
+
+
 @api.get("/glossary")
 def glossary_list():
-    return JSONResponse({"glossary": _glossary_dict()})
+    return JSONResponse(_glossary_payload())
 
 
 @api.post("/glossary")
@@ -1672,6 +1687,7 @@ def glossary_add(
     term: str = Form(...),
     reading_zh: str = Form(""),
     reading_en: str = Form(""),
+    cascade: bool | None = Form(None),
 ):
     tts._ensure_light()  # 懒加载：首次请求可能是本端点，normalizer 此时还是 None
     term = _fix_mojibake(term).strip()
@@ -1693,11 +1709,9 @@ def glossary_add(
     new_glossary = dict(tts.normalizer.term_glossary)
     new_glossary[term] = reading
     _glossary_replace(new_glossary)
-    try:
-        tts.normalizer.save_glossary_to_yaml(tts.glossary_path)
-    except Exception as e:
-        raise HTTPException(500, f"保存词汇表出错: {e}")
-    return JSONResponse({"glossary": _glossary_dict()})
+    saved = _save_glossary()
+    _set_cascade(cascade, saved)
+    return JSONResponse(_glossary_payload())
 
 
 def _glossary_replace(new_dict):
@@ -1711,15 +1725,42 @@ def _glossary_replace(new_dict):
     tts.normalizer.term_glossary = new_dict
 
 
-@api.delete("/glossary")
-def glossary_clear():
-    tts._ensure_light()
-    _glossary_replace({})
+def _save_glossary():
+    """落盘术语表。出错直接 500，不吞——静默写失败会让人以为改了其实没改。"""
     try:
         tts.normalizer.save_glossary_to_yaml(tts.glossary_path)
     except Exception as e:
         raise HTTPException(500, f"保存词汇表出错: {e}")
-    return JSONResponse({"glossary": _glossary_dict()})
+
+
+def _set_cascade(cascade, saved: bool = True):
+    """设置级联替换开关。None 表示本次请求没带这个参数，保持原值不动。"""
+    if cascade is None:
+        return
+    tts.normalizer.cascade_glossary = bool(cascade)
+    try:
+        tts.normalizer.save_glossary_settings(tts.glossary_settings_path)
+    except Exception as e:
+        # 内存里已经改了但没落盘：提示用户「重启后会失效」，别默默丢掉
+        logger.warning("Failed to save glossary settings: %s", e)
+        raise HTTPException(500, f"级联开关已生效但保存失败，重启后会恢复默认: {e}")
+    logger.info("Glossary cascade replacement: %s", tts.normalizer.cascade_glossary)
+
+
+@api.post("/glossary/cascade")
+def glossary_set_cascade(cascade: bool = Form(...)):
+    """只改级联开关，不动术语表。"""
+    tts._ensure_light()
+    _set_cascade(cascade)
+    return JSONResponse(_glossary_payload())
+
+
+@api.delete("/glossary")
+def glossary_clear():
+    tts._ensure_light()
+    _glossary_replace({})
+    _save_glossary()
+    return JSONResponse(_glossary_payload())
 
 
 @api.delete("/glossary/{term}")
@@ -1739,11 +1780,8 @@ def glossary_remove(term: str):
     new_glossary = dict(glossary)
     del new_glossary[term]
     _glossary_replace(new_glossary)
-    try:
-        tts.normalizer.save_glossary_to_yaml(tts.glossary_path)
-    except Exception as e:
-        raise HTTPException(500, f"保存词汇表出错: {e}")
-    return JSONResponse({"glossary": _glossary_dict()})
+    _save_glossary()
+    return JSONResponse(_glossary_payload())
 
 
 # ---- API 挂载 -----------------------------------------------------------------
@@ -1763,6 +1801,7 @@ _legacy_json_routes = (
     ("POST", "presets/{name}/rename"), ("POST", "presets/{name}/duplicate"),
     ("GET", "examples"), ("GET", "examples/{name}"), ("POST", "segments"),
     ("GET", "glossary"), ("POST", "glossary"), ("DELETE", "glossary"),
+    ("DELETE", "glossary/{term}"), ("POST", "glossary/cascade"),
 )
 
 

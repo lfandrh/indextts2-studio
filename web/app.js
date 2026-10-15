@@ -1794,7 +1794,10 @@ document.querySelectorAll("details.fold").forEach((f) => {
 
 async function renderGlossary() {
   try {
-    const g = (await (await fetch(`${API}/glossary`)).json()).glossary || {};
+    const j = await (await fetch(`${API}/glossary`)).json();
+    const g = j.glossary || {};
+    // 级联开关跟术语表一起返回，刷新页面/别的标签页改了也能同步回来
+    $("glCascade").checked = !!j.cascade;
     const keys = Object.keys(g);
     const box = $("glTable");
     box.replaceChildren();
@@ -1841,6 +1844,27 @@ $("btnAddTerm").addEventListener("click", async () => {
 });
 ["glTerm", "glZh", "glEn"].forEach((id) => {
   $(id).addEventListener("input", clearGlossaryError);
+});
+$("glCascade").addEventListener("change", async (e) => {
+  const want = e.target.checked;
+  clearGlossaryError();
+  const fd = new FormData();
+  fd.append("cascade", want ? "true" : "false");
+  try {
+    const r = await fetch(`${API}/glossary/cascade`, { method: "POST", body: fd });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { showGlossaryError("切换失败: " + (j.detail || r.status)); await renderGlossary(); return; }
+    // 用服务端返回的值回填，别信本地 checkbox——失败时会和服务端不一致
+    e.target.checked = !!j.cascade;
+    await renderGlossary();
+    scheduleSegments();          // 替换策略变了，预览要跟着重算
+    showActionHint(want
+      ? "已开启级联替换：读音里如果含有其它术语，会被继续改写"
+      : "已关闭级联替换：每条术语只作用于你输入的原文");
+  } catch (err) {
+    showGlossaryError("切换失败: " + err);
+    await renderGlossary();
+  }
 });
 
 /* ---------------- page tabs (gen / presets / model) ---------------- */

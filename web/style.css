@@ -320,6 +320,10 @@ textarea:focus, select:focus, input:focus {
   min-width: 0; white-space: normal; word-break: break-word; overflow-wrap: anywhere;
 }
 
+/* 级联替换读音开关：术语表下方 */
+.gl-cascade { margin: 0 12px; font-size: 12.5px; }
+.gl-cascade .qinfo { vertical-align: baseline; }
+
 /* ---------- main CTA ---------- */
 .cta {
   position: sticky; bottom: 0; z-index: 3; margin-top: auto;

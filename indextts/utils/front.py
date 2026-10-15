@@ -106,6 +106,36 @@ class TextNormalizer:
         #     "CMake": "C Make",
         # }
         self.term_glossary = dict()
+        # 级联替换：关（默认）时每条术语只作用于原文，替换结果不再被后续术语改写；
+        # 开时替换结果留在文本里，后面的术语会继续改写它（见 apply_glossary_terms）。
+        # 单独存 glossary_settings.yaml，不塞进 term_glossary —— 那个 dict 会被
+        # 当成「术语 -> 读音」遍历，混进一个 bool 会被当成一条叫 x 的术语。
+        self.cascade_glossary = False
+
+    def load_glossary_settings(self, settings_path):
+        """读级联开关。文件不存在或坏掉都退回默认（关），不让它拖垮规范化。"""
+        if not settings_path or not os.path.exists(settings_path):
+            return
+        try:
+            import yaml
+            with open(settings_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            if isinstance(data, dict) and "cascade" in data:
+                self.cascade_glossary = bool(data.get("cascade"))
+        except Exception as e:
+            logger.warning("Failed to load glossary settings: %s", e)
+            self.cascade_glossary = False
+
+    def save_glossary_settings(self, settings_path):
+        """写级联开关。原子替换，避免半截文件被下次读取当成坏数据。"""
+        if not settings_path:
+            return
+        import yaml
+        tmp = settings_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            yaml.dump({"cascade": bool(self.cascade_glossary)}, f,
+                      allow_unicode=True, default_flow_style=False)
+        os.replace(tmp, settings_path)
 
     def match_email(self, email):
         # 正则表达式匹配邮箱格式：数字英文@数字英文.英文
@@ -338,27 +368,62 @@ class TextNormalizer:
         # 例如："PCIe 5.0" 应该在 "PCIe" 之前匹配
         sorted_terms = sorted(glossary.keys(), key=len, reverse=True)
         transformed_text = text
+
+        if not getattr(self, "cascade_glossary", False):
+            # 默认：每条术语只作用于【原文】，替换结果不再参与后续匹配。
+            # 否则一条术语的读音里若含另一条术语，那条术语会再改写一次——
+            # 术语表 {"C++": "C 加加", "C": "西"} 输入「他主要写 C++」会得到
+            # 「他主要写西加加」，实际念成 xi jia jia，静默出错且界面无提示。
+            #
+            # 实现：替换结果先塞进私有区占位符（U+E000 起，正常文本不会出现），
+            # 全部替换完再统一还原。顺带好处是长短优先级更稳——长术语换成占位符
+            # 之后，短术语彻底碰不到它。
+            slots = []
+            for term in sorted_terms:
+                r = self._glossary_replacement(glossary, term, lang)
+                pattern = get_term_pattern(term)
+                if pattern is None:
+                    logger.warning("Skipping empty glossary term")
+                    continue
+                if r is None:
+                    continue
+                if not pattern.search(transformed_text):
+                    continue
+                slots.append(r)
+                ph = "\ue000%d\ue001" % (len(slots) - 1)
+                transformed_text = pattern.sub(lambda _m, p=ph: p, transformed_text)
+            for i, r in enumerate(slots):
+                transformed_text = transformed_text.replace("\ue000%d\ue001" % i, r)
+            return transformed_text
+
         for term in sorted_terms:
-            term_value = glossary[term]
-            if isinstance(term_value, dict):
-                replacement = term_value.get(lang, term_value.get(lang, term))
-            else:
-                replacement = term_value
+            replacement = self._glossary_replacement(glossary, term, lang)
             # 使用正则进行大小写不敏感的替换
             pattern = get_term_pattern(term)
             if pattern is None:
                 logger.warning("Skipping empty glossary term")
                 continue
-            if not isinstance(replacement, str):
-                # YAML 里写成数字/列表时的兜底，否则 re.sub 抛 TypeError
-                logger.warning("Coercing non-string reading for term %r: %r", term, replacement)
-                replacement = str(replacement)
+            if replacement is None:
+                continue
             # replacement 是用户填的自由文本，必须按【字面量】替换。
             # 直接传给 sub() 会被当成正则模板：读音里含 \1 会抛
             # re.error("invalid group reference")，整条链崩掉。
             transformed_text = pattern.sub(lambda _m, r=replacement: r, transformed_text)
 
         return transformed_text
+
+    def _glossary_replacement(self, glossary, term, lang):
+        """取出该术语在指定语言下的读音；None 表示这条不该参与替换。"""
+        term_value = glossary[term]
+        if isinstance(term_value, dict):
+            replacement = term_value.get(lang, term_value.get(lang, term))
+        else:
+            replacement = term_value
+        if not isinstance(replacement, str):
+            # YAML 里写成数字/列表时的兜底，否则 re.sub 抛 TypeError
+            logger.warning("Coercing non-string reading for term %r: %r", term, replacement)
+            replacement = str(replacement)
+        return replacement
 
     def load_glossary(self, glossary_dict):
         """
