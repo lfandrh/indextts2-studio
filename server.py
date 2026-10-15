@@ -80,12 +80,18 @@ except Exception:
 # 持久日志写 logs/server.log（按天轮转、保留 7 天），控制台同步输出。
 # start_server.bat 重定向的 server_bg.log 只是控制台镜像（每次启动清空），
 # 排查历史问题的唯一依据是这里带时间戳的 server.log。
+#
+# handler 挂在 "indextts" 这个父 logger 上，而不是 "indextts.server"：
+# 兄弟 logger（如 indextts.utils.front 的文本规范化异常）不会自动继承挂在
+# 兄弟身上的 handler，会一路传播到没配 handler 的 root，只由 logging 的
+# lastResort 打到 stderr —— 表现是「控制台看得见，server.log 里没有」。
+# 挂父节点则 indextts.* 下所有子 logger 统一继承。
 import logging
 from logging.handlers import TimedRotatingFileHandler
 
 LOGS_DIR = os.path.join(current_dir, "logs")
 os.makedirs(LOGS_DIR, exist_ok=True)
-logger = logging.getLogger("indextts.server")
+logger = logging.getLogger("indextts")
 logger.setLevel(logging.INFO)
 logger.propagate = False
 if not logger.handlers:
