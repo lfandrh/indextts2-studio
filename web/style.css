@@ -20,6 +20,16 @@
   --radius: 14px;
   --pad: 20px;
   --gap: 16px;
+
+  /* 页面内容区的最大宽度。导航栏（.hdr-row）、工作区（main）、页脚（footer）
+     三处必须同宽，否则宽屏上左右边界对不齐——曾经改过 main 忘了另外两处，
+     导致工作区比导航栏宽 240px。三处都引用这个变量，改一次就不会再漏。
+
+     为什么是 1680：生成页是三栏，固定部分是 左栏最小 520 + 历史栏 268 +
+     间距 32 = 820px，中间栏拿剩下的。上限 1440 时中间栏最多只能到 484px，
+     1920/2560 屏上多出来的宽度全被两侧留白吃掉，等于白买大屏。
+     三栏的中文注释在 .page[data-page="gen"].cur 那里。 */
+  --layout-max: 1680px;
   /* 系统字体栈：无外链依赖（Google Fonts 在离线/国内环境不可达），零阻塞 */
   --mono: "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
   --sans: "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
@@ -73,9 +83,7 @@ header {
   backdrop-filter: blur(10px); border-bottom: 1px solid var(--border);
 }
 .hdr-row {
-  /* 与 main 的 max-width 必须一致，否则超过 1440px 的屏幕上导航栏比工作区窄，
-     两边对不齐。改 main 时记得一起改这里。 */
-  max-width: 1680px; margin: 0 auto; padding: 8px 24px;
+  max-width: var(--layout-max); margin: 0 auto; padding: 8px 24px;
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
 }
 /* 单行 header：波形弹性伸展吃掉中间空隙，避免大块空白堆在一处 */
@@ -104,9 +112,7 @@ header {
 
 /* ---------- two-column layout ---------- */
 main {
-  /* 1440 -> 1680：三栏的固定部分是 左栏最小 520 + 历史栏 268 + 间距 32 = 820，
-     1440 的上限会让中间栏最多只能到 484px，2560 屏上白白浪费一半屏幕。 */
-  width: 100%; max-width: 1680px; margin: 0 auto; padding: var(--gap) 24px 48px;
+  width: 100%; max-width: var(--layout-max); margin: 0 auto; padding: var(--gap) 24px 48px;
   display: grid; grid-template-columns: minmax(360px, 470px) minmax(0, 1fr);
   gap: var(--gap); align-items: stretch; flex: 1;
 }
@@ -592,7 +598,7 @@ textarea:focus, select:focus, input:focus {
 .hb-rail-count { font-size: 10.5px; color: var(--faint); }
 
 /* ---------- footer & a11y ---------- */
-footer { max-width: 1680px; width: 100%; margin: 0 auto; padding: 0 24px 30px; color: var(--faint); font-size: 12px; }
+footer { max-width: var(--layout-max); width: 100%; margin: 0 auto; padding: 0 24px 30px; color: var(--faint); font-size: 12px; }
 footer a { color: var(--muted); }
 
 /* ---------- modal dialog (replaces native confirm/prompt) ---------- */
@@ -790,7 +796,7 @@ main#pages { display: block; }
   .histbar.collapsed .hb-rail { display: none; }
   .hb-list { max-height: 260px; }
 }
-/* 宽屏档：1680 的上限下，中间栏已能给到 660px；再放宽两侧固定档，
+/* 宽屏档：--layout-max 的上限下，中间栏已能给到 660px；再放宽两侧固定档，
    免得 1920/2560 屏上把富余空间全浪费在留白里。 */
 @media (min-width: 1600px) {
   .page[data-page="gen"].cur {
