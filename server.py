@@ -194,22 +194,39 @@ class LazyTTS:
             self._phase = phase
 
     def _ensure_light(self):
-        """Build config/normalizer/tokenizer on first need (imports torch)."""
-        if self.cfg is None:
-            with self._light_lock:
-                if self.cfg is None:
-                    from indextts.utils.front import TextNormalizer, TextTokenizer
-                    self.cfg = OmegaConf.load(self.cfg_path)
-                    self.model_version = getattr(self.cfg, "version", None)
-                    self.normalizer = TextNormalizer(enable_glossary=True)
-                    self.normalizer.load()
-                    bpe_path = os.path.join(self.model_dir, self.cfg.dataset["bpe_model"])
-                    self.tokenizer = TextTokenizer(bpe_path, self.normalizer)
-                    if os.path.exists(self.glossary_path):
-                        try:
-                            self.normalizer.load_glossary_from_yaml(self.glossary_path)
-                        except Exception as e:
-                            logger.warning("Failed to load glossary: %s", e)
+        """Build config/normalizer/tokenizer on first need (imports torch).
+
+        先全部造在局部变量里、造完再一次性发布给 self。原来的写法在
+        第一个赋值（self.cfg）就对外「挂牌」，但 tokenizer 要等到最后
+        才赋值，中间隔着 normalizer.load() 的数秒空窗——这期间任何并发
+        请求都会命中外层的无锁快路径 `if self.cfg is None`，误判为已就绪，
+        然后拿到还是 None 的 tokenizer（AttributeError 500）。更糟的是
+        期间到达的 /tts 请求会在 ensure_loaded 里用 None 覆盖掉
+        IndexTTS2.__init__ 刚建好的 tokenizer，整次模型加载作废。
+        """
+        if self.cfg is not None:
+            return self.cfg
+        with self._light_lock:
+            if self.cfg is not None:               # 双重检查：等锁期间可能已被别人建好
+                return self.cfg
+            t0 = time.perf_counter()
+            from indextts.utils.front import TextNormalizer, TextTokenizer
+            cfg = OmegaConf.load(self.cfg_path)
+            normalizer = TextNormalizer(enable_glossary=True)
+            normalizer.load()
+            bpe_path = os.path.join(self.model_dir, cfg.dataset["bpe_model"])
+            tokenizer = TextTokenizer(bpe_path, normalizer)
+            if os.path.exists(self.glossary_path):
+                try:
+                    normalizer.load_glossary_from_yaml(self.glossary_path)
+                except Exception as e:
+                    logger.warning("Failed to load glossary: %s", e)
+            # 全部就绪后才发布，中途不暴露半成品
+            self.cfg = cfg
+            self.normalizer = normalizer
+            self.tokenizer = tokenizer
+            self.model_version = getattr(cfg, "version", None)
+            logger.info("Light components ready in %.2fs", time.perf_counter() - t0)
         return self.cfg
 
     @property
