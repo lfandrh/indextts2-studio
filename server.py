@@ -831,7 +831,7 @@ class _InferenceStop(Exception):
 def _job_public(job, now=None):
     """Return a JSON-safe snapshot; call with the jobs lock held."""
     data = {k: v for k, v in job.items() if k not in ("stop_event", "events")}
-    if data.get("state") in ("done", "error", "cancelled") and data.get("finished_at"):
+    if data.get("state") in ("done", "error", "cancelled", "stopped") and data.get("finished_at"):
         now = now or time.time()
         if now - data["finished_at"] >= JOB_RETENTION_SECONDS:
             return None
@@ -843,7 +843,7 @@ def _prune_finished_jobs():
     now = time.time()
     stale = [
         job_id for job_id, job in _JOBS.items()
-        if job.get("state") in ("done", "error", "cancelled")
+        if job.get("state") in ("done", "error", "cancelled", "stopped")
         and now - job.get("finished_at", 0) >= JOB_RETENTION_SECONDS
     ]
     for job_id in stale:
@@ -1102,16 +1102,22 @@ def do_tts(
                 }
                 logger.info("TTS job %s done: file=%s elapsed=%ss mel_capped=%s",
                             job_id, ev.get("file"), ev.get("elapsed"), ev.get("mel_capped", False))
+            elif ev["type"] == "stopped":
+                # 用户主动停止：这是终态，不是失败。cancelled 留给「排队中还没
+                # 开始就被取消」，stopped 表示「已经跑起来了、中途停的」——
+                # 前端重连时要显示不同的说明，不能混成一个。
+                job["state"] = "stopped"
+                job["finished_at"] = time.time()
+                job["stage_desc"] = "已停止"
+                job["message"] = ev.get("detail") or "已停止生成"
+                logger.info("TTS job %s stopped: %s", job_id, job["message"])
             elif ev["type"] == "error":
                 job["error"] = ev.get("detail") or "生成失败"
                 job["finished_at"] = time.time()
-                # 取消/停止路径也用 error 事件收尾（前端靠它终止 SSE）。
-                # 元组里必须有 "stopping"：上面的 stopping 分支已经把状态从
-                # stop_requested 改写成 "stopping" 了，只认前两个的话，运行中
-                # 停止会落进 else，被记成 ERROR 失败——代码注释里写的意图从来没
-                # 生效过（实测「停止生成」每次都产生一条 ERROR 日志）。
-                # 同时必须落成终态：_prune_finished_jobs 只回收
-                # done/error/cancelled，卡在 stopping 会被永久留在 _JOBS 里。
+                # 兜底：万一还有别的路径用 error 事件收尾一个主动停止（旧调用方、
+                # 或事件类型拼错），别把它记成失败。元组里必须有 "stopping"——
+                # 上面的 stopping 分支已经把状态从 stop_requested 改写成
+                # "stopping" 了，只认前两个的话会落进 else。
                 if job["state"] in ("cancelled", "stop_requested", "stopping"):
                     job["state"] = "cancelled"
                     job["stage_desc"] = "已取消"
@@ -1289,7 +1295,7 @@ def do_tts(
                 except Exception as e:
                     logger.error("TTS job %s: model reload after stop failed: %s", job_id, e, exc_info=True)
                     detail = f"已停止生成，模型重新加载失败，下次生成将自动加载: {e}"
-            record_event({"type": "error", "detail": detail})
+            record_event({"type": "stopped", "detail": detail})
         except Exception as e:
             logger.error("TTS job %s inference error: %s", job_id, e, exc_info=True)
             record_event({"type": "error", "detail": f"Inference failed: {e}"})

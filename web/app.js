@@ -297,7 +297,11 @@ async function restoreJob() {
               stopUi();
               await loadResult(s.result.wav, s.result.elapsed, s.result.file, { melCapped: s.result.mel_capped, normalizeFallback: s.result.normalize_fallback });
               await refreshHistory();
+            } else if (s.state === "stopped") {
+              // 已经跑起来、中途被用户停掉的：中性提示
+              showStopped(s.message || "已停止生成");
             } else if (s.state === "cancelled") {
+              // 排队中还没开始就被取消的：确实什么都没做
               showError("已取消（排队中的任务未开始生成）");
             } else {
               showError(s.error || "生成失败");
@@ -320,6 +324,9 @@ async function restoreJob() {
       await refreshHistory();
     } else if (job.state === "error") {
       showError(job.error || "生成失败");
+    } else if (job.state === "stopped") {
+      // 已经跑起来、中途被用户停掉的：中性提示
+      showStopped(job.message || "已停止生成");
     } else if (job.state === "cancelled") {
       showError("已取消（排队中的任务未开始生成）");
     }
@@ -918,6 +925,18 @@ function showActionHint(msg) {
   hint.classList.remove("error");
 }
 
+/* 用户主动停止生成：不是故障。
+   红色错误框只该留给真的失败（OOM、文件读不出来、模型加载失败）。停止是用户
+   自己点的，用中性提示，否则每次正常停止都像出了故障。 */
+function showStopped(msg) {
+  showActionHint(msg || "已停止生成");
+  errBox.classList.remove("on");      // 清掉可能残留的红色错误框
+  errBox.textContent = "";
+  loadingBox.hidden = true;
+  setResultVisible(hasResult);
+  stopUi();
+}
+
 function clearActionError() {
   const hint = $("loadHint");
   hint.textContent = "";
@@ -1117,6 +1136,12 @@ genBtn.addEventListener("click", async () => {
           curJobState = "stopping";
           updateCancelUi();
           showLoading("正在停止生成…");
+        } else if (ev.type === "stopped") {
+          // 终态：用户主动停止。走中性提示而不是红色错误框——
+          // 停止不是故障，每��正常停止都报红会让人以为出了事。
+          curJobState = "stopped";
+          updateCancelUi();
+          showStopped(ev.detail);
         }
       }
     }
