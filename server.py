@@ -865,6 +865,7 @@ def _register_job(client_id):
             # 停止本身要 rebuild 是因为半途停止会留下脏缓存；卸载是把模型整个
             # 丢掉，脏状态自然消失，没必要先花十几秒建一个马上又要扔的。
             "stop_unload": False,
+            "stop_keep_model": False,
             "created_at": time.time(),
             "started_at": None,
             "finished_at": None,
@@ -921,11 +922,12 @@ def tts_cancel(job_id: str):
 
 
 @api.post("/tts/{job_id}/stop")
-def tts_stop(job_id: str):
+def tts_stop(job_id: str, keep_model: bool = False):
     """Stop a queued or running job.
 
     queued  -> skipped before the GPU is touched;
-    running -> stops at the next progress callback, then rebuilds the model.
+    running -> stops at the next progress callback, then rebuilds the model
+               (or leaves it alone when keep_model=1).
     """
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
@@ -938,6 +940,10 @@ def tts_stop(job_id: str):
         elif state == "running":
             job["state"] = "stop_requested"
             job["stop_event"].set()
+            if keep_model:
+                # 停但不重载：省掉十幾秒的模型重建，下一次生成直接接着用。
+                # 安全性依据见 _InferenceStop 分支里 keep_model 那段注释。
+                job["stop_keep_model"] = True
             state = "stop_requested"
     return {"ok": True, "state": state}
 
@@ -1099,9 +1105,15 @@ def do_tts(
             elif ev["type"] == "error":
                 job["error"] = ev.get("detail") or "生成失败"
                 job["finished_at"] = time.time()
-                if job["state"] in ("cancelled", "stop_requested"):
-                    # 取消/停止路径也用 error 事件收尾（前端靠它终止 SSE），
-                    # 但状态保留 cancelled，别把用户主动取消显示成“生成失败”
+                # 取消/停止路径也用 error 事件收尾（前端靠它终止 SSE）。
+                # 元组里必须有 "stopping"：上面的 stopping 分支已经把状态从
+                # stop_requested 改写成 "stopping" 了，只认前两个的话，运行中
+                # 停止会落进 else，被记成 ERROR 失败——代码注释里写的意图从来没
+                # 生效过（实测「停止生成」每次都产生一条 ERROR 日志）。
+                # 同时必须落成终态：_prune_finished_jobs 只回收
+                # done/error/cancelled，卡在 stopping 会被永久留在 _JOBS 里。
+                if job["state"] in ("cancelled", "stop_requested", "stopping"):
+                    job["state"] = "cancelled"
                     job["stage_desc"] = "已取消"
                     logger.info("TTS job %s cancelled: %s", job_id, job["error"])
                 else:
@@ -1227,9 +1239,11 @@ def do_tts(
             # 十几秒。/model/unload 拿到推理锁后还会再调一次 tts.unload()，
             # 那次是空操作（_tts 已是 None），无害。
             unload_only = False
+            keep_model = False
             with _JOBS_LOCK:
                 j = _JOBS.get(job_id)
                 unload_only = bool(j and j.get("stop_unload"))
+                keep_model = bool(j and j.get("stop_keep_model"))
             if unload_only:
                 record_event({"type": "stopping", "detail": "正在停止生成并卸载模型…"})
                 model = None
@@ -1239,6 +1253,24 @@ def do_tts(
                 except Exception as e:
                     logger.error("TTS job %s: unload after stop failed: %s", job_id, e, exc_info=True)
                     detail = f"已停止生成，卸载失败: {e}"
+            elif keep_model:
+                # 停止但不重载：只把回调摘掉、放开局部引用让显存回收，模型本身
+                # 原样留着给下一次生成用。停止只能发生在阶段边界的进度回调上
+                # （infer_v2.py 的 0.03/0.05/0.1 与每段的 gpt/s2mel/bigvgan），
+                # 而参考音频缓存是在 0.05 阶段一次性写完的（连续 5 条赋值，
+                # 中间不回调），per-run 标志在下一次推理开头重置，输出 wav
+                # 要全部段落跑完才落盘——所以停下来时没有半成品状态。
+                record_event({"type": "stopping", "detail": "正在停止生成…"})
+                model.gr_progress = prev_progress
+                model = None
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                detail = "已停止生成"
             else:
                 record_event({"type": "stopping", "detail": "正在停止生成并重新加载模型…"})
                 # Unwind the local model reference first so CUDA memory can be released.

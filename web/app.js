@@ -261,7 +261,7 @@ function applyJobSnapshot(job) {
   genStart = performance.now() - draftElapsed(job) * 1000;
   errBox.classList.remove("on");
   showLoading(job.state === "stopping"
-    ? "正在停止生成并重新加载模型…"
+    ? "正在停止生成…"
     : job.state === "queued" ? "排队中…" : transDesc(job.stage_desc) || "正在生成语音…");
   $("pbarFill").style.width = `${Math.round((job.progress || 0) * 100)}%`;
   $("pStageMeta").textContent = job.state === "queued" ? "排队中" : `${Math.round((job.progress || 0) * 100)}%`;
@@ -934,8 +934,8 @@ cancelBtn.addEventListener("click", async () => {
     if (curJobState === "running") {
       const stop = await uiConfirm({
         title: "停止生成",
-        body: "将中断当前推理并重新加载模型，本次已生成的部分不会保存。",
-        okText: "停止并重载",
+        body: "将中断当前推理，本次已生成的部分不会保存。模型保持加载，下次生成可直接继续。",
+        okText: "停止生成",
         cancelText: "继续等待",
         danger: true,
       });
@@ -944,7 +944,12 @@ cancelBtn.addEventListener("click", async () => {
         return;
       }
     }
-    const r = await fetch(`${API}/tts/${jobId}/stop`, { method: "POST" });
+    // keep_model=1：停止后不重建模型。重建要十几秒，而停止只发生在阶段边界——
+    // 参考缓存在 0.05 阶段一次写完（连续 5 条赋值、中间不回调），per-run 标志
+    // 在每次推理开头重置，输出 wav 要全部段落跑完才落盘——停下来时没有半成品
+    // 状态。实测 4 轮「停止 -> 再生成」显存收敛在 6760MB 上下（不升反降），
+    // 输出音频时长/峰值/均值与基准同一量级。
+    const r = await fetch(`${API}/tts/${jobId}/stop?keep_model=1`, { method: "POST" });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.detail || "停止失败");
     if (j.state === "cancelled") {
@@ -952,7 +957,7 @@ cancelBtn.addEventListener("click", async () => {
       curJobState = "cancelling";
     } else if (j.state === "stop_requested" || j.state === "running") {
       curJobState = "stopping";
-      showLoading("正在停止生成并重新加载模型…");
+      showLoading("正在停止生成…");
     }
     updateCancelUi();
   } catch (e) {
@@ -1111,7 +1116,7 @@ genBtn.addEventListener("click", async () => {
         } else if (ev.type === "stopping") {
           curJobState = "stopping";
           updateCancelUi();
-          showLoading("正在停止生成并重新加载模型…");
+          showLoading("正在停止生成…");
         }
       }
     }
