@@ -20,7 +20,6 @@
   --radius: 14px;
   --pad: 20px;
   --gap: 16px;
-
   /* 页面内容区的最大宽度。导航栏（.hdr-row）、工作区（main）、页脚（footer）
      三处必须同宽，否则宽屏上左右边界对不齐——曾经改过 main 忘了另外两处，
      导致工作区比导航栏宽 240px。三处都引用这个变量，改一次就不会再漏。
@@ -124,7 +123,13 @@ main {
 .mono { font-family: var(--mono); }
 
 /* ---------- LEFT: ops panel with step flow ---------- */
-.ops { position: relative; }
+/* .ops 自己就是卡片兼滚动容器（宽屏 overflow-y:auto），.cta 是它的 sticky 子元素。
+   sticky 的约束框 = 父级内容盒，所以卡片的 padding-bottom 会让 .cta 的底边永远停在
+   内容盒底、比可视滚动区底高 --pad+1px；滚到中间位置时，那一条会变成"窗口"，
+   高级参数里的滑块从"生成语音"下面钻出来（详见 .cta 注释）。
+   底部内边距交给 .cta 自己出（它本来就带 --pad+3px 下内边距），这里置 0 让
+   内容盒底与滚动视口底重合，缝就不存在了。左右上三个方向照旧。 */
+.ops { position: relative; padding-bottom: 0; }
 .opstep { position: relative; padding: 2px 0 18px 32px; }
 .opstep + .opstep { border-top: 1px solid var(--border); padding-top: 18px; margin-top: 2px; }
 .opstep::before { /* connector */
@@ -251,17 +256,20 @@ textarea:focus, select:focus, input:focus {
 .slider label { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; font-weight: 600; }
 .slider label span { color: var(--faint); font-weight: 400; font-family: var(--mono); font-size: 11.5px; }
 .srow { display: flex; align-items: center; gap: 12px; margin-top: 5px; }
-.srow input[type="range"] {
+.srow input[type="range"], .edit-row input[type="range"] {
   flex: 1; appearance: none; -webkit-appearance: none; height: 5px; border-radius: 3px;
   background: linear-gradient(90deg, var(--accent) var(--fill, 50%), var(--meter-track) var(--fill, 50%));
   cursor: pointer; padding: 0; border: none; font: inherit;
 }
-.srow input[type="range"]::-webkit-slider-thumb {
+.srow input[type="range"]::-webkit-slider-thumb,
+.edit-row input[type="range"]::-webkit-slider-thumb {
   appearance: none; -webkit-appearance: none;
   width: 15px; height: 15px; border-radius: 50%; background: var(--surface);
   border: 2px solid var(--accent); box-shadow: 0 1px 3px rgba(0,0,0,.25); transition: transform .15s ease;
 }
-.srow input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.15); }
+.srow input[type="range"]:active::-webkit-slider-thumb,
+.edit-row input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.15); }
+.edit-row input[type="range"]:disabled { opacity: .5; cursor: progress; }
 .srow output { font-family: var(--mono); font-size: 12px; color: var(--ink); min-width: 42px; text-align: right; font-weight: 600; }
 .grid-num { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
 .grid-num label { display: flex; justify-content: space-between; gap: 6px; font-size: 12px; font-weight: 600; }
@@ -358,10 +366,15 @@ textarea:focus, select:focus, input:focus {
 /* ---------- main CTA ---------- */
 .cta {
   position: sticky; bottom: 0; z-index: 3; margin-top: auto;
+  /* 左右负 margin 让吸底条铺满卡片整宽（上边留给内容，不铺）。
+     底部不加负 margin：sticky 的约束框是父级**内容盒**，负 margin 只会改
+     滚动高度、不会把盒子推出内容盒，写了也没用——底部那条缝由父级 .ops
+     的 padding-bottom:0 从结构上消掉。 */
   margin-left: calc(-1 * var(--pad)); margin-right: calc(-1 * var(--pad));
-  /* 不再用负 margin 吃掉卡片底 padding：负值会让 ops 的可滚动高度
-     天生比可视区少 --pad，左栏最后一个折叠面板的底部永远差一点才能滚上来 */
   padding: 14px var(--pad) calc(var(--pad) + 3px);
+  /* 吸底条底边与卡片内底重合，得自己带圆角；
+     窄屏（≤1240px，走单列）卡片不滚动、没有 overflow 裁剪，缺了它方角会戳出圆角外 */
+  border-radius: 0 0 calc(var(--radius) - 1px) calc(var(--radius) - 1px);
   background: color-mix(in srgb, var(--surface) 94%, transparent);
   border-top: 1px solid var(--border);
   backdrop-filter: blur(8px);
@@ -376,6 +389,9 @@ textarea:focus, select:focus, input:focus {
 .btn.primary { background: var(--primary); color: var(--primary-ink); }
 .btn.primary:hover { filter: brightness(1.08); box-shadow: 0 6px 18px color-mix(in srgb, var(--primary) 35%, transparent); }
 .btn.primary:disabled { opacity: .45; cursor: not-allowed; filter: none; box-shadow: none; }
+/* 通用禁用态：ghost 变体原本一条都没有，撤销/重做/重置全部置灰后看起来照样能点 */
+.btn:disabled { opacity: .45; cursor: not-allowed; transform: none; filter: none; box-shadow: none; }
+.btn.ghost:disabled:hover { background: transparent; }
 .btn.primary.big {
   width: 100%; padding: 17px 22px; font-size: 17px; letter-spacing: .06em;
   box-shadow: 0 8px 22px color-mix(in srgb, var(--primary) 30%, transparent);
@@ -393,7 +409,10 @@ textarea:focus, select:focus, input:focus {
 .btn.danger:not(.ghost) { background: var(--danger); color: #fff; }
 .btn.danger:not(.ghost):hover { filter: brightness(1.08); box-shadow: 0 6px 18px color-mix(in srgb, var(--danger) 35%, transparent); }
 .btn.ghost.danger { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
-.btn.ghost.mini { padding: 8px 13px; font-size: 12.5px; border-radius: 9px; flex: none; }
+/* mini 是"尺寸"而不是"ghost 的附属"，写成通用选择器，实底变体（primary mini）才能一起变小 */
+.btn.mini { padding: 8px 13px; font-size: 12.5px; border-radius: 9px; flex: none; }
+/* ghost 有 1px 描边、实底没有，同排 mini 按钮会差 2px 高；给实底补一圈透明描边抹平 */
+.btn.primary.mini { border: 1px solid transparent; }
 .hint { font-size: 11.5px; color: var(--faint); min-height: 15px; text-align: center; margin-top: 7px; }
 .hint.error { color: var(--danger); }
 
@@ -406,7 +425,9 @@ textarea:focus, select:focus, input:focus {
 }
 
 /* ---------- RIGHT: result showcase ---------- */
-.resultcard { min-height: 520px; }
+/* 同 .ops：右栏卡片也是滚动容器，末位的 .history 是 sticky 吸底条，
+   卡片的 padding-bottom 会在吸底条下方留出一条"窗口"。底部内边距交给 .history 自己出。 */
+.resultcard { min-height: 520px; padding-bottom: 0; }
 .ph {
   flex: 1; border: 1.5px dashed var(--border); border-radius: 14px;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -500,16 +521,59 @@ textarea:focus, select:focus, input:focus {
 #waveTrim { width: 100%; height: 108px; display: block; border-radius: 8px; touch-action: none; cursor: crosshair; background: var(--surface-2); }
 .bp-meta { display: flex; justify-content: space-between; gap: 10px; margin-top: 7px; font-size: 12.5px; color: var(--muted); }
 .trim-hint { font-size: 12px; color: var(--faint); margin-top: 12px; }
-.result-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
-.result-actions .btn.primary { margin-left: auto; }
-.dl-row { margin-top: 10px; }
+/* 源音频操作行：播放 / 选区 / 下载。
+   「下载」靠右推出去，与左边三个"操作源波形"的按钮在视觉上分开 */
+.sel-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+.sel-actions #dlSrcBtn { margin-left: auto; }
+.dl-row { margin-top: 8px; }
 .dl-name { font-family: var(--mono); font-size: 12px; color: var(--faint); word-break: break-all; }
+.dl-name:empty { display: none; }
+
+/* ---------- audio editing (gain / tempo / undo stack) ---------- */
+.sec-t { display: flex; align-items: baseline; gap: 8px; font-size: 13px; font-weight: 600; color: var(--ink); margin-bottom: 8px; }
+.sec-t em { font-style: normal; font-size: 11.5px; font-weight: 400; color: var(--faint); }
+
+.edit-panel { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+.edit-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+.edit-row > b { flex: none; width: 32px; font-size: 12.5px; font-weight: 600; color: var(--muted); }
+.edit-row input[type="range"] { flex: 1; min-width: 110px; max-width: 260px; }
+.edit-val { font-size: 12px; font-weight: 600; color: var(--ink); min-width: 58px; }
+.edit-note { font-size: 11.5px; color: var(--faint); }
+.edit-note.busy { color: var(--warn); }
+.warn-peak { color: var(--warn); }
+
+.ops-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 2px; }
+.ops-chips { flex: 1; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-height: 27px; min-width: 0; }
+.ops-empty { font-size: 11.5px; color: var(--faint); }
+.op-chip {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 9px;
+  padding: 4px 9px; font-size: 11.5px; font-family: var(--mono); color: var(--muted);
+}
+.op-chip i { font-style: normal; cursor: pointer; color: var(--faint); }
+.op-chip i:hover { color: var(--danger); }
+
+#resultPreview { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+.out-player { display: flex; align-items: center; gap: 10px; }
+.out-play {
+  width: 30px; height: 30px; border-radius: 50%; flex: none;
+  background: var(--primary); color: var(--primary-ink); border: none;
+}
+.out-play:hover { background: var(--primary); transform: translateY(-1px); filter: brightness(1.06); }
+#waveOut { flex: 1; min-width: 0; height: 28px; display: block; border-radius: 6px; background: var(--surface-2); }
+.out-dur { font-size: 12px; color: var(--muted); flex: none; min-width: 52px; text-align: right; }
+/* 「下载编辑结果」跟着结果区一起出现/隐藏，名字在按钮下方占满整行（放得下长中文名） */
+.out-foot { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-top: 12px; }
 
 /* ---------- result library (presets / examples tabs, bottom of right card) ---------- */
 .history {
   position: sticky; bottom: 0; z-index: 3;
-  margin: 16px calc(-1 * var(--pad)) calc(-1 * var(--pad));
-  padding: 10px var(--pad) 15px;
+  /* 底部负 margin 对 sticky 无效（约束框是父级内容盒，负 margin 只改滚动高度），
+     底部那条缝由父级 .resultcard 的 padding-bottom:0 消掉，这里自己带下内边距 */
+  margin: 16px calc(-1 * var(--pad)) 0;
+  padding: 10px var(--pad) var(--pad);
+  /* 与 .cta 同理：底边贴到卡片内底，窄屏没有 overflow 裁剪时靠自带圆角收口 */
+  border-radius: 0 0 calc(var(--radius) - 1px) calc(var(--radius) - 1px);
   background: color-mix(in srgb, var(--surface) 94%, transparent);
   border-top: 1px solid var(--border);
   backdrop-filter: blur(8px);
@@ -839,9 +903,16 @@ main#pages { display: block; }
 @media (max-width: 480px) {
   .brand small { display: none; }
   .pill { font-size: 11px; }
-  .result-actions .btn { width: 100%; }
-  .result-actions .btn.primary { margin-left: 0; }
+  /* 极窄视口：三个选区按钮等分一行，「下载」独占下一行铺满 */
+  .sel-actions { gap: 6px; }
+  .sel-actions .btn { flex: 1 1 0; min-width: 0; }
+  .sel-actions #dlSrcBtn { margin-left: 0; flex: 1 1 100%; }
+  .out-foot { align-items: stretch; }
+  .out-foot .btn { width: 100%; }
   .grid-num { grid-template-columns: 1fr; }
+  /* 极窄视口：编辑行放不下"标签+滑块+数值+峰值"，让滑块独占一行 */
+  .edit-row > b { width: 100%; }
+  .edit-row input[type="range"] { max-width: none; min-width: 0; }
   /* 极窄视口：仪表与 tabs 各占一行铺满；主题按钮浮到 header 右上角 */
   .meter { width: 72px; }
   .meters { order: 3; width: 100%; justify-content: flex-start; margin-left: 0; }

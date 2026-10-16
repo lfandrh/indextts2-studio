@@ -222,24 +222,78 @@
         </div>
       </div>
       <div class="trim-hint">在波形上按下拖动选择要保留的片段</div>
-      <div class="capnote" id="melCapNote" hidden>⚠ 文本超过单段生成长度上限，结尾被截断——请减少每段 Token（分句上限）或调高「最大 mel tokens」后重新生成</div>
-        <!-- 文本规范化退化的提示。第一次完整展开；提示过一次之后再发生就降级成
-             右上角的小铃铛，点击可随时展开——不重复打扰，但不丢信息。
-             完整记录始终在 logs/server.log 里。 -->
-        <div class="capnote capnote-soft" id="normCapNote" hidden>
-          <span class="capnote-full">⚠ 文本规范化异常，已按原文合成，部分术语读音可能不准。完整原因见 logs/server.log</span>
-          <button class="capnote-mini" type="button" aria-label="文本规范化异常，点此展开详情">⚠️</button>
-        </div>
-      <div class="result-actions">
-        <button class="btn ghost" id="playFromStart">从头播放</button>
-        <button class="btn ghost" id="playSel">播放选中</button>
-        <button class="btn ghost" id="resetSel">重置选择</button>
-        <button class="btn primary" id="dlBtn">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      <!-- 源音频操作行：播放 / 选区 / 下载。四个都只作用于上面的源波形，
+           排在编辑控件与结果区之前，避免被读成"针对编辑结果" -->
+      <div class="sel-actions">
+        <button class="btn ghost mini" id="playFromStart" type="button">从头播放</button>
+        <button class="btn ghost mini" id="playSel" type="button">播放选中</button>
+        <button class="btn ghost mini" id="resetSel" type="button">清除选区</button>
+        <!-- 只写「下载」，拿到的是未经剪辑的源文件；完整说明放 title -->
+        <button class="btn primary mini" id="dlSrcBtn" type="button" title="下载未经剪辑的生成音频">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
           下载
         </button>
       </div>
-      <div class="dl-row"><span class="dl-name" id="dlName"></span></div>
+      <div class="dl-row"><span class="dl-name" id="dlSrcName"></span></div>
+      <div class="capnote" id="melCapNote" hidden>⚠ 文本超过单段生成长度上限，结尾被截断——请减少每段 Token（分句上限）或调高「最大 mel tokens」后重新生成</div>
+      <!-- 文本规范化退化的提示。第一���完整展开；提示过一次之后再发生就降级成
+           右上角的小铃铛，点击可随时展开——不重复打扰，但不丢信息。
+           完整记录始终在 logs/server.log 里。 -->
+      <div class="capnote capnote-soft" id="normCapNote" hidden>
+        <span class="capnote-full">⚠ 文本规范化异常，已按原文合成，部分术语读音可能不准。完整原因见 logs/server.log</span>
+        <button class="capnote-mini" type="button" aria-label="文本规范化异常，点此展开详情">⚠️</button>
+      </div>
+
+      <!-- 编辑控件：裁剪靠上方波形拖选，这里管音量 / 变速 / 操作栈 -->
+      <div class="edit-panel">
+        <div class="edit-row">
+          <b>音量</b>
+          <input type="range" id="gainRange" min="-24" max="24" step="0.5" value="0" aria-label="音量增益">
+          <span class="edit-val mono" id="gainVal">0.0 dB</span>
+          <span class="edit-note mono" id="peakNote">峰值 —</span>
+          <button class="btn ghost mini" id="gainMax" type="button" hidden></button>
+        </div>
+        <div class="edit-row">
+          <b>变速</b>
+          <input type="range" id="tempoRange" min="0.5" max="2" step="0.05" value="1" aria-label="变速倍率">
+          <span class="edit-val mono" id="tempoVal">1.00×</span>
+          <span class="edit-note" id="tempoNote">保音高</span>
+        </div>
+        <div class="ops-row">
+          <span class="ops-chips" id="opsChips"></span>
+          <button class="btn ghost mini" id="undoBtn" type="button" disabled
+                  title="撤销上一步操作（Ctrl+Z）">撤销</button>
+          <button class="btn ghost mini" id="redoBtn" type="button" disabled
+                  title="恢复被撤销的操作（Ctrl+Shift+Z）">重做</button>
+          <button class="btn ghost mini" id="resetAllBtn" type="button" disabled
+                  title="清空所有编辑：增益归零、变速回到 1.00×、取消选区">重置全部</button>
+        </div>
+      </div>
+
+      <!-- 编辑结果：只读细波形，仅在「音量 / 变速」生效时出现 -->
+      <div id="resultPreview" hidden>
+        <div class="sec-t">编辑结果 <em>试听与下载的就是它</em></div>
+        <div class="out-player">
+          <button class="iconbtn out-play" id="outPlay" aria-label="试听编辑结果">
+            <svg id="outPlayIcon" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+          </button>
+          <canvas id="waveOut" aria-label="编辑结果波形"></canvas>
+          <span class="mono out-dur" id="outDur">—</span>
+        </div>
+        <!-- 独立播放器：源音频用 #player，编辑结果用这个，互不干扰 -->
+        <audio id="outAudio" hidden></audio>
+      </div>
+
+      <!-- 下载编辑结果：默认不显示；只要有编辑（裁剪/音量/变速）就出现。
+           刻意放在 #resultPreview 之外——纯裁剪时结果波形区不显示（见决策四），
+           但"下载裁出来的那一段"恰恰是最常用的动作，不能跟着一起藏起来 -->
+      <div class="out-foot" id="outFoot" hidden>
+        <button class="btn primary" id="dlBtn" type="button" title="下载剪辑后的音频">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          <span id="dlBtnLabel">下载编辑结果</span>
+        </button>
+        <span class="dl-name" id="dlName"></span>
+      </div>
     </div>
 
     <!-- preset / example library: secondary, bottom -->
@@ -401,5 +455,6 @@
 </div>
 
 <script src="/assets/app.js?v={app.js}"></script>
+<script src="/assets/edit.js?v={edit.js}"></script>
 </body>
 </html>

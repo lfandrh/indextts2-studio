@@ -5,13 +5,16 @@ the main TTS model is loaded lazily on first /tts request, so the server
 boots fast and idle VRAM stays at zero.
 """
 import argparse
+import asyncio
 import gc
 import hashlib
+import io
 import json
 import os
 import queue
 import re
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -1353,6 +1356,83 @@ def audio(name: str):
     return FileResponse(path, media_type="audio/wav")
 
 
+# ---- tempo (pitch-preserving time stretch) ----------------------------------
+# Pure CPU work: deliberately NOT guarded by _INFER_LOCK. A queued long-text
+# generation must never be blocked by someone dragging the speed slider.
+# librosa is imported lazily -- it is only ever needed here, and pulling it in
+# at startup would slow down every boot for a feature most runs never touch.
+_TEMPO_MIN, _TEMPO_MAX = 0.5, 2.0
+_librosa = None
+
+
+def _get_librosa():
+    global _librosa
+    if _librosa is None:
+        import librosa  # noqa: PLC0415  (lazy on purpose, see above)
+        _librosa = librosa
+    return _librosa
+
+
+def _stretch_wav(in_path: str, rate: float) -> bytes:
+    """Read wav -> time-stretch -> write 16bit PCM wav into memory."""
+    import numpy as np  # noqa: PLC0415
+    import soundfile as sf  # noqa: PLC0415
+
+    librosa = _get_librosa()
+    y, sr = sf.read(in_path, dtype="float32")
+    if y.ndim > 1:                      # stereo -> mono, the model output is mono anyway
+        y = y.mean(axis=1)
+    if not y.size:
+        raise ValueError("音频没有可处理的采样点")
+    y = np.ascontiguousarray(y)
+    out = librosa.effects.time_stretch(y, rate=rate)
+    buf = io.BytesIO()
+    sf.write(buf, out, sr, subtype="PCM_16", format="WAV")
+    return buf.getvalue()
+
+
+def _warmup_tempo():
+    """Pay the numba JIT cost up front.
+
+    The first ever time_stretch call costs ~8s on a fresh install (numba
+    compiles the phase-vocoder kernel); afterwards it is cached on disk and a
+    cold process only pays ~1s. Do it on a 0.2s silence buffer in a background
+    thread so the first real request stays snappy.
+    """
+    try:
+        import numpy as np  # noqa: PLC0415
+
+        librosa = _get_librosa()
+        librosa.effects.time_stretch(np.zeros(4410, dtype="float32"), rate=1.1)
+        logger.info("librosa time_stretch warmed up")
+    except Exception as e:                       # warmup is best-effort only
+        logger.warning("librosa warmup failed: %s", e)
+
+
+@api.post("/audio/tempo")
+async def audio_tempo(file: UploadFile = File(...), rate: float = Form(...)):
+    """Pitch-preserving speed change. Returns a new wav (not persisted)."""
+    data = await file.read()
+    _validate_audio_upload(data, "音频")
+    if not (_TEMPO_MIN <= rate <= _TEMPO_MAX):
+        raise HTTPException(
+            400, f"变速倍率超出范围（{rate}，允许 {_TEMPO_MIN}–{_TEMPO_MAX}）"
+        )
+    loop = asyncio.get_event_loop()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            in_path = os.path.join(td, "in.wav")
+            with open(in_path, "wb") as f:
+                f.write(data)
+            wav = await loop.run_in_executor(None, _stretch_wav, in_path, rate)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("tempo failed")
+        raise HTTPException(500, f"变速失败：{e}")
+    return Response(content=wav, media_type="audio/wav", headers={"Cache-Control": "no-cache"})
+
+
 # ---- generation history -------------------------------------------------------
 # Scope: this server run only (in-memory, nothing persisted). Writes happen from
 # the inference thread, which _INFER_LOCK already serializes, so the list needs no
@@ -1850,4 +1930,7 @@ if __name__ == "__main__":
     if removed:
         logger.info("Cleaned %d output file(s) older than %d days.", removed, OUTPUTS_RETENTION_DAYS)
     logger.info("IndexTTS2 server starting... port %d", cmd_args.port)
+    # 后台预热 librosa 的 numba JIT：装机后第一次变速要 8s（编译 phase vocoder 内核），
+    # 用 0.2s 静音提前付掉，避免用户第一次拖变速滑块时以为卡死。失败不影响服务。
+    threading.Thread(target=_warmup_tempo, daemon=True, name="tempo-warmup").start()
     uvicorn.run(app, host=cmd_args.host, port=cmd_args.port, log_level="warning")

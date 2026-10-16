@@ -1172,7 +1172,8 @@ genBtn.addEventListener("click", async () => {
 });
 
 /* ---------------- result, trim & download ---------------- */
-const trim = { buffer: null, sel: null, drag: null };
+// trim.buffer 仅作"当前是否有结果音频"的镜像（剪辑状态本身在 web/edit.js 的 ED 里）
+const trim = { buffer: null, drag: null };
 const tWave = $("waveTrim"), tCtx = tWave.getContext("2d");
 const player = $("player");
 const bigPlay = $("bigPlay"), bigPlayIcon = $("bigPlayIcon");
@@ -1223,8 +1224,10 @@ async function loadResult(url, elapsed, serverFile, opts) {
   try {
     const buf = await (await fetch(url)).arrayBuffer();
     trim.buffer = await getAC().decodeAudioData(buf);
+    ED.setSource(trim.buffer, url);          // 剪辑状态回到"无操作"，见 web/edit.js
   } catch (e) {
     trim.buffer = null;
+    ED.clear();
     hasResult = false;
     player.pause();
     player.removeAttribute("src");
@@ -1233,7 +1236,6 @@ async function loadResult(url, elapsed, serverFile, opts) {
     showError("生成结果音频加载失败，请重试");
     return;
   }
-  trim.sel = null;
   hasResult = true;
   $("trimRange").textContent = `全长 ${trim.buffer.duration.toFixed(2)}s`;
   $("genMeta").textContent = `耗时 ${Number(elapsed || 0).toFixed(1)}s`;
@@ -1248,13 +1250,17 @@ bigPlay.addEventListener("click", () => {
 player.addEventListener("ended", () => { bigPlayIcon.innerHTML = PLAY2; });
 
 function drawTrimWave() {
+  if (!ED.src) return;
   const { w, h } = sizeCanvas(tWave);
-  const data = trim.buffer.getChannelData(0);
+  const data = ED.src.getChannelData(0);
   const step = Math.floor(data.length / w) || 1;
   const mid = h / 2;
   const ink = cssVar("--accent"), mut = cssVar("--border"), pri = cssVar("--primary");
-  const pos = player.duration ? (player.currentTime / player.duration) * w : 0;
-  const s = trim.sel;
+  // 波形恒画源音频（编辑台），选区与播放进度都是源时间轴。
+  // 编辑结果有自己的播放器（#outAudio）和自己的波形，两者互不干扰。
+  const dur = ED.src.duration;
+  const pos = dur ? (player.currentTime / dur) * w : 0;
+  const s = ED.getState().trim;
   tCtx.clearRect(0, 0, w, h);
   for (let x = 0; x < w; x++) {
     let min = 1, max = -1;
@@ -1285,53 +1291,55 @@ function xToFrac(e) {
   return Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1);
 }
 tWave.addEventListener("pointerdown", (e) => {
-  if (!trim.buffer) return;
+  if (!ED.src) return;
   trim.drag = [xToFrac(e), xToFrac(e)];
   tWave.setPointerCapture(e.pointerId);
 });
 tWave.addEventListener("pointermove", (e) => {
   if (!trim.drag) return;
   trim.drag[1] = xToFrac(e);
-  trim.sel = [Math.min(...trim.drag), Math.max(...trim.drag)];
+  const sel = [Math.min(...trim.drag), Math.max(...trim.drag)];
+  ED.setTrimLive(sel);          // 拖动中只更新状态与芯片，不重渲染音频
   drawTrimWave();
-  const d = trim.buffer.duration;
-  $("trimRange").textContent = `选中 ${(trim.sel[0] * d).toFixed(2)}s – ${(trim.sel[1] * d).toFixed(2)}s`;
+  const d = ED.src.duration;
+  $("trimRange").textContent =
+    `选中 ${(sel[0] * d).toFixed(2)}s – ${(sel[1] * d).toFixed(2)}s · ${((sel[1] - sel[0]) * d).toFixed(2)}s`;
 });
 tWave.addEventListener("pointerup", () => {
-  if (trim.drag) { trim.drag = null; updateDlName(); } // 选区定稿后再刷新下载名（带 _trim 后缀）
+  if (!trim.drag) return;
+  trim.drag = null;
+  ED.setTrim(ED.getState().trim);   // 定稿才压快照：拖一次不该产生几十条撤销记录
+  updateDlName();                   // 选区定稿后再刷新下载名（带 _trim 后缀）
 });
 
 let selStopTick = null;
-$("playSel").addEventListener("click", () => {
-  if (!trim.buffer) return;
-  if (!player.paused) player.pause();
-  const d = trim.buffer.duration;
+// 从头播放 / 播放选中都作用在源播放器上（#player 永远挂源音频），与编辑结果无关
+$("playFromStart").addEventListener("click", () => {
+  if (!ED.src) return;
   if (selStopTick) { player.removeEventListener("timeupdate", selStopTick); selStopTick = null; }
-  player.currentTime = (trim.sel ? trim.sel[0] : 0) * d;
+  player.currentTime = 0;
   player.play();
   bigPlayIcon.innerHTML = PAUSE2;
-  if (trim.sel) {
-    const stopAt = trim.sel[1] * d;
+});
+$("playSel").addEventListener("click", () => {
+  if (!ED.src) return;
+  if (!player.paused) player.pause();
+  if (selStopTick) { player.removeEventListener("timeupdate", selStopTick); selStopTick = null; }
+  // #player 永远挂源音频，所以这里定位的是源时间轴上的选区，与编辑结果无关
+  const sel = ED.getState().trim;
+  const d = ED.src.duration;
+  player.currentTime = (sel ? sel[0] : 0) * d;
+  player.play();
+  bigPlayIcon.innerHTML = PAUSE2;
+  if (sel) {
+    const stopAt = sel[1] * d;
     selStopTick = () => { if (player.currentTime >= stopAt) { player.pause(); player.removeEventListener("timeupdate", selStopTick); selStopTick = null; bigPlayIcon.innerHTML = PLAY2; } };
     player.addEventListener("timeupdate", selStopTick);
   }
 });
 $("resetSel").addEventListener("click", () => {
-  trim.sel = null;
-  $("trimRange").textContent = `全长 ${trim.buffer ? trim.buffer.duration.toFixed(2) : "—"}s`;
-  updateDlName();
-  drawTrimWave();
-});
-
-$("playFromStart").addEventListener("click", () => {
-  if (!trim.buffer) return;
-  if (selStopTick) {
-    player.removeEventListener("timeupdate", selStopTick);
-    selStopTick = null;
-  }
-  player.currentTime = 0;
-  player.play();
-  bigPlayIcon.innerHTML = PAUSE2;
+  // 清空选区（只动 trim，保留音量/变速）。文案与波形高亮由 syncTrimView 统一刷新
+  ED.setTrim(null);
 });
 
 player.addEventListener("play", () => { bigPlayIcon.innerHTML = PAUSE2; });
@@ -1361,27 +1369,62 @@ function encodeWav(buffer, s0, s1) {
   return new Blob([out], { type: "audio/wav" });
 }
 
-function updateDlName() {
-  // 与服务端 outputs/ 的实际文件名保持一致；仅剪辑下载时加 _trim 后缀
-  if (curServerFile) {
-    const base = curServerFile.replace(/\.wav$/i, "");
-    $("dlName").textContent = trim.sel ? `${base}_trim.wav` : curServerFile;
-    return;
-  }
-  // 回退：从结果 URL 推导（历史回放等场景）
-  const fromUrl = (curUrl || "").split("/").pop();
-  if (fromUrl && fromUrl !== "audio") { $("dlName").textContent = fromUrl; return; }
-  $("dlName").textContent = `spk_${Math.floor(Date.now() / 1000)}.wav`;
+function triggerDownload(href, name) {
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
+// 源音频的"原名"：优先用服务端 outputs/ 里的实际文件名，其次从 URL 推导
+function srcFileName() {
+  if (curServerFile) return curServerFile;
+  const fromUrl = (curUrl || "").split("/").pop();
+  if (fromUrl && fromUrl !== "audio") return fromUrl;
+  return `spk_${Math.floor(Date.now() / 1000)}.wav`;
+}
+
+function updateDlName() {
+  // 命名规则沿用原有：无操作=原名，仅裁剪=_trim，含增益/变速=_edit
+  // _edit 的判定与「编辑结果」条的显示条件同源——看到什么就拿什么
+  const base = srcFileName();
+  const stem = base.replace(/\.wav$/i, "");
+  const suffix = ED.hasResult() ? "_edit" : (ED.getState().trim ? "_trim" : "");
+  const outName = suffix ? `${stem}${suffix}.wav` : base;
+  $("dlSrcName").textContent = base;
+  $("dlName").textContent = outName;
+  // 「下载编辑结果」不在这里管显示与否——它整个包在 #resultPreview 里，
+  // 由 edit.js 的 paintResult() 随结果区一起显隐（默认不显示，有编辑结果才出现）
+  $("dlBtn").title = `下载剪辑后的音频（${outName}）`;
+  $("dlSrcBtn").title = `下载未经剪辑的生成音频（${base}）`;
+}
+
+// edit.js 在状态变化后回调：把源波形的选区高亮与选区文案拉回同步
+// （「重置全部」「撤销」都会清掉选区，只改 ED 是不够的）
+window.syncTrimView = function () {
+  if (!ED.src) return;
+  const s = ED.getState().trim;
+  const d = ED.src.duration;
+  $("trimRange").textContent = s
+    ? `选中 ${(s[0] * d).toFixed(2)}s – ${(s[1] * d).toFixed(2)}s · ${((s[1] - s[0]) * d).toFixed(2)}s`
+    : `全长 ${d.toFixed(2)}s`;
+  drawTrimWave();
+};
+
+$("dlSrcBtn").addEventListener("click", () => {
+  // 原音频：直接拿服务端那份文件，不经过任何剪辑链路，字节就是原始字节
+  const name = $("dlSrcName").textContent || srcFileName();
+  if (ED.srcUrl) triggerDownload(ED.srcUrl, name);
+  else if (ED.src) triggerDownload(URL.createObjectURL(encodeWav(ED.src)), name);
+});
+
 $("dlBtn").addEventListener("click", () => {
-  if (!trim.buffer) return;
-  const blob = encodeWav(trim.buffer, trim.sel ? trim.sel[0] : 0, trim.sel ? trim.sel[1] : undefined);
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = $("dlName").textContent;
-  a.click();
-  URL.revokeObjectURL(a.href);
+  const buf = ED.getRendered();
+  if (!buf || !ED.hasOps()) return;
+  // 下载与试听同源（都是 ED.rendered），不存在两套实现算出不同结果的可能
+  triggerDownload(URL.createObjectURL(encodeWav(buf)), $("dlName").textContent);
 });
 
 /* ---------------- preset library (right column, tabs with examples) ---------------- */
