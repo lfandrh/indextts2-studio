@@ -1820,6 +1820,7 @@ async function renderGlossary() {
       term.textContent = "暂无自定义术语";
       empty.append(term, document.createElement("span"), document.createElement("span"));
       box.appendChild(empty);
+      $("btnClearTerms").hidden = true;
       return;
     }
     for (const key of keys) {
@@ -1830,14 +1831,51 @@ async function renderGlossary() {
       term.className = "gl-term";
       const zh = document.createElement("span");
       const en = document.createElement("span");
-      row.append(term, zh, en);
+      const del = document.createElement("button");
+      del.className = "gl-del";
+      del.type = "button";
+      del.textContent = "×";
+      del.title = `删除术语「${key}」`;
+      del.setAttribute("aria-label", `删除术语 ${key}`);
+      del.addEventListener("click", () => removeTerm(key));
+      row.append(term, zh, en, del);
       term.textContent = key;
       zh.textContent = typeof value === "object" ? (value.zh || "") : "";
       en.textContent = typeof value === "object" ? (value.en || "") : (value || "");
       box.appendChild(row);
     }
+    $("btnClearTerms").hidden = false;
   } catch (err) { /* keep old list */ }
 }
+
+/* 单条删除是轻量可逆操作（重新添加即可），不弹确认框；清空全部才拦截。 */
+async function removeTerm(key) {
+  try {
+    const r = await fetch(`${API}/glossary/` + encodeURIComponent(key), { method: "DELETE" });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { showGlossaryError("删除术语失败: " + (j.detail || r.status)); return; }
+    clearGlossaryError();
+    await renderGlossary();
+    showActionHint(`已删除术语: ${key}`);
+  } catch (err) { showGlossaryError("删除术语失败: " + err); }
+}
+
+$("btnClearTerms").addEventListener("click", async () => {
+  const ok = await uiConfirm({
+    title: "清空术语",
+    body: "确定清空全部自定义术语？此操作不可恢复。",
+    okText: "清空", danger: true,
+  });
+  if (!ok) return;
+  try {
+    const r = await fetch(`${API}/glossary`, { method: "DELETE" });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { showGlossaryError("清空术语失败: " + (j.detail || r.status)); return; }
+    clearGlossaryError();
+    await renderGlossary();
+    showActionHint("术语已清空");
+  } catch (err) { showGlossaryError("清空术语失败: " + err); }
+});
 $("btnAddTerm").addEventListener("click", async () => {
   const fd = new FormData();
   fd.append("term", $("glTerm").value);
