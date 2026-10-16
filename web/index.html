@@ -255,7 +255,11 @@
         </div>
         <div class="edit-row">
           <b>变速</b>
-          <input type="range" id="tempoRange" min="0.5" max="2" step="0.05" value="1" aria-label="变速倍率">
+          <!-- 滑块与刻度包成一列：刻度永远和滑轨等宽对齐，点击刻度直接跳到该倍率 -->
+          <div class="tempo-wrap">
+            <input type="range" id="tempoRange" min="0.5" max="2" step="0.01" value="1" aria-label="变速倍率">
+            <div class="edit-ticks" id="tempoTicks" role="group" aria-label="常用变速倍率"></div>
+          </div>
           <span class="edit-val mono" id="tempoVal">1.00×</span>
           <span class="edit-note" id="tempoNote">保音高</span>
         </div>

@@ -19,6 +19,10 @@
   const HIST_MAX = 50;          // 快照栈上限
   const TEMPO_CACHE_MAX = 8;    // 变速结果缓存条数
   const GAIN_DEBOUNCE = 80;     // ms，拖动增益时的重算节流
+  // 变速刻度：0.5–2.0 均匀七档，正好把滑轨均分，所以刻度与滑块位置天然对齐。
+  // 既是标尺也是跳转按钮——拖动难对准的值（1.25×）点一下就到。
+  const TEMPO_TICKS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+  const TEMPO_SNAP = 0.02;      // 拖动落在 1.00±0.02 内吸附回原速，避免误操作出 1.01×
 
   const ED = {
     src: null,                  // 源 AudioBuffer，只读，全程不改动
@@ -90,7 +94,7 @@
     return p;
   }
 
-  /* ---------------- 变速（服务端 librosa，保音高） ---------------- */
+  /* ---------------- 变速（服务端 audiotsm WSOLA，保音高） ---------------- */
   function cacheSet(key, val) {
     ED.tempoCache.set(key, val);
     while (ED.tempoCache.size > TEMPO_CACHE_MAX) {
@@ -299,8 +303,19 @@
   function setBusy(on) {
     ED.busy = on;
     el.tempoRange.disabled = on;
+    for (const b of el.ticks.children) b.disabled = on;
     el.tempoNote.classList.toggle("busy", on);
     if (on) el.tempoNote.textContent = "变速计算中…";
+  }
+
+  /** 刻度高亮：当前倍率落在哪一档（拖动中也要跟着走） */
+  function syncTicks() {
+    const cur = Number(el.tempoRange.value) || 1;
+    for (const b of el.ticks.children) {
+      const on = Math.abs(Number(b.dataset.rate) - cur) < 0.005;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+    }
   }
 
   function syncControls() {
@@ -312,6 +327,7 @@
     el.tempoVal.textContent = (t || 1).toFixed(2) + "×";
     fill(el.gainRange);
     fill(el.tempoRange);
+    syncTicks();
     paintEstimate();
   }
 
@@ -448,7 +464,7 @@
 
   const el = {
     gainRange: $("gainRange"), gainVal: $("gainVal"), peakNote: $("peakNote"), gainMax: $("gainMax"),
-    tempoRange: $("tempoRange"), tempoVal: $("tempoVal"), tempoNote: $("tempoNote"),
+    tempoRange: $("tempoRange"), tempoVal: $("tempoVal"), tempoNote: $("tempoNote"), ticks: $("tempoTicks"),
     chips: $("opsChips"), undo: $("undoBtn"), redo: $("redoBtn"), resetAll: $("resetAllBtn"),
     out: $("resultPreview"), outWave: $("waveOut"), outDur: $("outDur"),
     outPlay: $("outPlay"), outPlayIcon: $("outPlayIcon"),
@@ -483,10 +499,38 @@
     el.gainRange.dispatchEvent(new Event("change"));
   });
 
+  // 刻度按钮：走和拖动完全相同的 input + change 两条事件，所以忙碌态、快照、
+  // 渲染、失败回滚都自动一致，不需要第二条代码路径。
+  (function buildTicks() {
+    for (const rate of TEMPO_TICKS) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "tick";
+      b.dataset.rate = String(rate);
+      b.textContent = rate.toFixed(2);
+      b.title = "点击跳到 " + rate.toFixed(2) + "×";
+      b.setAttribute("aria-label", "变速 " + rate.toFixed(2) + " 倍");
+      b.setAttribute("aria-pressed", "false");
+      b.addEventListener("click", () => {
+        if (ED.busy) return;
+        el.tempoRange.value = String(rate);
+        el.tempoRange.dispatchEvent(new Event("input"));
+        el.tempoRange.dispatchEvent(new Event("change"));
+      });
+      el.ticks.appendChild(b);
+    }
+    syncTicks();
+  })();
+
   el.tempoRange.addEventListener("input", () => {           // 拖动即时更新数字，松手才请求服务端
-    const rate = Number(el.tempoRange.value) || 1;
+    let rate = Number(el.tempoRange.value) || 1;
+    if (Math.abs(rate - 1) <= TEMPO_SNAP) {                 // 中间吸附原速，别误出一堆 1.01×
+      rate = 1;
+      el.tempoRange.value = "1";
+    }
     fill(el.tempoRange);
     el.tempoVal.textContent = rate.toFixed(2) + "×";
+    syncTicks();
     paintEstimate();
   });
   el.tempoRange.addEventListener("change", async () => {     // 松手才请求服务端
@@ -494,11 +538,13 @@
     const rate = Number(el.tempoRange.value);
     ED.state.tempo = Math.abs(rate - 1) < 0.001 ? null : rate;
     el.tempoVal.textContent = (ED.state.tempo || 1).toFixed(2) + "×";
+    syncTicks();
     pushHistory();
     if (!(await render())) {                                // 失败回滚，别留下一个假的 chip
       ED.state.tempo = prev;
       el.tempoRange.value = String(prev || 1);
       el.tempoVal.textContent = (prev || 1).toFixed(2) + "×";
+      syncTicks();
       syncChips();
       paintEstimate();
     }

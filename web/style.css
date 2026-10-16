@@ -536,7 +536,22 @@ textarea:focus, select:focus, input:focus {
 .edit-panel { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
 .edit-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
 .edit-row > b { flex: none; width: 32px; font-size: 12.5px; font-weight: 600; color: var(--muted); }
-.edit-row input[type="range"] { flex: 1; min-width: 110px; max-width: 260px; }
+.edit-row input[type="range"] { flex: 1; min-width: 110px; }
+/* 变速：滑轨吃满可用宽度（原来被 max-width 260px 掐短），刻度挂在滑轨正下方 */
+.tempo-wrap { flex: 1; min-width: 140px; display: flex; flex-direction: column; gap: 2px; }
+.tempo-wrap input[type="range"] { flex: none; width: 100%; min-width: 0; }
+.edit-ticks { display: flex; justify-content: space-between; padding: 0 7px; }
+.edit-ticks .tick {
+  background: none; border: none; padding: 1px 5px; border-radius: 4px; cursor: pointer;
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--faint);
+  transition: color .12s ease, background .12s ease;
+}
+.edit-ticks .tick:hover { color: var(--ink); background: var(--meter-track); }
+.edit-ticks .tick.on { color: var(--accent); font-weight: 700; }
+.edit-ticks .tick:disabled { opacity: .5; cursor: progress; }
+/* 悬停时滑块放大一点，抓取感更明确（原样式只在按下时放大） */
+.edit-row input[type="range"]:hover::-webkit-slider-thumb { transform: scale(1.12); }
+.edit-row input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.22); }
 .edit-val { font-size: 12px; font-weight: 600; color: var(--ink); min-width: 58px; }
 .edit-note { font-size: 11.5px; color: var(--faint); }
 .edit-note.busy { color: var(--warn); }
