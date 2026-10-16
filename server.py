@@ -1325,7 +1325,7 @@ def do_tts(
         while True:
             ev = progress_q.get()
             yield f"data: {json.dumps(ev)}\n\n"
-            if ev["type"] in ("done", "error"):
+            if ev["type"] in ("done", "error", "stopped"):
                 return
 
     return StreamingResponse(
