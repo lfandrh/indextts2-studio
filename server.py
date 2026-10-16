@@ -1359,54 +1359,75 @@ def audio(name: str):
 # ---- tempo (pitch-preserving time stretch) ----------------------------------
 # Pure CPU work: deliberately NOT guarded by _INFER_LOCK. A queued long-text
 # generation must never be blocked by someone dragging the speed slider.
-# librosa is imported lazily -- it is only ever needed here, and pulling it in
+# Engine: audiotsm's WSOLA (time-domain overlap-add, MIT licensed). The old
+# engine was a bare phase vocoder (librosa.effects.time_stretch) which rewrites
+# phase without touching magnitude -- overlapping frames then cancel each other
+# out, so it sounds metallic ("电音") and the peak came out at ~50% of source.
+# WSOLA searches for the best alignment before overlap-add, so energy and
+# transients survive (measurements in docs/TEMPO_ENGINE_LICENSE_REVIEW_zh.md).
+# audiotsm is imported lazily -- it is only ever needed here, and pulling it in
 # at startup would slow down every boot for a feature most runs never touch.
 _TEMPO_MIN, _TEMPO_MAX = 0.5, 2.0
-_librosa = None
+_WSOLA_FRAME = 1024          # audiotsm 的默认帧长；显式写出来，补帧时要用
+_wsola = None
 
 
-def _get_librosa():
-    global _librosa
-    if _librosa is None:
-        import librosa  # noqa: PLC0415  (lazy on purpose, see above)
-        _librosa = librosa
-    return _librosa
+def _get_wsola():
+    global _wsola
+    if _wsola is None:
+        from audiotsm import wsola  # noqa: PLC0415  (lazy on purpose, see above)
+        _wsola = wsola
+    return _wsola
 
 
 def _stretch_wav(in_path: str, rate: float) -> bytes:
-    """Read wav -> time-stretch -> write 16bit PCM wav into memory."""
+    """Read wav -> WSOLA time-stretch -> write 16bit PCM wav into memory."""
     import numpy as np  # noqa: PLC0415
     import soundfile as sf  # noqa: PLC0415
+    from audiotsm.io.array import ArrayReader, ArrayWriter  # noqa: PLC0415
 
-    librosa = _get_librosa()
     y, sr = sf.read(in_path, dtype="float32")
     if y.ndim > 1:                      # stereo -> mono, the model output is mono anyway
         y = y.mean(axis=1)
     if not y.size:
         raise ValueError("音频没有可处理的采样点")
-    y = np.ascontiguousarray(y)
-    out = librosa.effects.time_stretch(y, rate=rate)
+    n = y.shape[0]
+    # WSOLA 按整帧输出，收尾那帧不满就被丢掉：直接跑出来的时长会比理想值短一帧左右
+    # （55s 的音频差 60ms，3s 的短音频差 2.5%，肉眼能看出和前端预估对不上）。
+    # 所以尾部补一帧静音再按理想长度裁回来 —— 尾巴不被吃掉，时长与「结果 x.xx s」一致。
+    src = np.ascontiguousarray(y.reshape(1, -1), dtype="float32")
+    src = np.concatenate([src, np.zeros((1, _WSOLA_FRAME), dtype="float32")], axis=1)
+    writer = ArrayWriter(1)
+    _get_wsola()(channels=1, speed=rate, frame_length=_WSOLA_FRAME).run(ArrayReader(src), writer)
+    out = writer.data[0]
+    want = int(round(n / rate))
+    if out.shape[0] < want:             # 慢速时偶尔短几十个采样，补零对齐
+        out = np.concatenate([out, np.zeros(want - out.shape[0], dtype=out.dtype)])
+    else:                              # 多出来的是刚补的静音尾巴，裁掉
+        out = out[:want]
     buf = io.BytesIO()
     sf.write(buf, out, sr, subtype="PCM_16", format="WAV")
     return buf.getvalue()
 
 
 def _warmup_tempo():
-    """Pay the numba JIT cost up front.
+    """Pay the audiotsm import cost off the request path.
 
-    The first ever time_stretch call costs ~8s on a fresh install (numba
-    compiles the phase-vocoder kernel); afterwards it is cached on disk and a
-    cold process only pays ~1s. Do it on a 0.2s silence buffer in a background
-    thread so the first real request stays snappy.
+    WSOLA has no JIT to warm up (that was the old phase vocoder's numba kernel,
+    ~8s on a fresh install), so this only pulls numpy + audiotsm in and proves
+    the dependency is importable -- a missing audiotsm then shows up as a boot
+    warning instead of a user staring at "变速计算中…" forever.
     """
     try:
         import numpy as np  # noqa: PLC0415
+        from audiotsm.io.array import ArrayReader, ArrayWriter  # noqa: PLC0415
 
-        librosa = _get_librosa()
-        librosa.effects.time_stretch(np.zeros(4410, dtype="float32"), rate=1.1)
-        logger.info("librosa time_stretch warmed up")
+        _get_wsola()(channels=1, speed=1.1).run(
+            ArrayReader(np.zeros((1, 4410), dtype="float32")), ArrayWriter(1)   # 0.2s @22.05k
+        )
+        logger.info("audiotsm wsola warmed up")
     except Exception as e:                       # warmup is best-effort only
-        logger.warning("librosa warmup failed: %s", e)
+        logger.warning("audiotsm warmup failed: %s", e)
 
 
 @api.post("/audio/tempo")
@@ -1930,7 +1951,8 @@ if __name__ == "__main__":
     if removed:
         logger.info("Cleaned %d output file(s) older than %d days.", removed, OUTPUTS_RETENTION_DAYS)
     logger.info("IndexTTS2 server starting... port %d", cmd_args.port)
-    # 后台预热 librosa 的 numba JIT：装机后第一次变速要 8s（编译 phase vocoder 内核），
-    # 用 0.2s 静音提前付掉，避免用户第一次拖变速滑块时以为卡死。失败不影响服务。
+    # 后台加载 numpy + audiotsm：变速引擎的 import 成本提前付掉，顺便让「包内
+    # 缺少 audiotsm」在启动日志里就报出来，而不是等用户拖滑块时卡在「变速计算中…」。
+    # 失败不影响服务。
     threading.Thread(target=_warmup_tempo, daemon=True, name="tempo-warmup").start()
     uvicorn.run(app, host=cmd_args.host, port=cmd_args.port, log_level="warning")

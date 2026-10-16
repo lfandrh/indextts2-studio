@@ -104,6 +104,18 @@ wheels = [
 ]
 
 [[package]]
+name = "audiotsm"
+version = "0.1.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f8/b8/721a9c613641c938a6fb9c7c3efb173b7f77b519de066e9cd2eeb27c3289/audiotsm-0.1.2.tar.gz", hash = "sha256:8870af28fad0a76cac1d2bb2b55e7eac6ad5d1ad5416293eb16120dece6c0281", size = 6558897, upload-time = "2017-09-21T20:26:13.164Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9c/7d/a214ff529fed9501452252d24231f54ab5afe8691b4f81e5d07d204070b4/audiotsm-0.1.2-py2.py3-none-any.whl", hash = "sha256:f6041b2a38326d1449ca84218c258c54ee126868fe864e12a17e425365ec93be", size = 32172, upload-time = "2017-09-21T20:26:05.689Z" },
+]
+
+[[package]]
 name = "brotli"
 version = "1.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -619,6 +631,7 @@ version = "2.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate", marker = "sys_platform == 'win32'" },
+    { name = "audiotsm", marker = "sys_platform == 'win32'" },
     { name = "cn2an", marker = "sys_platform == 'win32'" },
     { name = "cython", marker = "sys_platform == 'win32'" },
     { name = "descript-audiotools", marker = "sys_platform == 'win32'" },
@@ -667,6 +680,7 @@ webui = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = "==1.8.1" },
+    { name = "audiotsm", specifier = "==0.1.2" },
     { name = "cn2an", specifier = "==0.5.22" },
     { name = "cython", specifier = "==3.0.7" },
     { name = "descript-audiotools", specifier = "==0.7.2" },
