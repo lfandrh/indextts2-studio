@@ -1061,7 +1061,15 @@ def do_tts(
         except Exception as e:
             raise HTTPException(400, f"Failed to save emo audio: {e}")
 
-    mode = int(emo_mode)
+    # emo_mode 来自表单是字符串；非数字用 400 明确拒绝，而不是在 int() 上
+    # 抛未捕获异常变成 500。越界值（只允许 0~3）同样拒绝——此前 9 之类会
+    # 静默落进 else 当成 0 处理。
+    try:
+        mode = int(emo_mode)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "情感模式参数无效（应为 0~3 的整数）")
+    if mode not in (0, 1, 2, 3):
+        raise HTTPException(400, "情感模式参数无效（应为 0~3 的整数）")
     if mode == 0:
         emo_ref_path = None
         vec = None
