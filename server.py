@@ -862,7 +862,9 @@ def _register_job(client_id):
     job_id = uuid.uuid4().hex[:12]
     with _JOBS_LOCK:
         _prune_finished_jobs()
-        ahead = sum(1 for j in _JOBS.values() if j["state"] == "queued")
+        # 队首正在跑的任务也算「前面还有」——只数 queued 会让「已经有一个在
+        # 跑、再提交一个」的第二个任务 ahead=0，界面就不显示排队提示了。
+        ahead = sum(1 for j in _JOBS.values() if j["state"] in ("queued", "running"))
         _JOBS[job_id] = {
             "job_id": job_id,
             "client_id": client_id,
