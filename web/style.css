@@ -176,6 +176,9 @@ textarea:focus, select:focus, input:focus {
 .seg-scroll { max-height: 176px; overflow-y: auto; margin: 6px 0 2px; }
 .seg-list { display: flex; flex-direction: column; gap: 4px; }
 .seg-fold:not([open]) .seg-scroll { display: none; }
+/* 分句 Token 滑块跟预览同属一个面板，收紧下边距避免贴到面板底边 */
+.seg-fold .slider { margin: 6px 0 10px; }
+.seg-fold .slider label span { font-size: 10.5px; }
 .seg-item {
   display: flex; align-items: baseline; gap: 8px; padding: 6px 9px;
   border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2);

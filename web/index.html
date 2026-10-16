@@ -55,8 +55,10 @@
       <div class="grow"><textarea id="text" rows="4" maxlength="10000" placeholder="输入要合成的文本…">欢迎使用 IndexTTS2 语音合成工作台！上传参考音频，即刻克隆你想要的声音</textarea></div>
       <div class="opfoot mono"><span id="charCount">0 字</span><span id="segInfo">分句预览待输入</span></div>
       <details class="fold seg-fold" id="segFold" open>
-        <summary>分句预览 <span class="q" title="输入文本后实时更新；按分句最大 Token 数自动切分">?</span></summary>
+        <summary>分句预览 <span class="q" title="输入文本后实时更新；拖动下方滑块可调整每段的 Token 上限">?</span></summary>
         <div class="seg-scroll"><div class="seg-list" id="segList"></div></div>
+        <!-- 分句最大 Token 直接决定上面怎么切，放在预览下方改动即时可见 -->
+        <div class="slider"><label for="segTokens">分句最大 Token <span>max_text_tokens_per_segment</span></label><div class="srow"><input type="range" id="segTokens" min="20" max="600" step="2" value="120"><output id="segTokensOut">120</output></div></div>
       </details>
     </div>
 
