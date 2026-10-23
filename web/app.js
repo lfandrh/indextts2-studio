@@ -510,11 +510,19 @@ $("spkChange").addEventListener("click", () => {
 
 /* emo reference audio shares the same pattern */
 const emoDrop = $("emoDrop"), emoFile = $("emoFile");
+// 参考音频“当前选择”的版本号：预设音频是异步 fetch 的，下载期间用户
+// 可能已经自己拖了新文件进来，晚到的预设音频不能再覆盖用户的选择。
+const refSelSeq = { spk: 0, emo: 0 };
 emoDrop.addEventListener("dragover", (e) => { e.preventDefault(); emoDrop.classList.add("over"); });
 emoDrop.addEventListener("dragleave", () => emoDrop.classList.remove("over"));
 emoDrop.addEventListener("drop", (e) => { e.preventDefault(); emoDrop.classList.remove("over"); if (e.dataTransfer.files[0]) setEmoFile(e.dataTransfer.files[0]); });
 emoFile.addEventListener("change", () => emoFile.files[0] && setEmoFile(emoFile.files[0]));
 function setEmoFile(f, persist = true) {
+  refSelSeq.emo++;
+  // 拖拽进来 / 预设 fetched 的 Blob 不会自动写进 <input type=file>，
+  // 而提交时读的是 input.files[0]。这里必须同步，否则界面换了音频、
+  // 生成却仍然用 input 里的旧文件（预设自带的那份）。
+  if (emoFile.files[0] !== f) assignFile(emoFile, f);
   $("emoName").textContent = f.name;
   if (persist) setDraftBlob(DRAFT_AUDIO_KEYS.emo, f).catch(() => {});
 }
@@ -602,6 +610,9 @@ function resetSpkSelection() {
   spkPlaying = false;
   spkSeekFrac = 0;
   spkBuffer = null;
+  // input 自身也要清空：只清草稿和界面的话，用户在“更换音频”里点取消，
+  // 音色参考音频区域显示为空，生成却仍会默默用上一次的文件。
+  spkFile.value = "";
   // 草稿里的音频 blob 一并清掉:否则"更换音频"后取消文件选择,
   // 刷新页面会把旧音频从 IndexedDB 恢复回来
   setDraftBlob(DRAFT_AUDIO_KEYS.spk, null).catch(() => {});
@@ -614,6 +625,11 @@ function resetSpkSelection() {
 }
 
 function setSpkFile(f, persist = true) {
+  refSelSeq.spk++;
+  // 同 setEmoFile：拖拽 / 预设音频只是 JS 里的一个 File，不会进 input.files，
+  // 而 /tts 与「保存预设」都只读 input.files[0]，不同步就会出现
+  // “界面和试听都换了，生成还是旧音色”。
+  if (spkFile.files[0] !== f) assignFile(spkFile, f);
   $("spkFileName").textContent = f.name;
   $("spkFileName").title = f.name;
   $("spkDrop").hidden = true;
@@ -1432,11 +1448,14 @@ let presetNamesCache = [];
 let curPresetName = "";       // applied preset name (for summary line + card highlight)
 let exCache = [];             // example items cache
 
-async function fetchPresetAudio(url, inputEl, applyFn) {
+async function fetchPresetAudio(url, inputEl, applyFn, seqKey) {
+  const seq = seqKey ? refSelSeq[seqKey] : 0;
   try {
     const r = await fetch(url);
     if (!r.ok) return;
     const blob = await r.blob();
+    // 下载期间用户已经自己换了音频：以用户的选择为准
+    if (seqKey && refSelSeq[seqKey] !== seq) return;
     const fileName = (url.split("/").pop() || "audio") + ".wav";
     const file = new File([blob], fileName, { type: "audio/wav" });
     const dt = new DataTransfer();
@@ -1462,8 +1481,8 @@ function applyPresetToForm(j) {
   setVecInputs(j.emo_vector || [0, 0, 0, 0, 0, 0, 0, 0]);
   bindSliders();
   emoVisible();
-  if (j.prompt_audio_url) fetchPresetAudio(j.prompt_audio_url, $("spkFile"), setSpkFile);
-  if (j.emo_audio_url) fetchPresetAudio(j.emo_audio_url, $("emoFile"), setEmoFile);
+  if (j.prompt_audio_url) fetchPresetAudio(j.prompt_audio_url, $("spkFile"), setSpkFile, "spk");
+  if (j.emo_audio_url) fetchPresetAudio(j.emo_audio_url, $("emoFile"), setEmoFile, "emo");
   scheduleSegments();
   scheduleDraftSave();
 }
