@@ -486,10 +486,23 @@ const spkPlay = $("spkPlay"), spkPlayIcon = $("spkPlayIcon");
 let spkBuffer = null, spkPlaying = false, spkSeekFrac = 0;
 let spkUrl = null;
 
+/* 用户自己换音频（拖入 / 选择文件）时调用：当前参数组合已经不等于预设内容了，
+   标签若继续显示「预设: 胡桃」，会让人以为生成还在用预设那份参考音频。
+   注意只清标签，不重置采样参数——常用的玩法正是「沿用预设参数、只换一个音色」。 */
+function dropPresetSelection() {
+  if (!curPresetName) return;
+  curPresetName = "";
+  updateGenSummary();
+  if (curLib === "presets") renderLib();   // 资源库里那张卡的选中态同步取消
+  scheduleDraftSave();
+}
+function userPickedSpk(f) { dropPresetSelection(); setSpkFile(f); }
+function userPickedEmo(f) { dropPresetSelection(); setEmoFile(f); }
+
 spkDrop.addEventListener("dragover", (e) => { e.preventDefault(); spkDrop.classList.add("over"); });
 spkDrop.addEventListener("dragleave", () => spkDrop.classList.remove("over"));
-spkDrop.addEventListener("drop", (e) => { e.preventDefault(); spkDrop.classList.remove("over"); if (e.dataTransfer.files[0]) setSpkFile(e.dataTransfer.files[0]); });
-spkFile.addEventListener("change", () => spkFile.files[0] && setSpkFile(spkFile.files[0]));
+spkDrop.addEventListener("drop", (e) => { e.preventDefault(); spkDrop.classList.remove("over"); if (e.dataTransfer.files[0]) userPickedSpk(e.dataTransfer.files[0]); });
+spkFile.addEventListener("change", () => spkFile.files[0] && userPickedSpk(spkFile.files[0]));
 let draftSaveTimer = null;
 function scheduleDraftSave() {
   clearTimeout(draftSaveTimer);
@@ -501,7 +514,7 @@ spkPlayerBox.addEventListener("dragleave", () => spkPlayerBox.classList.remove("
 spkPlayerBox.addEventListener("drop", (e) => {
   e.preventDefault();
   spkPlayerBox.classList.remove("over");
-  if (e.dataTransfer.files[0]) setSpkFile(e.dataTransfer.files[0]);
+  if (e.dataTransfer.files[0]) userPickedSpk(e.dataTransfer.files[0]);
 });
 $("spkChange").addEventListener("click", () => {
   resetSpkSelection();
@@ -515,8 +528,8 @@ const emoDrop = $("emoDrop"), emoFile = $("emoFile");
 const refSelSeq = { spk: 0, emo: 0 };
 emoDrop.addEventListener("dragover", (e) => { e.preventDefault(); emoDrop.classList.add("over"); });
 emoDrop.addEventListener("dragleave", () => emoDrop.classList.remove("over"));
-emoDrop.addEventListener("drop", (e) => { e.preventDefault(); emoDrop.classList.remove("over"); if (e.dataTransfer.files[0]) setEmoFile(e.dataTransfer.files[0]); });
-emoFile.addEventListener("change", () => emoFile.files[0] && setEmoFile(emoFile.files[0]));
+emoDrop.addEventListener("drop", (e) => { e.preventDefault(); emoDrop.classList.remove("over"); if (e.dataTransfer.files[0]) userPickedEmo(e.dataTransfer.files[0]); });
+emoFile.addEventListener("change", () => emoFile.files[0] && userPickedEmo(emoFile.files[0]));
 function setEmoFile(f, persist = true) {
   refSelSeq.emo++;
   // 拖拽进来 / 预设 fetched 的 Blob 不会自动写进 <input type=file>，
