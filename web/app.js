@@ -374,11 +374,6 @@ themeBtn.addEventListener("click", () => {
   applyTheme(next);
 });
 
-/* ---------------- header waveform (signature) ---------------- */
-const hWave = $("waveHeader"), hCtx = hWave.getContext("2d");
-let genAnim = { on: false, level: 0, progress: 0 };
-let waveT = 0;
-
 function sizeCanvas(cv) {
   const r = cv.getBoundingClientRect();
   const d = window.devicePixelRatio || 1;
@@ -392,34 +387,94 @@ function sizeCanvas(cv) {
 
 function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
-function drawHeaderWave(t) {
-  t = t || waveT || 0;
-  const { w, h } = sizeCanvas(hWave);
-  hCtx.clearRect(0, 0, w, h);
-  const accent = cssVar("--accent"), primary = cssVar("--primary");
-  /* 3px 一格、1.6px 一根。原来 4px 一格 2px 宽，1440 下只有 54 根 2px 短线，
-     叠上 50% 透明度就是一条若有若无的虚线——补上「画到一半的分隔线」的既视感。 */
-  const n = Math.floor(w / 3);
-  const mid = h / 2;
-  for (let i = 0; i < n; i++) {
-    const p = n > 1 ? i / (n - 1) : 0;
-    // 两端渐隐：波形有明确的起止，不会在画布边缘被硬切
-    const fade = Math.min(1, Math.min(p, 1 - p) / 0.08);
-    let a;
-    if (genAnim.on) {
-      a = Math.sin(p * Math.PI) * (0.25 + 0.75 * Math.abs(Math.sin(i * 0.7 + t / 130))) * genAnim.level;
-    } else {
-      // 空闲态：两条不同频率的正弦叠加，既不像节拍器也不像等高虚线的静态轮廓
-      a = 0.17 + 0.11 * Math.sin(i * 0.36 + t / 1600) + 0.06 * Math.sin(i * 1.15 - t / 900);
-    }
-    const bh = Math.max(1.5, a * fade * h);
-    hCtx.fillStyle = genAnim.on && p < genAnim.progress ? primary : accent;
-    hCtx.globalAlpha = genAnim.on ? 0.95 : 0.55;
-    hCtx.fillRect(i * 3, mid - bh / 2, 1.6, bh);
+/* ---------------- header waveform (signature) ----------------
+   顶栏这条横带不是装饰，是把「一段语音」压成的包络。三条规则决定它长什么样：
+   1. 配色只走品牌红。蓝色在这套系统里是数据色（真波形、进度、数值都用它），
+      顶栏再插一条蓝就变成第二主色，跟暖白底 + 红主操作互相打架。
+   2. 包络由 8 个「音节爆发」拼成，爆发宽窄高低不一、中间留真静音，
+      读起来像一段话；原来那条是两条正弦叠加，只会荡成一条抖动的虚线。
+   3. 1px 列 + 锯齿顶边 + 纯色填充 —— 跟结果卡里的真波形同一套画法（drawSpkWave），
+      只是缩到 24px 高的 chrome 尺度。试过竖向渐变，会把锯齿磨成气刷感的「叶片」，
+      小尺寸下反而失真，所以不用。 */
+const hWave = $("waveHeader"), hCtx = hWave.getContext("2d");
+let genAnim = { on: false, level: 0, progress: 0 };
+let waveT = 0;
+/* c 位置 / w 宽度（占整条的比例）/ a 峰值。宽窄、高低都错开，中间留两次真停顿，
+   避免排成一串等距菱形；停顿时长不同，才像「说完一句换口气」而不是节拍器 */
+const HDR_BURST = [
+  { c: .05, w: .048, a: .50 },
+  { c: .17, w: .072, a: .95 },
+  { c: .29, w: .040, a: .68 },
+  { c: .41, w: .032, a: .35 },
+  { c: .53, w: .060, a: 1.00 },
+  { c: .66, w: .044, a: .72 },
+  { c: .79, w: .068, a: .88 },
+  { c: .92, w: .036, a: .55 },
+];
+const hdrNoise = (i) => { const s = Math.sin(i * 12.9898) * 43758.5453; return s - Math.floor(s); };
+/* t 只驱动极慢的整体漂移（约 3s 一个来回）：静止时也有一口气，但看不出在动 */
+function hdrEnv(i, n, t) {
+  const p = n > 1 ? i / (n - 1) : 0;
+  const drift = Math.sin(t / 3000) * .018;
+  let e = 0;
+  for (let k = 0; k < HDR_BURST.length; k++) {
+    const b = HDR_BURST[k];
+    const dd = (p - b.c - drift * (k % 2 ? -1.6 : 1)) / b.w;
+    const g = Math.exp(-dd * dd * 1.6) * b.a;
+    if (g > e) e = g;
   }
-  hCtx.globalAlpha = 1;
+  // 相邻三格平滑过的噪声：爆发内部也不等高，否则就是一段段等幅的梳子
+  const jit = (hdrNoise(i - 1) + 2 * hdrNoise(i) + hdrNoise(i + 1)) / 4;
+  return e * (.38 + .62 * jit);
 }
-setInterval(() => { if (!document.hidden) drawHeaderWave(waveT + 16); }, 250); // gentle idle refresh
+/* 令牌是 6 位 hex，画布要带 alpha 的色值，所以在这里拼 rgba；
+   不直接字符串加 "66"（万一以后换成 rgb()/oklch() 会静默失效） */
+function alphaOf(color, a) {
+  const s = String(color).trim().replace("#", "");
+  const hex = s.length === 3 ? s.split("").map((c) => c + c).join("") : s;
+  if (!/^[0-9a-f]{6}$/i.test(hex)) return color;
+  const v = parseInt(hex, 16);
+  return `rgba(${(v >> 16) & 255}, ${(v >> 8) & 255}, ${v & 255}, ${a})`;
+}
+const HDR_REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+function drawHeaderWave(t) {
+  t = t || 0;
+  const { w, h } = sizeCanvas(hWave);
+  const mid = Math.round(h / 2);
+  hCtx.clearRect(0, 0, w, h);
+
+  const primary = cssVar("--primary");
+  const running = genAnim.on;
+  const playedX = running ? genAnim.progress * w : -1;
+  // 闲置 58% 是「暖色底纹」的浓度：看得出是声音，但不跟红点、主按钮抢注意力
+  const quiet = alphaOf(primary, .58), live = alphaOf(primary, .94);
+
+  let isLive = false;
+  hCtx.fillStyle = quiet;
+  for (let x = 0; x < w; x++) {
+    const p = w > 1 ? x / w : 0;
+    let e = hdrEnv(x, w, t);
+    const wantLive = x <= playedX;
+    if (running && wantLive) {
+      // 只让「已经生成的这一段」动：播放头附近鼓一个包（凸起 → 凹陷），
+      // 像声音正被一路写过去。整条一起抖的话，跟真实进度就对不上了。
+      const head = Math.exp(-(p - genAnim.progress) * (p - genAnim.progress) * 160);
+      e = Math.min(1, e * (.8 + .3 * genAnim.level + .55 * head));
+    }
+    // 两端渐隐：横带要有明确起止，不能贴到画布边缘被硬切
+    const edge = Math.min(1, Math.min(p, 1 - p) / .06);
+    // 0.6px 下限 = 停顿处只剩一根发丝，整条仍然连成一段音轨
+    const a = Math.max(.6, e * edge * h * .44);
+    if (wantLive !== isLive) { isLive = wantLive; hCtx.fillStyle = isLive ? live : quiet; }
+    hCtx.fillRect(x, mid - a, 1, a * 2);
+  }
+}
+/* 呼吸：4 次/秒重画一次足够，肉眼读到的是「缓慢漂移」，不是动画。
+   系统开了减少动态效果就完全停掉，只留一张静态包络。 */
+if (!HDR_REDUCED.matches) {
+  setInterval(() => { if (!document.hidden) drawHeaderWave(performance.now()); }, 250);
+}
 let waveRAF = 0;
 function waveLoop(t) {
   waveT = t;

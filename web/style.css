@@ -169,12 +169,13 @@ header {
 /* 副标题只在宽屏出现，且宽度预算优先给仪表条 */
 .brand small { display: none; color: var(--muted); font-weight: 500; font-size: var(--fs-12); }
 
+/* 顶栏那条波形横带：浓度已经画在画布颜色里（闲置 58%），这里不再叠 opacity，
+   否则再乘 .9 会淡成一层灰粉 */
 #waveHeader {
   height: 24px;
   flex: 1 1 100px;
   min-width: 40px;
   max-width: 420px;
-  opacity: .9;
   align-self: center;
 }
 .spacer { flex: 1 1 0; min-width: 0; }
