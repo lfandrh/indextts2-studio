@@ -32,6 +32,8 @@ desktop.ini
 # 服务端运行时产物：参考音频缓存与日志，仅本机使用
 /prompts/
 /logs/
+# 服务端运行时状态（如 ui_state.json 里的参数锁定），每次运行都会变，不入库
+/data/
 # BigVGAN CUDA 扩展的本地编译产物（torch.utils.cpp_extension 生成）
 /indextts/s2mel/modules/bigvgan/alias_free_activation/cuda/build/
 
