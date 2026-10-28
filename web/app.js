@@ -225,31 +225,39 @@ function saveDraft() {
   } catch (e) { /* storage may be full; the active session remains usable */ }
 }
 
-function applyDraft(draft) {
-  if (!draft) return;
-  if (typeof draft.text === "string") $("text").value = draft.text;
-  if (typeof draft.curPresetName === "string") curPresetName = draft.curPresetName;
-  if (draft.emoMode != null) $("emoMode").value = String(draft.emoMode);
-  if (draft.emoWeight != null) $("emoWeight").value = draft.emoWeight;
-  if (typeof draft.emoText === "string") $("emoText").value = draft.emoText;
-  if (draft.emoRandom != null) $("emoRandom").checked = !!draft.emoRandom;
-  if (draft.doSample != null) $("doSample").checked = !!draft.doSample;
-  if (draft.topP != null) $("topP").value = draft.topP;
-  if (draft.topK != null) $("topK").value = draft.topK;
-  if (draft.temperature != null) $("temperature").value = draft.temperature;
-  if (draft.lenPen != null) $("lenPen").value = draft.lenPen;
-  if (draft.numBeams != null) $("numBeams").value = draft.numBeams;
-  if (draft.repPen != null) $("repPen").value = draft.repPen;
-  if (draft.maxMel != null) $("maxMel").value = draft.maxMel;
-  if (draft.segTokens != null) $("segTokens").value = draft.segTokens;
-  if (draft.gapMs != null) $("gapMs").value = draft.gapMs;
-  if (Array.isArray(draft.emoVector)) setVecInputs(draft.emoVector);
+/* 界面同步：不管有没有本地草稿都要跑一遍。
+   首屏文本域本身就预填了一段文字，如果跟着草稿一起跳过，计数器会停在 HTML 里的
+   初始值「0 字」，而估算区已经按真实文本算出「共 1 段 · 40 字」——同一屏两个数。 */
+function syncDraftUi() {
   $("charCount").textContent = `${$("text").value.trim().length} 字`;
   syncParams();
   emoVisible();
   updateGenSummary();
   scheduleSegments();
   enforceParamLock();
+}
+
+function applyDraft(draft) {
+  if (draft) {
+    if (typeof draft.text === "string") $("text").value = draft.text;
+    if (typeof draft.curPresetName === "string") curPresetName = draft.curPresetName;
+    if (draft.emoMode != null) $("emoMode").value = String(draft.emoMode);
+    if (draft.emoWeight != null) $("emoWeight").value = draft.emoWeight;
+    if (typeof draft.emoText === "string") $("emoText").value = draft.emoText;
+    if (draft.emoRandom != null) $("emoRandom").checked = !!draft.emoRandom;
+    if (draft.doSample != null) $("doSample").checked = !!draft.doSample;
+    if (draft.topP != null) $("topP").value = draft.topP;
+    if (draft.topK != null) $("topK").value = draft.topK;
+    if (draft.temperature != null) $("temperature").value = draft.temperature;
+    if (draft.lenPen != null) $("lenPen").value = draft.lenPen;
+    if (draft.numBeams != null) $("numBeams").value = draft.numBeams;
+    if (draft.repPen != null) $("repPen").value = draft.repPen;
+    if (draft.maxMel != null) $("maxMel").value = draft.maxMel;
+    if (draft.segTokens != null) $("segTokens").value = draft.segTokens;
+    if (draft.gapMs != null) $("gapMs").value = draft.gapMs;
+    if (Array.isArray(draft.emoVector)) setVecInputs(draft.emoVector);
+  }
+  syncDraftUi();
 }
 
 function draftElapsed(job) {
@@ -389,20 +397,25 @@ function drawHeaderWave(t) {
   const { w, h } = sizeCanvas(hWave);
   hCtx.clearRect(0, 0, w, h);
   const accent = cssVar("--accent"), primary = cssVar("--primary");
-  const n = Math.floor(w / 4);
+  /* 3px 一格、1.6px 一根。原来 4px 一格 2px 宽，1440 下只有 54 根 2px 短线，
+     叠上 50% 透明度就是一条若有若无的虚线——补上「画到一半的分隔线」的既视感。 */
+  const n = Math.floor(w / 3);
   const mid = h / 2;
   for (let i = 0; i < n; i++) {
+    const p = n > 1 ? i / (n - 1) : 0;
+    // 两端渐隐：波形有明确的起止，不会在画布边缘被硬切
+    const fade = Math.min(1, Math.min(p, 1 - p) / 0.08);
     let a;
     if (genAnim.on) {
-      const env = Math.sin(i / n * Math.PI);
-      a = env * (0.25 + 0.75 * Math.abs(Math.sin(i * 0.7 + t / 130))) * genAnim.level;
+      a = Math.sin(p * Math.PI) * (0.25 + 0.75 * Math.abs(Math.sin(i * 0.7 + t / 130))) * genAnim.level;
     } else {
-      a = 0.06 + 0.05 * Math.sin(i * 0.5 + t / 900);
+      // 空闲态：两条不同频率的正弦叠加，既不像节拍器也不像等高虚线的静态轮廓
+      a = 0.17 + 0.11 * Math.sin(i * 0.36 + t / 1600) + 0.06 * Math.sin(i * 1.15 - t / 900);
     }
-    const bh = Math.max(2, a * h);
-    hCtx.fillStyle = genAnim.on && i / n < genAnim.progress ? primary : accent;
-    hCtx.globalAlpha = genAnim.on ? 0.95 : 0.5;
-    hCtx.fillRect(i * 4, mid - bh / 2, 2.4, bh);
+    const bh = Math.max(1.5, a * fade * h);
+    hCtx.fillStyle = genAnim.on && p < genAnim.progress ? primary : accent;
+    hCtx.globalAlpha = genAnim.on ? 0.95 : 0.55;
+    hCtx.fillRect(i * 3, mid - bh / 2, 1.6, bh);
   }
   hCtx.globalAlpha = 1;
 }
@@ -1128,9 +1141,10 @@ async function updateSegments() {
     // 粗略值只为给长文本用户一个心理预期，不是精确基准）。
     // 注意不含【首次模型加载】（实测冷启动约 30~60 秒），也不含排队等待。
     const estSec = Math.round(segs.length * 4 + totalTok * 0.06);
-    const est = estSec >= 60 ? `约 ${Math.round(estSec / 60)} 分钟` : `约 ${estSec} 秒`;
+    // 只说一次「约」：原来是「预估 约 8 秒」，两个词表达同一件事
+    const est = estSec >= 60 ? `${Math.round(estSec / 60)} 分钟` : `${estSec} 秒`;
     $("estDurEcho").textContent =
-      `共 ${segs.length} 段 · ${$("text").value.trim().length} 字 · 预估 ${est}（不含首次加载模型）`;
+      `共 ${segs.length} 段 · ${$("text").value.trim().length} 字 · 约 ${est}（不含首次加载模型）`;
     if (segs.length > 10) {
       $("estDurEcho").textContent += "（长文本，建议分段生成）";
     }
@@ -1167,7 +1181,13 @@ function updateGenSummary() {
     curPresetName ? `预设: ${curPresetName}` : "预设: 无",
     `采样: temp ${Number($("temperature").value).toFixed(2)} / top_p ${Number($("topP").value).toFixed(2)} / top_k ${$("topK").value}`,
   ];
-  $("genSummary").textContent = parts.join("  ·  ");
+  $("genSummary").replaceChildren(...parts.map((t) => {
+    // 一段一个 span（样式里 nowrap）：换行只发生在段与段之间，
+    // 不会把「top_k 30」拆成两行、让末行只剩一个孤零零的数字
+    const s = document.createElement("span");
+    s.textContent = t;
+    return s;
+  }));
 }
 ["emoMode", "emoWeight", "temperature", "topP", "topK"].forEach((id) => {
   $(id).addEventListener("input", updateGenSummary);
@@ -1938,9 +1958,12 @@ function renderLib() {
       presetDetail(name).then((d) => {
         if (!d) { meta.textContent = "-"; return; }
         const adv = d.advanced_params || {};
-        meta.textContent = `${["同参考", "情感音频", "向量", "文本"][d.emo_control_method] ?? "-"} · ${d.prompt_audio_url ? "含音频" : "无音频"} · temp ${adv.temperature ?? "-"}`;
-        // 卡片只有 160px 宽，这行必然省略；把全文挂到 title 上，悬停能看全
-        meta.title = meta.textContent;
+        // 卡片只有约 156px 宽，原来这一行是「同参考 · 含音频 · temp 0.80」，
+        // 三列布局下必然省略成「…含音频 · t…」——收尾一个孤零零的字母最像 bug。
+        // 卡片上只留两个能一眼分类的事实，采样参数去检视面板看，全文挂 title。
+        const emoLabel = ["同参考", "情感音频", "向量", "文本"][d.emo_control_method] ?? "-";
+        meta.textContent = `${emoLabel} · ${d.prompt_audio_url ? "含音频" : "无音频"}`;
+        meta.title = `${meta.textContent} · temp ${adv.temperature ?? "-"}`;
       });
       row.addEventListener("click", async (e) => {
         if (e.target.closest(".pm-del") || e.target.closest(".pm-act")) return;
@@ -2329,6 +2352,14 @@ $("glCascade").addEventListener("change", async (e) => {
 
 /* ---------------- page tabs (gen / presets / model) ---------------- */
 const tabBtns = document.querySelectorAll("#tabs .tab");
+/* 页脚提示按当前页签换文案：三个页面共用一个 <footer>，
+   原来在预设页和模型页也写着「Ctrl+Enter 生成」，与当前能做的事无关。 */
+const FOOT_HINT = {
+  gen: "快捷键 Ctrl+Enter 生成 · Space 播放暂停 · Ctrl+S 存预设 · 主题跟随系统偏好，可点右上角切换",
+  presets: "预设存于服务端，跨会话可用 · 删除不可恢复 · 点卡片在右侧查看音色与采样参数",
+  model: "精度与加速项改动后需点「重启并应用配置」才生效 · 模型懒加载，首次生成约需 30~60 秒",
+};
+
 function switchPage(name, updateHash = true) {
   tabBtns.forEach((b) => b.classList.toggle("cur", b.dataset.page === name));
   document.querySelectorAll(".page").forEach((p) => {
@@ -2336,6 +2367,7 @@ function switchPage(name, updateHash = true) {
     p.classList.toggle("cur", on);
     p.hidden = !on;
   });
+  $("footHint").textContent = FOOT_HINT[name] || FOOT_HINT.gen;
   if (name === "model") refreshModelPage();
   if (name === "presets") refreshPmList();
   // hash 路由：刷新/分享链接时停留在当前页签
@@ -2483,15 +2515,14 @@ function renderPmNav() {
     });
     return b;
   }));
-
-  $("pmCount").textContent = `${pmListCache.length} 个预设`;
 }
 
 function renderPmCards() {
   const names = pmVisibleNames();
+  // 全量时只报总数，筛选/搜索后报「命中 / 总数」；这是页面上唯一一处数量
   $("pmShown").textContent = names.length === pmListCache.length
-    ? `共 ${names.length} 个`
-    : `${names.length} / ${pmListCache.length}`;
+    ? `共 ${names.length} 个预设`
+    : `${names.length} / ${pmListCache.length} 个预设`;
   pmCards.replaceChildren();
 
   if (!names.length) {
@@ -2602,9 +2633,122 @@ async function pmApplyPreset(name) {
 }
 
 /* 右栏：选中→详情；未选中→创建表单，保证这一栏永远有内容 */
+/* ---------------- 预设检视面板的小播放器 ----------------
+   <audio controls> 在 Chrome / Firefox / Safari 是三种长相，压到 34px 高还会把
+   播放键、音量、⋮ 挤成一团，和合成页的播放器完全不是一套控件。
+   这里用同一套控件语言自绘：圆形播放键 + 蓝色进度 + 等宽时间。
+   同一时刻只放一条，避免两条音频叠着响。 */
+let miniAudioNow = null;   // 当前可能在响的那条
+
+function clockSec(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+/**
+ * 紧凑播放器。返回一个 .audiorow 元素（内含隐藏的 <audio>）。
+ * @param {string} url   音频地址
+ * @param {string} label 播放按钮的可读名称，也是暂停后复原的 aria-label
+ */
+function miniPlayer(url, label) {
+  const row = document.createElement("div");
+  row.className = "audiorow";
+
+  // 用原生 <audio> 只做解码与播放，控件全部自绘；preload=metadata 才能立刻显示总时长
+  const audio = document.createElement("audio");
+  audio.preload = "metadata";
+  audio.src = url;
+  audio.hidden = true;
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "iconbtn";
+  btn.setAttribute("aria-label", label);
+  btn.innerHTML = '<svg class="ico" aria-hidden="true"><use href="#i-play"></use></svg>';
+
+  const track = document.createElement("div");
+  track.className = "audiorow-track";
+  track.title = "点击或拖动定位";
+  const fill = document.createElement("i");
+  fill.className = "audiorow-fill";
+  track.appendChild(fill);
+
+  const time = document.createElement("span");
+  time.className = "audiorow-time";
+  time.textContent = "0:00";
+
+  row.append(btn, track, time, audio);
+
+  let raf = 0;
+  const paint = () => {
+    const d = audio.duration;
+    if (!Number.isFinite(d) || d <= 0) { time.textContent = "0:00"; return; }
+    fill.style.width = `${Math.min(100, (audio.currentTime / d) * 100)}%`;
+    time.textContent = `${clockSec(audio.currentTime)} / ${clockSec(d)}`;
+  };
+  const tick = () => { paint(); if (!audio.paused) raf = requestAnimationFrame(tick); };
+
+  btn.addEventListener("click", () => {
+    if (!audio.paused) { audio.pause(); return; }
+    if (miniAudioNow && miniAudioNow !== audio) miniAudioNow.pause();
+    miniAudioNow = audio;
+    audio.play().catch(() => {});
+  });
+  audio.addEventListener("play", () => {
+    btn.innerHTML = '<svg class="ico" aria-hidden="true"><use href="#i-pause"></use></svg>';
+    btn.setAttribute("aria-label", "暂停");
+    row.classList.add("playing");
+    cancelAnimationFrame(raf);
+    tick();
+  });
+  audio.addEventListener("pause", () => {
+    btn.innerHTML = '<svg class="ico" aria-hidden="true"><use href="#i-play"></use></svg>';
+    btn.setAttribute("aria-label", label);
+    row.classList.remove("playing");
+    cancelAnimationFrame(raf);
+    paint();
+  });
+  audio.addEventListener("ended", () => { audio.currentTime = 0; paint(); });
+  audio.addEventListener("loadedmetadata", paint);
+
+  // 点击定位 + 按住拖动。用 pointer capture 才能在指针移出轨道后继续跟随，
+  // 否则拖到边缘就断，手感像「点一下跳一下」。
+  let dragging = false;
+  const seekTo = (clientX) => {
+    const d = audio.duration;
+    if (!Number.isFinite(d) || d <= 0) return;
+    const r = track.getBoundingClientRect();
+    audio.currentTime = Math.min(Math.max((clientX - r.left) / r.width, 0), 1) * d;
+    paint();
+  };
+  track.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    try { track.setPointerCapture(e.pointerId); } catch (err) { /* 合成事件没有 pointerId */ }
+    seekTo(e.clientX);
+  });
+  track.addEventListener("pointermove", (e) => { if (dragging) seekTo(e.clientX); });
+  const endDrag = (e) => {
+    dragging = false;
+    try { track.releasePointerCapture(e.pointerId); } catch (err) { /* 未捕获时忽略 */ }
+  };
+  track.addEventListener("pointerup", endDrag);
+  track.addEventListener("pointercancel", endDrag);
+
+  return row;
+}
+
+function inspNote(text) {
+  const p = document.createElement("p");
+  p.className = "mg-hint";
+  p.textContent = text;
+  return p;
+}
+
 function renderInspector(name) {
   const insp = $("pmInsp"), create = $("pmCreateBox");
   const d = name ? pmDetailMap.get(name) : null;
+  // 换选中项 / 列表刷新都可能重建面板，先把还在响的那条停掉，否则元素被摘掉后声音还在
+  if (miniAudioNow) miniAudioNow.pause();
   if (!name || !d) {
     insp.hidden = true;
     create.hidden = false;
@@ -2641,16 +2785,10 @@ function renderInspector(name) {
   const audioBox = $("inspAudio");
   audioBox.replaceChildren();
   if (d.prompt_audio_url) {
-    const a = document.createElement("audio");
-    a.controls = true;
-    a.preload = "none";
-    a.src = d.prompt_audio_url;
-    a.style.width = "100%";
-    const note = document.createElement("p");
-    note.className = "mg-hint";
-    note.style.margin = "0";
-    note.textContent = "预设自带的参考音频，应用后自动回填到合成页";
-    audioBox.append(a, note);
+    audioBox.append(
+      miniPlayer(d.prompt_audio_url, "播放参考音频"),
+      inspNote("预设自带的参考音频，应用后自动回填到合成页"),
+    );
   } else {
     const none = document.createElement("div");
     none.className = "insp-audio-none";
@@ -2666,31 +2804,21 @@ function renderInspector(name) {
     const vec = Array.isArray(d.emo_vector) ? d.emo_vector.map(Number) : [];
     const box = document.createElement("div");
     box.className = "insp-vec";
-    box.style.marginBottom = "8px";
     EMO_NAMES8.forEach((label, i) => {
       const v = Math.max(0, Math.min(1, vec[i] ?? 0));
       const row = document.createElement("div");
       row.innerHTML = `<span>${label}</span><i><b style="width:${(v * 100).toFixed(1)}%"></b></i><em>${v.toFixed(2)}</em>`;
       box.appendChild(row);
     });
-    const note = document.createElement("p");
-    note.className = "mg-hint";
-    note.style.margin = "0";
-    note.textContent = "8 维情感向量，数值越大该情绪越强";
-    emoBox.append(box, note);
+    emoBox.append(box, inspNote("8 维情感向量，数值越大该情绪越强"));
   } else if (m === 3) {
     const t = document.createElement("div");
-    t.className = "insp-emotext";
+    t.className = "insp-emotext val";
     t.textContent = d.emo_text || "（未填写描述文本）";
     emoBox.appendChild(t);
   } else if (m === 1) {
     if (d.emo_audio_url) {
-      const a = document.createElement("audio");
-      a.controls = true;
-      a.preload = "none";
-      a.src = d.emo_audio_url;
-      a.style.width = "100%";
-      emoBox.appendChild(a);
+      emoBox.appendChild(miniPlayer(d.emo_audio_url, "播放情感参考音频"));
     } else {
       const none = document.createElement("div");
       none.className = "insp-audio-none";

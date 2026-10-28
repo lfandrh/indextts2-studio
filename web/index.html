@@ -34,6 +34,8 @@
     <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
       <path d="M6 6l12 12"/><path d="M18 6L6 18"/>
     </symbol>
+    <symbol id="i-play" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></symbol>
   </defs>
 </svg>
 
@@ -155,7 +157,8 @@
         <input type="checkbox" id="paramLock"><span class="tk"></span>锁定高级参数
       </label>
       <div class="lockhint" id="lockHint" hidden>已锁定 · 应用预设不会覆盖以下数值</div>
-      <label class="chk"><input type="checkbox" id="doSample" checked> do_sample <span>采样模式</span></label>
+      <!-- 与同面板的两个开关同一套控件（36×20 自绘），不再用 14px 原生 checkbox -->
+      <label class="switch samplerow"><input type="checkbox" id="doSample" checked><span class="tk"></span>采样模式 <span class="pname">do_sample</span></label>
       <div class="slider pitem">
         <label for="temperature">采样温度 <span>temperature</span></label>
         <div class="srow">
@@ -430,7 +433,6 @@
       <div class="mg-top">
         <div class="mg-top-l">
           <h2 class="mg-h">预设管理</h2>
-          <span class="mg-count mono" id="pmCount">0 个预设</span>
         </div>
         <input type="text" id="pmSearch" class="mg-search" placeholder="搜索预设名称…">
         <div class="mg-top-r">
@@ -627,7 +629,7 @@
 
 </main>
 
-<footer>模型懒加载：页面秒开，首次生成约需 30~60 秒加载模型 · 深浅色主题跟随系统偏好，可点右上角切换 · 快捷键：Ctrl+Enter 生成 / Space 播放暂停 / Ctrl+S 存预设</footer>
+<footer id="footHint">快捷键 Ctrl+Enter 生成 · Space 播放暂停 · Ctrl+S 存预设 · 主题跟随系统偏好，可点右上角切换</footer>
 
 <!-- 轻量模态弹窗：替代原生 alert/confirm/prompt，与主题一致 -->
 <div class="modal-mask" id="modalMask" hidden>

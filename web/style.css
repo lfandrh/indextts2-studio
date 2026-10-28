@@ -38,7 +38,10 @@
   --accent: #1f5fe0;       /* 数据蓝：滑块、进度、数值、选中，不做正文色 */
   --ok: #1a8a4f;
   --warn: #a0690a;
-  --meter-track: #eceae5;
+  /* 轨道（进度条底槽、滑块未填充段、开关关闭态）必须自己看得见，
+     它承担「总量」的语义。原来的 #eceae5 对表头底色只有 1.06:1、
+     对卡片底色 1.11:1，等于不存在：10% 的仪表只剩一根孤立短线。 */
+  --meter-track: #c7c0b4;
 
   /* 字号 6 档 */
   --fs-18: 18px;   /* 页面标题 */
@@ -91,7 +94,7 @@ html[data-theme="dark"] {
   --accent: #7ca1f2;
   --ok: #4cc38a;
   --warn: #e0a437;
-  --meter-track: #2a2826;
+  --meter-track: #413d38;
 
   --shadow: 0 1px 2px rgba(0, 0, 0, .4);
   --shadow-pop: 0 18px 44px -12px rgba(0, 0, 0, .6), 0 2px 8px rgba(0, 0, 0, .4);
@@ -561,11 +564,16 @@ input[type="range"]:disabled { cursor: not-allowed; }
 .switch input:checked + .tk { background: var(--accent); }
 .switch input:checked + .tk::after { left: 18px; }
 .switch.cfg-disabled { opacity: .55; cursor: not-allowed; }
-
-.chk { display: flex; align-items: center; gap: var(--s2); font-size: var(--fs-13); cursor: pointer; user-select: none; margin-top: var(--s2); }
-.chk input { accent-color: var(--accent); width: 14px; height: 14px; margin: 0; }
-.chk span { color: var(--faint); font-weight: 400; font-family: var(--mono); font-size: var(--fs-11); }
-.chk span:empty { display: none; }
+/* 「采样模式」是下面三个采样滑块的开关，与它们同属一组，间距跟着滑块走 */
+.switch.samplerow { margin-top: var(--s3); }
+/* 开关行里的原始参数名，与滑块 <label> 里的同名小字同一套（等宽、靠右） */
+.switch .pname {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: var(--fs-11);
+  font-weight: 400;
+  color: var(--faint);
+}
 
 /* 拖放区 */
 .drop {
@@ -607,6 +615,11 @@ input[type="range"]:disabled { cursor: not-allowed; }
   border-radius: var(--r-md);
   background: var(--surface-2);
 }
+/* 展开后的内容要自己让出内距。只有 summary 那一行写了 8/12，内容区不补的话，
+   下拉框与滑块的方角会直接压在面板边框和 10px 圆角上（分句预览默认展开，
+   首屏就能看到）。父级加内距、摘要行反向拉出，摘要仍是整行可点。 */
+.fold[open] { padding: 0 var(--s3) var(--s3); }
+.fold[open] > summary { margin: 0 calc(var(--s3) * -1); }
 .fold > summary,
 .fold summary {
   cursor: pointer;
@@ -635,7 +648,6 @@ input[type="range"]:disabled { cursor: not-allowed; }
 }
 .fold[open] summary::before { transform: rotate(45deg); margin-top: -1px; }
 .fold summary:hover { color: var(--ink); }
-.fold .chk { margin: var(--s3) 0 0; }
 
 /* 帮助气泡：14px 圆形图标，点/悬停看 title */
 .q {
@@ -668,18 +680,27 @@ input[type="range"]:disabled { cursor: not-allowed; }
 .ops { position: relative; padding-bottom: 0; }
 
 .opstep { position: relative; padding: 0 0 var(--s4) var(--s8); }
-.opstep + .opstep { border-top: 1px solid var(--border); padding-top: var(--s4); }
-/* 步骤连线：止于最后一步，不伸进下方折叠面板 */
+/* 步骤之间的分割线从竖线的位置起画，而不是整条卡片宽：
+   整宽会在竖线左侧多出 9px 小尾巴，两线交汇还会凑成一个小「+」。
+   用背景渐变代替 border-top，就能把起点右移到 9px 且不占布局高度。 */
+.opstep + .opstep {
+  padding-top: var(--s4);
+  background-image: linear-gradient(var(--border), var(--border));
+  background-repeat: no-repeat;
+  background-position: 9px 0;
+  background-size: calc(100% - 9px) 1px;
+}
+/* 步骤连线：上端从圆形序号下方起，下端正好接住下一条分割线（bottom:0，
+   越过 0 就会穿过分割线）。 */
 .opstep::before {
   content: "";
   position: absolute;
   left: 9px;
   top: 22px;
-  bottom: -4px;
+  bottom: 0;
   width: 1px;
   background: var(--border);
 }
-.opstep:has(+ :not(.opstep))::before { bottom: 0; }
 .opstep::after {
   content: attr(data-step);
   position: absolute;
@@ -715,7 +736,8 @@ input[type="range"]:disabled { cursor: not-allowed; }
 .seg-scroll { max-height: 176px; overflow-y: auto; margin: var(--s2) 0 0; }
 .seg-list { display: flex; flex-direction: column; gap: var(--s1); }
 .seg-fold:not([open]) .seg-scroll { display: none; }
-.seg-fold .slider { margin: var(--s2) 0 var(--s3); }
+/* 底部内距交给 .fold[open] 自己的 padding，这里不再重复加一份 */
+.seg-fold .slider { margin: var(--s2) 0 0; }
 .seg-item {
   display: flex;
   align-items: baseline;
@@ -854,6 +876,9 @@ input[type="range"]:disabled { cursor: not-allowed; }
   gap: var(--s1);
   font-size: var(--fs-12);
   font-weight: 600;
+  /* 中文标签不许折行：这一格只有 178px，标签一折就成「重复惩 / 罚」。
+     宽度不够时让右边的等宽参数名去省略。 */
+  white-space: nowrap;
 }
 .grid-num label span {
   color: var(--faint);
@@ -904,13 +929,13 @@ input[type="range"]:disabled { cursor: not-allowed; }
 #advFold.params-locked input[type="range"] { filter: grayscale(1); opacity: .45; cursor: not-allowed; }
 #advFold.params-locked input.pnum,
 #advFold.params-locked .nrow input[type="number"] { opacity: .55; background: var(--surface); cursor: not-allowed; }
-#advFold.params-locked .chk { opacity: .55; cursor: not-allowed; }
+#advFold.params-locked .samplerow { opacity: .55; cursor: not-allowed; }
 #advFold.params-locked .pitem label { color: var(--muted); }
 
 /* 术语表 */
-.gl-cascade { margin: var(--s3) var(--s3) 0; font-size: var(--fs-12); }
-.gl-add { display: grid; grid-template-columns: 1.3fr 1fr 1fr auto; gap: var(--s2); margin: var(--s3) var(--s3) 0; align-items: center; }
-.gl-table { margin: var(--s2) var(--s3) var(--s1); display: flex; flex-direction: column; gap: var(--s1); }
+.gl-cascade { margin: var(--s3) 0 0; font-size: var(--fs-12); }
+.gl-add { display: grid; grid-template-columns: 1.3fr 1fr 1fr auto; gap: var(--s2); margin: var(--s3) 0 0; align-items: center; }
+.gl-table { margin: var(--s2) 0 var(--s1); display: flex; flex-direction: column; gap: var(--s1); }
 .gl-row {
   display: grid;
   grid-template-columns: 1.2fr 1fr 1fr auto;
@@ -953,11 +978,11 @@ input[type="range"]:disabled { cursor: not-allowed; }
 .gl-del:hover { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
 /* 触屏没有 hover，直接常显 */
 @media (hover: none) { .gl-del { opacity: 1; } }
-.gl-foot { display: flex; justify-content: flex-end; margin: var(--s1) var(--s3) var(--s2); }
+.gl-foot { display: flex; justify-content: flex-end; margin: var(--s1) 0 0; }
 .gl-foot .linkbtn { font-size: var(--fs-11); color: var(--faint); }
 .gl-foot .linkbtn:hover { color: var(--danger); }
 .gl-error {
-  margin: var(--s2) var(--s3) 0;
+  margin: var(--s2) 0 0;
   padding: var(--s1) var(--s2);
   border-radius: var(--r-sm);
   font-size: var(--fs-12);
@@ -987,14 +1012,15 @@ input[type="range"]:disabled { cursor: not-allowed; }
   padding: var(--s1) var(--s2);
   border-radius: var(--r-sm);
   background: var(--surface-2);
-  /* 这行是「本次将用什么参数生成」的唯一概览，单行省略会把关键项切掉，
-     所以给两行；再长就真的该去改参数了。 */
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
   margin-bottom: var(--s2);
+  /* 按「项」换行，不按字符换行。这三段里最长的是采样参数，
+     按字符折行会把「top_k 30」的 30 甩到下一行、末行只剩一个孤零零的数字；
+     拆成 span 后每项整体不折，换行只发生在项与项之间。 */
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px var(--s3);
 }
+.gen-summary > span { white-space: nowrap; }
 .gen-summary:empty { display: none; }
 .hint {
   font-size: var(--fs-11);
@@ -1523,15 +1549,6 @@ input[type="range"]:disabled { cursor: not-allowed; }
 }
 .mg-top-l { display: flex; align-items: baseline; gap: var(--s2); flex: none; }
 .mg-h { margin: 0; font-size: var(--fs-18); font-weight: 700; letter-spacing: .01em; }
-.mg-count {
-  font-size: var(--fs-11);
-  color: var(--muted);
-  padding: 2px var(--s2);
-  border-radius: var(--r-pill);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  font-variant-numeric: tabular-nums;
-}
 /* 特异性要压过全局 input[type="text"]{width:100%}，否则工具带被撑成三行 */
 input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto; }
 .mg-top-r { display: flex; gap: var(--s2); flex: none; }
@@ -1568,6 +1585,8 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   background: var(--surface);
 }
 .mg-main-head { display: flex; align-items: center; gap: var(--s3); min-height: 24px; margin-bottom: var(--s2); flex: none; }
+/* 数量只在这里出现一次。原先标题旁的胶囊也报一次总量，同一个数字两种写法，
+   屏幕上一左一右各一个；而卡片墙上方这个会跟着筛选/搜索变，信息量更大。 */
 .mg-main-count { font-size: var(--fs-11); color: var(--muted); flex: none; font-variant-numeric: tabular-nums; }
 .mg-main-head .mg-hint { margin: 0; }
 .mg-sub-h { margin: 0; font-size: var(--fs-13); font-weight: 700; color: var(--ink); }
@@ -1598,12 +1617,16 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
 /* ---------- 13. 预设管理页 ---------- */
 /* 左：筛选目录 */
 .pm-nav { display: flex; flex-direction: column; gap: 2px; }
+/* 每组（筛选 / 按情绪）的行必须共用一条文本基线：只有「按情绪」那组带彩色圆点，
+   若圆点参与布局，两组的文字左缘就差 22px，同一条侧栏里出现两种缩进。
+   所以圆点改成绝对定位，文本一律从 24px 起。 */
 .pm-nav-row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--s2);
   width: 100%;
-  padding: var(--s1) var(--s2);
+  padding: var(--s1) var(--s2) var(--s1) var(--s6);
   border: 1px solid transparent;
   border-radius: var(--r-sm);
   background: none;
@@ -1621,7 +1644,18 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   color: var(--primary);
   font-weight: 600;
 }
-.pm-nav-row .nav-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--faint); }
+.pm-nav-row .nav-dot {
+  position: absolute;
+  left: var(--s2);
+  /* 上下都贴到 0 再用 margin:auto 居中：行高由字号决定，写死像素迟早对不齐 */
+  top: 0;
+  bottom: 0;
+  margin: auto 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--faint);
+}
 .pm-nav-row b {
   margin-left: auto;
   font-family: var(--mono);
@@ -1745,8 +1779,66 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
 .insp-badges { display: flex; flex-wrap: wrap; gap: var(--s1); }
 .insp-sec { border-top: 1px solid var(--border); padding-top: var(--s3); display: flex; flex-direction: column; gap: var(--s2); }
 .insp-sec-h { font-size: var(--fs-11); font-weight: 600; letter-spacing: .1em; color: var(--muted); }
-.insp-audio { display: flex; flex-direction: column; gap: var(--s1); }
-.insp-audio audio { width: 100%; height: 34px; }
+/* 面板内的小字说明由 .insp-sec 的 gap 控制节奏，不要再叠一层 margin-top */
+.insp-sec .mg-hint { margin: 0; }
+.insp-audio { display: flex; flex-direction: column; gap: var(--s2); }
+/* 检视面板里的小播放器：和主播放器同一套控件语言（圆形播放键 + 蓝色进度 + 等宽时间）。
+   不用浏览器原生 <audio controls>：它在 Chrome/Firefox/Safari 是三种长相，
+   被压到 34px 高时播放键、音量键、⋮ 会挤在一起。 */
+.audiorow { display: flex; align-items: center; gap: var(--s2); }
+.audiorow-track {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 20px;           /* 20px 是可点/可拖区域，视觉轨道只有 4px，垂直居中 */
+  cursor: pointer;
+  /* 触屏上按住拖动是定位，不是滚面板 */
+  touch-action: none;
+}
+.audiorow-track::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 8px;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--meter-track);
+}
+.audiorow-fill {
+  position: absolute;
+  left: 0;
+  top: 8px;
+  width: 0;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  pointer-events: none;
+}
+/* 拖拽点：静止时收起，hover 或播放中显形，避免面板上多一个圆点噪音 */
+.audiorow-fill::after {
+  content: "";
+  position: absolute;
+  right: -5px;
+  top: -3px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 2px solid var(--accent);
+  opacity: 0;
+  transition: opacity .15s ease;
+}
+.audiorow:hover .audiorow-fill::after,
+.audiorow.playing .audiorow-fill::after { opacity: 1; }
+.audiorow-time {
+  flex: none;
+  font-family: var(--mono);
+  font-size: var(--fs-11);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .insp-kv { display: flex; flex-direction: column; gap: 2px; }
 .insp-kv > div { display: flex; justify-content: space-between; gap: var(--s2); font-size: var(--fs-12); }
 .insp-kv span { color: var(--muted); }
@@ -1759,14 +1851,14 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   border: 1px dashed var(--border);
   border-radius: var(--r-sm);
 }
+/* 情感说明：纯文案，不是控件。原来用灰底圆角框包着，看起来像禁用的输入框，
+   会让人以为这里能改。用户填的描述文本另给 .val 用水色区分。 */
 .insp-emotext {
   font-size: var(--fs-12);
-  color: var(--ink);
+  color: var(--muted);
   line-height: 1.6;
-  padding: var(--s2) var(--s3);
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
 }
+.insp-emotext.val { color: var(--ink); }
 .insp-vec { display: flex; flex-direction: column; gap: 2px; }
 .insp-vec > div { display: grid; grid-template-columns: 30px 1fr 26px; align-items: center; gap: var(--s2); font-size: var(--fs-11); color: var(--muted); }
 .insp-vec i { height: 3px; border-radius: var(--r-pill); background: var(--meter-track); overflow: hidden; display: block; }
