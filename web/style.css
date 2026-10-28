@@ -1237,10 +1237,24 @@ input[type="range"]:disabled { cursor: not-allowed; }
   margin-bottom: var(--s2);
 }
 .sec-t em { font-style: normal; font-size: var(--fs-11); font-weight: 400; color: var(--faint); }
-.edit-row { display: flex; align-items: center; gap: var(--s2); margin-bottom: var(--s3); flex-wrap: wrap; }
-.edit-row > b { flex: none; width: 30px; font-size: var(--fs-12); font-weight: 600; color: var(--muted); }
-.edit-row input[type="range"] { min-width: 110px; }
-.tempo-wrap { flex: 1; min-width: 140px; display: flex; flex-direction: column; gap: 2px; }
+/* 音量行与变速行共用同一套网格列宽：标签 / 滑轨 / 数值 / 备注。
+   原来两行各自 flex，备注文字的长短会直接吃掉滑轨宽度——「峰值 -3.0 dBFS」比
+   「保音高」宽 53.5px，于是两行滑轨右端和数值横坐标都差 53.5px，看着就是没对齐。
+   列宽写死之后，备注再怎么变长变短都只在自己那格里伸缩，滑轨两端恒定对齐。
+   60px 装得下最长的「+24.0 dB」，104px 装得下「峰值 +24.0 dBFS」「保音高 · 结果 4.55s」。 */
+.edit-row {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) 60px 104px;
+  column-gap: var(--s2);
+  row-gap: var(--s1);
+  align-items: center;
+  margin-bottom: var(--s3);
+}
+.edit-row > b { font-size: var(--fs-12); font-weight: 600; color: var(--muted); }
+.edit-row input[type="range"] { min-width: 0; }
+/* 「降到不削波」只在削波时出现：放第二行、贴着滑轨左端起，绝不回头挤窄滑轨 */
+.edit-row > #gainMax { grid-column: 2 / 3; grid-row: 2; justify-self: start; }
+.tempo-wrap { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .tempo-wrap input[type="range"] { flex: none; width: 100%; min-width: 0; }
 .edit-ticks { display: flex; justify-content: space-between; padding: 0 var(--s1); }
 .edit-ticks .tick {
@@ -1262,10 +1276,9 @@ input[type="range"]:disabled { cursor: not-allowed; }
   font-size: var(--fs-12);
   font-weight: 600;
   color: var(--ink);
-  min-width: 56px;
   font-variant-numeric: tabular-nums;
 }
-.edit-note { font-size: var(--fs-11); color: var(--faint); }
+.edit-note { font-size: var(--fs-11); color: var(--faint); white-space: nowrap; }
 .edit-note.busy { color: var(--warn); }
 .warn-peak { color: var(--warn); }
 
@@ -1276,9 +1289,15 @@ input[type="range"]:disabled { cursor: not-allowed; }
    仍然与滑轨等宽，位置也仍然按倍率等距；备注也不会被挤成好几行。 */
 .edit-panel { container-type: inline-size; }
 @container (max-width: 470px) {
-  .edit-row > b { flex: 1 0 100%; }
-  .edit-row > input[type="range"] { flex: 1 0 100%; }
-  .tempo-wrap { flex: 1 0 100%; }
+  /* 窄面板回到三行式：标签一行、滑轨（含刻度）独占一行、数值与备注一行。
+     数值列同样写死——用 auto 的话「0.0 dB」比「1.00×」宽 7px，备注又会错开。 */
+  .edit-row { grid-template-columns: 60px minmax(0, 1fr); row-gap: 2px; }
+  .edit-row > b { grid-column: 1 / -1; }
+  .edit-row > input[type="range"] { grid-column: 1 / -1; }
+  .tempo-wrap { grid-column: 1 / -1; }
+  .edit-row > #gainMax { grid-column: 1 / -1; grid-row: auto; }
+  /* 整行宽了，备注不必再硬撑一行 */
+  .edit-note { white-space: normal; }
 }
 
 .ops-row { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; margin-top: 2px; }
@@ -2151,7 +2170,6 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   .sel-actions #dlSrcBtn { margin-left: 0; flex: 1 1 100%; }
   .out-foot { align-items: stretch; }
   .out-foot .btn { width: 100%; }
-  .edit-row > b { width: 100%; }
   .mg-top-r .btn { flex: 1; }
   .mm-ops .btn { flex: 1; }
 }
