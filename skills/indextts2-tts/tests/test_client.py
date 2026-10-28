@@ -321,7 +321,7 @@ class ClientTestCase(unittest.TestCase):
     def test_version(self):
         r = self.run_client("--version")
         self.assertEqual(0, r.returncode, r.stderr)
-        self.assertIn("indextts2-tts 1.2.2", r.stdout)
+        self.assertIn("indextts2-tts 1.2.4", r.stdout)
 
     # ---- 模型管理（/model、/model/unload）----
     def test_model_plain_and_json(self):

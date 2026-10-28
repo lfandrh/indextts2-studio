@@ -66,7 +66,7 @@ from pathlib import Path
 
 # skill 自身版本。用户报问题时先问这个——skill 有两份副本（用户级/项目内），
 # 没有版本号就只能靠"文件时间"猜，也没法判断两份是否漂移。
-SKILL_VERSION = "1.2.2"
+SKILL_VERSION = "1.2.4"
 
 
 def _relax_stdio():
@@ -1352,6 +1352,10 @@ def cmd_locate(args):
         return 0
 
     if PROJECT_DIR is not None:
+        # 成功也要在 stderr 说一句：stdout 那行 JSON 是给 agent 解析的，
+        # 人看不懂。用户界面上"一直在转圈却没有任何输出"是最劝退的体验，
+        # 这句是兜底——即使 agent 忘了转述，终端里也有迹可循。
+        print("[locate] 找到项目：%s（%s）" % (PROJECT_DIR, PROJECT_SOURCE), file=sys.stderr)
         print(json.dumps({"ok": True, "project_dir": str(PROJECT_DIR), "source": PROJECT_SOURCE},
                          ensure_ascii=False))
         return 0
