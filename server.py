@@ -531,10 +531,13 @@ def health():
 
 
 # ---- system metrics (v2 UI header gauges) ----
+import ctypes
 import shutil
 import subprocess as _sp
 
+
 def _nvidia_smi(query: str):
+    """兜底通道：fork nvidia-smi 解析 stdout。"""
     exe = shutil.which("nvidia-smi")
     if not exe:
         return None
@@ -550,18 +553,143 @@ def _nvidia_smi(query: str):
     return None
 
 
-GPU_INFO = None
-_gpu_name = _nvidia_smi("name")
-if _gpu_name:
-    _vram_total = _nvidia_smi("memory.total")
-    try:
-        _vram_total_mb = int(_vram_total) if _vram_total else None
-    except ValueError:
-        _vram_total_mb = None  # nvidia-smi 偶发返回 "N/A" 之类，不能让服务起不来
-    GPU_INFO = {"name": _gpu_name, "vram_total_mb": _vram_total_mb}
+class _NvmlUtil(ctypes.Structure):
+    _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
 
-# nvidia-smi spawns a subprocess per call (~50-200ms on Windows); multiple
-# tabs polling /metrics every 2s must not fork a storm of them. Cache for 1s.
+
+class _NvmlMem(ctypes.Structure):
+    _fields_ = [
+        ("total", ctypes.c_ulonglong),
+        ("free", ctypes.c_ulonglong),
+        ("used", ctypes.c_ulonglong),
+    ]
+
+
+# GPU 数据源优先级：进程内 NVML > nvidia-smi 子进程。
+# 踩过的坑：某台机器上 nvidia-smi.exe 一启动就报 "Failed to initialize NVML:
+# Unknown Error"（驱动升级后命令行外壳与驱动不自洽），但它依赖的 nvml.dll
+# 完全正常。旧实现只走 nvidia-smi，一次失败就让显存 / 利用率永久显示 "--"。
+# 顺带收益：不用每次刷新都 fork 一个 ~200ms 的子进程。
+_NVML_LIBS = (
+    ("nvml.dll",) if sys.platform == "win32"
+    else ("libnvidia-ml.so.1", "libnvidia-ml.so")
+)
+_NVML = {"lib": None, "handle": None, "dead": False}
+
+
+def _nvml_open() -> bool:
+    """惰性加载 nvml 并缓存 device 0 句柄；加载失败则永久跳过，交给 smi 兜底。"""
+    if _NVML["handle"] is not None:
+        return True
+    if _NVML["dead"]:
+        return False
+    lib = None
+    for name in _NVML_LIBS:
+        try:
+            lib = ctypes.WinDLL(name) if sys.platform == "win32" else ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if lib is None:
+        _NVML["dead"] = True
+        return False
+    try:
+        init = getattr(lib, "nvmlInit_v2", None) or lib.nvmlInit
+        init.restype = ctypes.c_int
+        if init() != 0:
+            _NVML["dead"] = True
+            return False
+        get_handle = (
+            getattr(lib, "nvmlDeviceGetHandleByIndex_v2", None)
+            or lib.nvmlDeviceGetHandleByIndex
+        )
+        get_handle.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]
+        get_handle.restype = ctypes.c_int
+        handle = ctypes.c_void_p()
+        if get_handle(0, ctypes.byref(handle)) != 0 or not handle.value:
+            _NVML["dead"] = True
+            return False
+        lib.nvmlDeviceGetUtilizationRates.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(_NvmlUtil)
+        ]
+        lib.nvmlDeviceGetUtilizationRates.restype = ctypes.c_int
+        lib.nvmlDeviceGetMemoryInfo.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(_NvmlMem)
+        ]
+        lib.nvmlDeviceGetMemoryInfo.restype = ctypes.c_int
+        get_name = getattr(lib, "nvmlDeviceGetName", None)
+        if get_name is not None:
+            get_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint]
+            get_name.restype = ctypes.c_int
+    except Exception:
+        _NVML["dead"] = True
+        return False
+    _NVML["lib"], _NVML["handle"] = lib, handle
+    return True
+
+
+def _nvml_reads():
+    """一次读齐 (util%, used_mb, total_mb, name)；任一环节失败返回 None。"""
+    if not _nvml_open():
+        return None
+    lib, handle = _NVML["lib"], _NVML["handle"]
+    try:
+        util = _NvmlUtil()
+        if lib.nvmlDeviceGetUtilizationRates(handle, ctypes.byref(util)) != 0:
+            return None
+        mem = _NvmlMem()
+        if lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem)) != 0:
+            return None
+        name = None
+        get_name = getattr(lib, "nvmlDeviceGetName", None)
+        if get_name is not None:
+            buf = ctypes.create_string_buffer(96)
+            if get_name(handle, buf, len(buf)) == 0:
+                name = buf.value.decode("utf-8", "replace").strip() or None
+        return (
+            int(util.gpu),
+            int(mem.used) // 1024**2,
+            int(mem.total) // 1024**2,
+            name,
+        )
+    except Exception:
+        return None
+
+
+# 静态信息（型号 / 显存总量）缓存，但失败后每 15s 允许重试一次：
+# 旧实现只在 import 时读一次，驱动短暂抖动就会让 GPU 指标整场消失。
+_GPU_INFO_RETRY_SEC = 15.0
+_gpu_info_cache = {"t": 0.0, "info": None}
+
+
+def _gpu_static_info():
+    """返回 {"name", "vram_total_mb"}；无 GPU 或暂时读不到返回 None。"""
+    if _gpu_info_cache["info"] is not None:
+        return _gpu_info_cache["info"]
+    now = time.time()
+    if _gpu_info_cache["t"] and now - _gpu_info_cache["t"] < _GPU_INFO_RETRY_SEC:
+        return None
+    _gpu_info_cache["t"] = now
+
+    r = _nvml_reads()
+    if r is not None:
+        # 个别驱动版本读不到型号名；退化成 "GPU" 也强过整块指标消失
+        info = {"name": r[3] or "GPU", "vram_total_mb": r[2] or None}
+    else:
+        name = _nvidia_smi("name")
+        if not name:
+            return None
+        total = _nvidia_smi("memory.total")
+        try:
+            total_mb = int(total) if total else None
+        except ValueError:
+            total_mb = None  # nvidia-smi 偶发返回 "N/A" 之类，不能让服务起不来
+        info = {"name": name, "vram_total_mb": total_mb}
+    _gpu_info_cache["info"] = info
+    return info
+
+
+# 多标签页每 2s 轮询一次 /status；1s 缓存避免重复读（NVML 很快，smi 要 fork）。
 _smi_cache = {"t": 0.0, "util": None, "used": None}
 
 
@@ -569,8 +697,12 @@ def _gpu_readings():
     now = time.time()
     if now - _smi_cache["t"] > 1.0:
         _smi_cache["t"] = now
-        _smi_cache["util"] = _nvidia_smi("utilization.gpu")
-        _smi_cache["used"] = _nvidia_smi("memory.used")
+        r = _nvml_reads()
+        if r is not None:
+            _smi_cache["util"], _smi_cache["used"] = r[0], r[1]
+        else:
+            _smi_cache["util"] = _nvidia_smi("utilization.gpu")
+            _smi_cache["used"] = _nvidia_smi("memory.used")
     return _smi_cache["util"], _smi_cache["used"]
 
 
@@ -588,13 +720,17 @@ def metrics():
             "mem_used_gb": round(vm.used / 1024**3, 2),
             "mem_total_gb": round(vm.total / 1024**3, 2),
         })
-    if GPU_INFO:
+    gpu = _gpu_static_info()
+    if gpu:
         util, used = _gpu_readings()
         if util is not None and used is not None:
-            data["gpu_percent"] = int(util)
-            data["vram_used_mb"] = int(used)
-            data["vram_total_mb"] = GPU_INFO.get("vram_total_mb") or 0
-    data["gpu_name"] = (GPU_INFO or {}).get("name")
+            try:
+                data["gpu_percent"] = int(util)
+                data["vram_used_mb"] = int(used)
+                data["vram_total_mb"] = gpu.get("vram_total_mb") or 0
+            except (TypeError, ValueError):
+                pass  # 个别驱动返回 "N/A"，宁可少两项也不让整次轮询 500
+    data["gpu_name"] = (gpu or {}).get("name")
     return data
 
 
@@ -1578,6 +1714,7 @@ def presets_create(
     repetition_penalty: float = Form(10.0),
     max_mel_tokens: int = Form(1500),
     max_text_tokens_per_segment: int = Form(120),
+    interval_silence: int = Form(200),
     prompt_audio: UploadFile | None = File(None),
     emo_audio: UploadFile | None = File(None),
     overwrite: bool = Form(False),
@@ -1605,6 +1742,7 @@ def presets_create(
             "repetition_penalty": float(repetition_penalty),
             "max_mel_tokens": int(max_mel_tokens),
             "max_text_tokens_per_segment": int(max_text_tokens_per_segment),
+            "interval_silence": int(interval_silence),
         },
     }
 
@@ -1637,10 +1775,17 @@ def presets_create(
 
 
 @api.get("/presets/{name}")
-def presets_detail(name: str):
+def presets_detail(name: str, legacy: bool = False):
     data = load_preset(name)
     if data is None:
         raise HTTPException(404, "Preset not found")
+    # 兼容老客户端：带 ?legacy=1 时退回不含 interval_silence 的旧结构。
+    # 新增字段本身是向后兼容的加法，但严格 schema 校验（extra=forbid /
+    # additionalProperties:false）的第三方插件会因此报错，留一个逃生门。
+    if legacy:
+        adv = data.get("advanced_params")
+        if isinstance(adv, dict):
+            adv.pop("interval_silence", None)
     # load_preset 把音频字段转成了服务器绝对路径，只对内使用；
     # 响应里换成语 URL，避免把服务器目录结构暴露给客户端
     if data.get("prompt_audio"):
@@ -1695,6 +1840,84 @@ def presets_duplicate(name: str, req: dict | None = Body(None)):
     except ValueError as e:
         raise HTTPException(409, str(e))
     return JSONResponse({"ok": True, "name": final, "presets": list_presets()})
+
+
+# ---- UI 偏好：参数锁定 ---------------------------------------------------------
+# 存磁盘而不是浏览器 localStorage：用户清缓存后锁定的参数不该丢。
+# 文件放在项目根的 data/ 下，不放 outputs/ —— 那是生成产物目录，会被保留期清理。
+_UI_STATE_DIR = os.path.join(current_dir, "data")
+_UI_STATE_PATH = os.path.join(_UI_STATE_DIR, "ui_state.json")
+_UI_STATE_LOCK = threading.Lock()
+# 锁定的参数白名单：与前端「高级参数」折叠里的 9 项一致。
+# segTokens 不在此列 —— 它属于「怎么切句」，不是音色质量参数。
+_LOCK_PARAM_KEYS = frozenset({
+    "doSample", "temperature", "topP", "topK", "numBeams",
+    "maxMel", "repPen", "lenPen", "gapMs",
+})
+
+
+def _read_ui_state() -> dict:
+    """Read data/ui_state.json; a missing or corrupt file is an empty state."""
+    try:
+        with open(_UI_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        logger.warning("ui_state.json 无法解析，按空状态处理", exc_info=True)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_ui_state(state: dict) -> None:
+    """Atomically replace ui_state.json (tmp + os.replace, same volume)."""
+    os.makedirs(_UI_STATE_DIR, exist_ok=True)
+    tmp = _UI_STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, _UI_STATE_PATH)
+
+
+@api.get("/prefs/param-lock")
+def prefs_param_lock_get():
+    with _UI_STATE_LOCK:
+        payload = _read_ui_state().get("paramLock")
+    if not isinstance(payload, dict):
+        payload = {"locked": False, "values": {}}
+    return JSONResponse(payload)
+
+
+@api.put("/prefs/param-lock")
+def prefs_param_lock_put(req: dict = Body(...)):
+    locked = req.get("locked", False)
+    if not isinstance(locked, bool):
+        raise HTTPException(400, "locked 必须是布尔值")
+    raw = req.get("values") or {}
+    if not isinstance(raw, dict):
+        raise HTTPException(400, "values 必须是对象")
+    unknown = [k for k in raw if k not in _LOCK_PARAM_KEYS]
+    if unknown:
+        raise HTTPException(400, f"未知参数: {', '.join(sorted(unknown))}")
+    values = {}
+    for key, val in raw.items():
+        if key == "doSample":
+            values[key] = bool(val)
+            continue
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"参数 {key} 不是数字")
+        if num != num or num in (float("inf"), float("-inf")):
+            raise HTTPException(400, f"参数 {key} 不是有效数字")
+        values[key] = str(val).strip()
+    payload = {"locked": locked, "values": values, "updated_at": int(time.time())}
+    with _UI_STATE_LOCK:
+        state = _read_ui_state()
+        state["paramLock"] = payload
+        _write_ui_state(state)
+    return JSONResponse(payload)
 
 
 def _load_examples(include_experimental=False):
