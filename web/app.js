@@ -661,6 +661,48 @@ function getAC() {
   return sharedAC;
 }
 
+/* ---------------- 解码 ----------------
+   decodeAudioData 会把音频重采样到 AudioContext 的采样率（设备通常 48000）。
+   我们的产物是 22050Hz，22050→48000 的插值会过冲 0.3~0.5dB：一份峰值正好压在
+   0dBFS（没削波）的文件，解出来变成 +0.3dBFS，于是峰值提示每次都误报削波、
+   还建议用户降 0.5dB；导出的剪辑结果也被无谓升采样成 48000（体积 ×2.2，音质不变）。
+   所以先读 wav 头拿文件自己的采样率，用对应采样率的 OfflineAudioContext 解码，
+   整条链路上不产生重采样。非 wav（如用户上传的 mp3）读不出表头，退回设备采样率。 */
+
+/** 读 RIFF/WAVE 头里的采样率；读不出（非 wav）返回 0 */
+function wavSampleRate(ab) {
+  try {
+    if (ab.byteLength < 44) return 0;
+    const dv = new DataView(ab);
+    const tag = (o) => String.fromCharCode(dv.getUint8(o), dv.getUint8(o + 1), dv.getUint8(o + 2), dv.getUint8(o + 3));
+    if (tag(0) !== "RIFF" || tag(8) !== "WAVE") return 0;
+    // 不能假设 fmt 块固定在 12：有的文件前面还有 LIST/JUNK 块
+    for (let o = 12; o + 8 <= dv.byteLength;) {
+      const id = tag(o), size = dv.getUint32(o + 4, true);
+      if (id === "fmt ") {
+        const rate = dv.getUint32(o + 12, true);
+        return rate >= 8000 && rate <= 384000 ? rate : 0;
+      }
+      o += 8 + size + (size % 2);   // 块按偶数字节对齐
+    }
+  } catch (e) { /* 表头损坏，交给设备采样率兜底 */ }
+  return 0;
+}
+
+const offlineByRate = new Map();   // 每个采样率复用同一个 OfflineAudioContext
+const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+/** 按文件自身采样率解码，避免重采样过冲 */
+function decodeNative(ab) {
+  const rate = OAC ? wavSampleRate(ab) : 0;
+  if (!rate) return getAC().decodeAudioData(ab);
+  let ctx = offlineByRate.get(rate);
+  if (!ctx) {
+    ctx = new OAC(1, 1, rate);     // 只用它解码，长度无所谓
+    offlineByRate.set(rate, ctx);
+  }
+  return ctx.decodeAudioData(ab);
+}
+
 function resetSpkSelection() {
   spkAudio.pause();
   spkPlaying = false;
@@ -696,7 +738,7 @@ function setSpkFile(f, persist = true) {
     if (spkUrl) URL.revokeObjectURL(spkUrl);
     spkUrl = URL.createObjectURL(f);
     spkAudio.src = spkUrl;
-    f.arrayBuffer().then((ab) => getAC().decodeAudioData(ab)).then((buf) => {
+    f.arrayBuffer().then((ab) => decodeNative(ab)).then((buf) => {
       spkBuffer = buf;
       spkPlaying = false; spkSeekFrac = 0;
       $("spkTime").textContent = `0.00s / ${spkBuffer.duration.toFixed(2)}s`;
@@ -1535,7 +1577,8 @@ async function loadResult(url, elapsed, serverFile, opts) {
   player.src = url;
   try {
     const buf = await (await fetch(url)).arrayBuffer();
-    trim.buffer = await getAC().decodeAudioData(buf);
+    // 按文件采样率解码：升采样过冲会让峰值虚高 ~0.3dB，进而误报削波，见 decodeNative
+    trim.buffer = await decodeNative(buf);
     ED.setSource(trim.buffer, url);          // 剪辑状态回到"无操作"，见 web/edit.js
   } catch (e) {
     trim.buffer = null;

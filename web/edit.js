@@ -10,7 +10,7 @@
  *     gain / tempo 有值时才出现——纯裁剪时源波形的选区高亮已经把信息表达完了。
  *  4. 拖动中不压快照，松手才定稿，否则拖一次滑块撤销要按几十次。
  *
- * 依赖 app.js 的全局：$ / API / getAC / sizeCanvas / cssVar / encodeWav /
+ * 依赖 app.js 的全局：$ / API / getAC / decodeNative / sizeCanvas / cssVar / encodeWav /
  * showActionError / player / PAUSE2 / PLAY2（本文件必须在其后加载）
  */
 (function () {
@@ -116,7 +116,8 @@
         try { d = (await r.json()).detail || d; } catch (e) { /* 非 JSON 错误体 */ }
         throw new Error(d);
       }
-      const out = await getAC().decodeAudioData(await r.arrayBuffer());
+      // 按文件采样率解码：升采样过冲会让峰值虚高，进而误报削波（见 app.js 的 decodeNative）
+      const out = await decodeNative(await r.arrayBuffer());
       cacheSet(key, out);
       return out;
     } finally {
@@ -223,16 +224,26 @@
   function paintPeak() {
     const factor = ED.state.gain ? Math.pow(10, ED.state.gain / 20) : 1;
     const outPeak = ED.basePeak * factor;
-    const peak = Math.min(outPeak, 1);
     const maxDb = ED.basePeak > 0 ? 20 * Math.log10(1 / ED.basePeak) : 24;
-    el.peakNote.textContent = peak > 0 ? "峰值 " + (20 * Math.log10(peak)).toFixed(1) + " dBFS" : "峰值 —";
-    const clipped = outPeak > 1.0001;
+    // 显示真实峰值，不再夹到 0dBFS：夹过之后「峰值 0.0 dBFS」会和下面「要降 0.5dB」
+    // 自相矛盾，用户没法判断到底削没削波
+    const dbPeak = outPeak > 0 ? 20 * Math.log10(outPeak) : -Infinity;
+    // 满刻度文件解出来是 0.99997，直接 toFixed 会印成「-0.0 dBFS」，抹成整零
+    const shown = Math.abs(dbPeak) < 0.05 ? 0 : dbPeak;
+    el.peakNote.textContent = outPeak > 0
+      ? "峰值 " + (shown > 0 ? "+" : "") + shown.toFixed(1) + " dBFS"
+      : "峰值 —";
+    // 0.0005 的容差只用来吃掉浮点误差（0.004dB，远低于任何可闻阈值）
+    const clipped = outPeak > 1.0005;
     el.peakNote.classList.toggle("warn-peak", clipped);
     el.gainMax.hidden = !clipped;
     if (clipped) {
-      const safe = Math.max(-24, Math.min(24, Math.floor(maxDb * 2) / 2));
-      el.gainMax.textContent = "拉到无损上限 " + (safe >= 0 ? "+" : "") + safe.toFixed(1) + " dB";
+      // 取不超过 maxDb 的最大 0.5 步进值，保证点下去一定不削波；
+      // +5e-4 让「本来就正好 0dBFS」的情况落在 0.0 而不是 -0.5
+      const safe = Math.max(-24, Math.min(24, Math.floor((maxDb + 5e-4) * 2) / 2));
+      el.gainMax.textContent = "降到不削波 " + (safe > 0 ? "+" : "") + safe.toFixed(1) + " dB";
       el.gainMax.dataset.db = String(safe);
+      el.gainMax.title = "把增益设成 " + safe.toFixed(1) + " dB，峰值回到 0 dBFS 以内";
     }
   }
 
