@@ -271,6 +271,77 @@ textarea:focus, select:focus, input:focus {
 .edit-row input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.15); }
 .edit-row input[type="range"]:disabled { opacity: .5; cursor: progress; }
 .srow output { font-family: var(--mono); font-size: 12px; color: var(--ink); min-width: 42px; text-align: right; font-weight: 600; }
+
+/* ---------- 参数数值输入 / 单项恢复默认 ---------- */
+/* 全局 input[type="number"] 是 (0,1,1) 且 width:100%，这里必须同特异性且靠后 */
+input.pnum {
+  width: 62px; min-width: 62px; flex: none;
+  padding: 5px 7px; border-radius: 7px;
+  font-family: var(--mono); font-size: 12px; font-weight: 600;
+  text-align: right; line-height: 1.3;
+  appearance: textfield; -moz-appearance: textfield;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--ink);
+}
+input.pnum::-webkit-outer-spin-button,
+input.pnum::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+input.pnum:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+/* 常驻但淡化；偏离默认值时变实色 —— 扫一眼就知道哪几项被改过 */
+.rdef {
+  flex: none; width: 21px; height: 21px; padding: 0;
+  display: grid; place-items: center;
+  border: none; border-radius: 6px; background: none;
+  color: var(--faint); font-size: 12.5px; line-height: 1; cursor: pointer;
+  opacity: .3; transition: opacity .15s ease, color .15s ease, background .15s ease;
+}
+.pitem:hover .rdef { opacity: .85; }
+.rdef.on { opacity: 1; color: var(--accent); }
+.rdef:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); }
+.rdef:disabled { opacity: .34; pointer-events: none; }
+
+/* 参数行比模型页的滑块行更紧凑：右边多了数字框和 ↺，滑块要留够长度 */
+.pitem .srow { gap: 8px; }
+/* 英文参数名（repetition_penalty 这类）在窄栏里会顶到右边缘，允许省略，
+   完整名字由 JS 写到 title 上，hover 可看 */
+.pitem label { min-width: 0; }
+.pitem label span {
+  min-width: 0; flex: 0 1 auto;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* grid-num 里的 number + 恢复按钮并排；宽度与上方 .pnum 对齐，避免同一屏
+   出现 62px 和 200px 两种数字框 */
+.nrow { display: flex; align-items: center; gap: 4px; margin-top: 5px; }
+.nrow input[type="number"] {
+  flex: none; width: 68px; min-width: 68px;
+  padding: 6px 8px; font-size: 12px; text-align: right;
+  font-family: var(--mono); font-weight: 600;
+}
+
+/* ---------- 参数锁定 ---------- */
+.lockbadge {
+  margin-left: auto; flex: none;
+  font-size: 10.5px; font-weight: 600; letter-spacing: .02em;
+  padding: 2px 7px; border-radius: 999px;
+  color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.lockrow { margin: 8px 0 0; font-size: 12.5px; color: var(--muted); }
+.lockhint {
+  margin: 6px 0 0; padding: 6px 9px; border-radius: 7px;
+  font-size: 11.5px; line-height: 1.5; color: var(--muted);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  border-left: 2px solid var(--accent);
+}
+/* 锁定态：数值控件失效的视觉表达（禁用由 disabled 属性负责） */
+#advFold.params-locked .srow input[type="range"] { filter: grayscale(1); opacity: .45; cursor: not-allowed; }
+#advFold.params-locked input.pnum,
+#advFold.params-locked .nrow input[type="number"] { opacity: .55; background: var(--surface); cursor: not-allowed; }
+#advFold.params-locked .chk { opacity: .55; cursor: not-allowed; }
+#advFold.params-locked .pitem label { color: var(--muted); }
 .grid-num { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
 .grid-num label { display: flex; justify-content: space-between; gap: 6px; font-size: 12px; font-weight: 600; }
 .grid-num label span { color: var(--faint); font-weight: 400; font-family: var(--mono); font-size: 10.5px; }
@@ -752,15 +823,37 @@ main#pages { display: block; }
   body { height: 100vh; overflow: hidden; }
   main#pages { flex: 1; min-height: 0; }
   .page { height: 100%; }
-  .page:not([data-page="gen"]).cur { overflow-y: auto; }
-  .ops, .resultcard, .histbar { overflow-y: auto; }
+  /* 管理页不再整页滚：顶栏要钉住、右栏底部主按钮要贴底，
+     只能让各栏自己滚（否则整页滚会把工具带和按钮一起推出视口）。 */
+  .page:not([data-page="gen"]).cur { overflow: hidden; }
+  .ops, .histbar { overflow-y: auto; }
+  /* 结果卡片：上半部分（空态/加载/生成结果）自己滚，底部资源库固定成一条底栏。
+     原来是整卡滚动 + .history sticky 吸底——生成结果变长后预设库会盖住结果区末尾
+     （实测压住「撤销/重做」那行 7px），滚动时结果内容还从它半透明的底下穿过。 */
+  .resultcard { overflow: hidden; }
+  .resultcard > .ph,
+  .resultcard > .sc-loading,
+  .resultcard > #resultBody { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+  .resultcard > .history { position: static; flex: none; }
+  .mg-card { height: 100%; min-height: 0; overflow: hidden; }
+  .mg-side, .mg-main, .mg-inspect { overflow-y: auto; overscroll-behavior: contain; }
+  .mg-side::-webkit-scrollbar, .mg-main::-webkit-scrollbar, .mg-inspect::-webkit-scrollbar { width: 8px; }
+  .mg-side::-webkit-scrollbar-track, .mg-main::-webkit-scrollbar-track, .mg-inspect::-webkit-scrollbar-track { background: transparent; }
+  .mg-side::-webkit-scrollbar-thumb, .mg-main::-webkit-scrollbar-thumb, .mg-inspect::-webkit-scrollbar-thumb {
+    background: var(--border); border-radius: 4px;
+  }
+  .mg-side::-webkit-scrollbar-thumb:hover, .mg-main::-webkit-scrollbar-thumb:hover,
+  .mg-inspect::-webkit-scrollbar-thumb:hover { background: var(--faint); }
 }
 
-/* ---------- header gauges (device / cpu / mem / gpu / vram) ---------- */
-.meters { display: flex; gap: 14px; margin-left: 12px; flex-wrap: nowrap; justify-content: flex-end; align-items: flex-start; }
-.meter { display: flex; flex-direction: column; gap: 4px; width: 86px; flex: none; font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+/* ---------- header gauges (device / cpu / mem / gpu / vram) ----------
+   宽度 94px 是按最长的「内存 18.0/31.1G」定的：10.5px 等宽字体下
+   标签 21 + 间距 8 + 数值 62 = 91px，86px 会把末尾的 G 裁掉 2.5px。
+   flex: none 让整条在空间不足时换行，而不是被压窄后把内容挤到相邻元素上。 */
+.meters { display: flex; gap: 10px; margin-left: 12px; flex-wrap: nowrap; justify-content: flex-end; align-items: flex-start; flex: none; }
+.meter { display: flex; flex-direction: column; gap: 4px; width: 94px; flex: none; font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
 .meter > span {
-  display: flex; justify-content: space-between; align-items: baseline; gap: 6px;
+  display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
   white-space: nowrap; overflow: hidden; line-height: 16px; min-width: 0;
 }
 .meter > span b { overflow: hidden; text-overflow: ellipsis; flex: none; }
@@ -769,16 +862,57 @@ main#pages { display: block; }
 .meter .bar i { display: block; height: 100%; width: 0%; background: var(--accent); border-radius: 2px; transition: width .6s ease; }
 .meter.hot .bar i { background: var(--danger); }
 
-/* ---------- manage pages shared ---------- */
-.mg-card { max-width: 1080px; margin: 0 auto; width: 100%; }
-.mg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
-.mg-grid > .mg-col { min-width: 0; display: flex; flex-direction: column; }
-.mg-h { margin: 0 0 10px; font-size: 15px; font-weight: 700; }
+/* ---------- manage pages shared ----------
+   预设页与模型页共用同一套「三栏工作台」骨架：
+   顶部工具带（横跨全宽）+ 左目录/主配置 + 中主体 + 右检视/参数。
+   宽度不再锁 1080px——主页铺满 --layout-max，管理页却缩在中间会显得像另开了一个产品。
+   桌面端由各栏内部滚动，页面本身不滚（见下方 @media 1101）。 */
+.mg-card { width: 100%; }
+.mg-top {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding-bottom: 14px; border-bottom: 1px solid var(--border); flex: none;
+}
+.mg-top-l { display: flex; align-items: baseline; gap: 10px; flex: none; }
+.mg-h { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: .01em; }
+.mg-count {
+  font-size: 11.5px; color: var(--faint); padding: 2px 8px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--border);
+}
+/* 特异性要压过全局 input[type="text"]{width:100%}，否则工具带被撑成三行 */
+input.mg-search { width: 280px; flex: 0 1 280px; margin-left: auto; padding: 7px 12px; font-size: 13px; }
+.mg-top-r { display: flex; gap: 8px; flex: none; }
+
+.mg-body {
+  flex: 1; min-height: 0; padding-top: 16px;
+  display: grid; grid-template-columns: 216px minmax(0, 1fr) 336px; gap: 20px;
+}
+.mg-side, .mg-main, .mg-inspect { min-width: 0; }
+.mg-side { display: flex; flex-direction: column; }
+.mg-main { display: flex; flex-direction: column; }
+.mg-inspect { display: flex; flex-direction: column; }
+
+.mg-side-h {
+  font-size: 10.5px; font-weight: 600; letter-spacing: .1em; color: var(--faint);
+  margin: 0 0 7px; flex: none;
+}
+.mg-side-h:not(:first-child) { margin-top: 20px; }
+/* 内容少时这一栏会被 grid 拉到与中栏等高，把说明钉在可视区底部才总有交代 */
+.mg-side-foot {
+  position: sticky; bottom: 0; margin-top: auto; padding: 18px 0 2px;
+  font-size: 11px; line-height: 1.7; color: var(--faint); flex: none;
+  background: var(--surface);
+}
+
+.mg-main-head { display: flex; align-items: center; gap: 12px; min-height: 24px; margin-bottom: 10px; flex: none; }
+.mg-main-count { font-size: 11.5px; color: var(--faint); flex: none; }
+.mg-main-head .mg-hint { margin: 0; }
+.mg-sub-h { margin: 0; font-size: 13.5px; font-weight: 700; color: var(--ink); }
+
 .mg-hint { font-size: 12px; color: var(--faint); line-height: 1.7; margin-top: 4px; }
 .mg-btnrow { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
 .mg-btnrow .btn { padding: 9px 16px; font-size: 13.5px; }
-.mg-slider { margin: 12px 0 0; }
-.mg-save { margin-top: 16px; padding: 10px 22px; font-size: 14px; align-self: flex-start; }
+.mg-slider { margin: 0 0 4px; }
+.mg-save { margin-top: 12px; padding: 10px 22px; font-size: 14px; }
 
 .preset-row.wide { margin: 0; }
 .preset-detail.wide { margin: 10px 0 0; max-height: 260px; }
@@ -793,7 +927,8 @@ main#pages { display: block; }
 .kv b.off { color: var(--muted); }
 
 /* quality badges (acceleration options) */
-.q-legend { margin: 2px 0 12px; display: flex; flex-direction: column; gap: 4px; }
+/* 三档质量说明横排：竖排要占 60px，会把最后一项 cuDNN 挤出首屏 */
+.q-legend { margin: 2px 0 12px; display: flex; flex-wrap: wrap; gap: 4px 16px; }
 .q-legend p { margin: 0; font-size: 11.5px; color: var(--faint); }
 .qzb {
   display: inline-block; font-family: var(--mono); font-size: 10px; font-weight: 600;
@@ -804,9 +939,20 @@ main#pages { display: block; }
 .qzb.drop { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); border-color: color-mix(in srgb, var(--warn) 32%, transparent); }
 .qzb.warn { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); border-color: color-mix(in srgb, var(--danger) 32%, transparent); }
 
-/* acceleration switch rows get looser spacing than the ops panel */
-.mg-col .switch { margin-top: 12px; font-size: 13.5px; }
-.mg-col .switch .qzb { margin-left: auto; }
+/* acceleration option rows: 卡片式分组，说明从 tooltip 提到行内 */
+.cfg-group-h {
+  display: flex; align-items: baseline; gap: 7px;
+  margin: 16px 0 6px; font-size: 11.5px; font-weight: 600; color: var(--muted); flex: none;
+}
+.cfg-group-h:first-of-type { margin-top: 4px; }
+.cfg-group-h span { font-size: 10.5px; font-weight: 400; color: var(--faint); }
+.cfg-item {
+  padding: 9px 12px; border: 1px solid var(--border); border-radius: 9px;
+  background: var(--surface-2); margin-bottom: 6px; flex: none;
+}
+.cfg-item .switch { margin: 0; font-size: 13px; }
+.cfg-item .switch .qzb { margin-left: auto; }
+.cfg-desc { margin: 5px 0 0; font-size: 11.5px; line-height: 1.55; color: var(--faint); }
 
 /* disabled acceleration option */
 .switch.cfg-disabled { opacity: .55; cursor: not-allowed; }
@@ -820,50 +966,195 @@ main#pages { display: block; }
 }
 .qinfo:hover { color: var(--accent); border-color: var(--accent); }
 
-/* mg col header row (title + inline tools) */
-.mg-grid-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
-.mg-grid-head .mg-h { margin: 0; }
-.pm-tools { display: flex; gap: 8px; align-items: center; flex: 1; justify-content: flex-end; min-width: 0; }
-.pm-tools input[type="text"] { width: 180px; padding: 7px 11px; font-size: 13px; }
-.wide-col { flex: 1; min-width: 0; }
-
-/* preset card flow */
-.pm-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 10px; }
-.pm-card {
-  position: relative; display: flex; flex-direction: column; gap: 6px;
-  border: 1px solid var(--border); border-radius: 12px; background: var(--surface-2);
-  padding: 12px 13px; cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .16s ease;
+/* ---------- preset page: 左目录 ---------- */
+.pm-nav { display: flex; flex-direction: column; gap: 2px; }
+.pm-nav-row {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 10px; border: 1px solid transparent; border-radius: 8px; background: none;
+  color: var(--muted); font-family: var(--sans); font-size: 13px; text-align: left; cursor: pointer;
+  transition: background .15s ease, color .15s ease, border-color .15s ease;
 }
-.pm-card:hover { border-color: var(--accent); background: var(--surface); transform: translateY(-1px); }
-.pm-card.cur { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 5%, var(--surface)); }
-.pm-name { font-size: 13.5px; font-weight: 700; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 26px; }
-.pm-meta { font-family: var(--mono); font-size: 10.5px; color: var(--faint); display: flex; flex-direction: column; gap: 2px; }
+.pm-nav-row:hover { background: var(--surface-2); color: var(--ink); }
+.pm-nav-row.cur {
+  background: color-mix(in srgb, var(--primary) 8%, var(--surface));
+  border-color: color-mix(in srgb, var(--primary) 28%, transparent);
+  color: var(--primary); font-weight: 600;
+}
+.pm-nav-row .nav-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--faint); }
+.pm-nav-row b { margin-left: auto; font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--faint); }
+.pm-nav-row.cur b { color: var(--primary); }
+
+/* ---------- preset page: 中卡片墙 ----------
+   一张卡上必须能回答「它是谁 / 有没有参考音频 / 用什么参数」，
+   否则名字只差一两个字时完全无法扫读。 */
+.pm-cards {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr));
+  gap: 12px; align-content: start; padding-bottom: 6px;
+}
+.pm-card {
+  position: relative; display: flex; flex-direction: column; gap: 8px;
+  border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+  padding: 13px 14px 12px; cursor: pointer; min-height: 120px;
+  transition: border-color .16s ease, background .16s ease, transform .16s ease;
+}
+/* 选中态用左边缘竖条 + 浅底，比整卡描边更不容易和 hover 混淆 */
+.pm-card::before {
+  content: ""; position: absolute; left: 0; top: 12px; bottom: 12px; width: 3px;
+  border-radius: 0 3px 3px 0; background: var(--primary); opacity: 0;
+  transition: opacity .16s ease;
+}
+.pm-card:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); transform: translateY(-1px); }
+.pm-card.cur { border-color: color-mix(in srgb, var(--primary) 55%, var(--border)); background: color-mix(in srgb, var(--primary) 4%, var(--surface)); }
+.pm-card.cur::before { opacity: 1; }
+/* 右上角 hover 浮出「改 / 复 / ✕」：pm-acts 占右侧 35~81px，名称要让到 84px 才不重叠 */
+.pm-card-head { display: flex; align-items: center; gap: 8px; min-width: 0; padding-right: 84px; }
+.pm-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--faint); }
+.pm-name { font-size: 14px; font-weight: 700; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.pm-row { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.pm-tag {
+  font-family: var(--mono); font-size: 10px; font-weight: 600; padding: 2px 7px;
+  border-radius: 999px; border: 1px solid var(--border); color: var(--muted);
+  background: var(--surface-2); white-space: nowrap;
+}
+.pm-tag.on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 32%, transparent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.pm-tag.mute { color: var(--faint); }
+.pm-wav { width: 42px; height: 16px; flex: none; opacity: .8; }
+.pm-params {
+  font-family: var(--mono); font-size: 10.5px; color: var(--faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pm-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; padding-top: 2px; }
+.pm-emo { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.pm-apply {
+  border: 1px solid color-mix(in srgb, var(--primary) 35%, transparent); background: none;
+  color: var(--primary); font-family: var(--sans); font-size: 11.5px; font-weight: 600;
+  padding: 3px 10px; border-radius: 6px; cursor: pointer; flex: none;
+  transition: background .15s ease, color .15s ease;
+}
+.pm-apply:hover { background: var(--primary); color: var(--primary-ink); }
 .pm-del {
-  position: absolute; top: 8px; right: 8px; width: 22px; height: 22px;
+  position: absolute; top: 9px; right: 9px; width: 22px; height: 22px;
   border: none; border-radius: 6px; background: none; color: var(--faint);
   cursor: pointer; display: grid; place-items: center; font-size: 13px; line-height: 1;
   transition: color .15s ease, background .15s ease;
 }
 .pm-del:hover { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); }
-.pm-empty { grid-column: 1 / -1; color: var(--faint); font-size: 12.5px; padding: 18px 4px; text-align: center; }
+.pm-empty { grid-column: 1 / -1; color: var(--faint); font-size: 12.5px; padding: 32px 4px; text-align: center; }
 
 /* 预设卡片操作按钮组（改名/复制，hover 浮出，与删除按钮并排） */
 .pm-acts {
-  position: absolute; top: 8px; right: 34px;
-  display: flex; gap: 2px;
-  opacity: 0; transition: opacity .15s ease;
+  position: absolute; top: 9px; right: 35px;
+  display: flex; gap: 2px; opacity: 0; transition: opacity .15s ease;
 }
 .pm-card:hover .pm-acts, .hist-item:hover .pm-acts { opacity: 1; }
 .pm-act {
   border: none; border-radius: 5px; background: none; color: var(--faint);
   cursor: pointer; display: grid; place-items: center;
   width: 22px; height: 22px; padding: 0;
-  font-size: 12px; line-height: 1;
-  transition: color .15s ease, background .15s ease;
+  font-size: 12px; line-height: 1; transition: color .15s ease, background .15s ease;
 }
 .pm-act:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .pm-act:disabled { opacity: .4; cursor: wait; }
-/* 库区列表行的操作按钮（同一套） */
+
+/* ---------- preset page: 右检视面板 ----------
+   这一栏原来只放两句免责声明，占着 40% 宽度几乎全空。
+   现在两种状态轮换：选中→详情；未选中→创建表单，永远有内容。 */
+.pm-insp, .pm-create { display: flex; flex-direction: column; gap: 14px; min-height: 0; }
+.pm-insp[hidden] { display: none; }
+.insp-head { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.insp-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--faint); }
+.insp-name { margin: 0; font-size: 15.5px; font-weight: 700; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.insp-badges { display: flex; flex-wrap: wrap; gap: 6px; }
+.insp-sec { border-top: 1px solid var(--border); padding-top: 12px; }
+.insp-sec-h { font-size: 10.5px; font-weight: 600; letter-spacing: .1em; color: var(--faint); margin-bottom: 8px; }
+.insp-kv { display: flex; flex-direction: column; gap: 5px; }
+.insp-kv > div { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; }
+.insp-kv span { color: var(--muted); }
+.insp-kv b { font-family: var(--mono); font-weight: 600; color: var(--ink); }
+.insp-audio-none {
+  font-size: 11.5px; color: var(--faint); padding: 10px 12px; line-height: 1.6;
+  border: 1px dashed var(--border); border-radius: 8px;
+}
+.insp-wave {
+  display: flex; align-items: center; gap: 9px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2);
+}
+.insp-wave canvas { flex: 1; height: 26px; min-width: 0; }
+.insp-wave span { font-family: var(--mono); font-size: 10.5px; color: var(--faint); flex: none; }
+.insp-emotext {
+  font-size: 12.5px; color: var(--ink); line-height: 1.6;
+  padding: 8px 10px; border-radius: 8px; background: var(--surface-2);
+}
+.insp-vec { display: flex; flex-direction: column; gap: 5px; }
+.insp-vec > div { display: grid; grid-template-columns: 32px 1fr 26px; align-items: center; gap: 8px; font-size: 10.5px; color: var(--muted); }
+.insp-vec i { height: 4px; border-radius: 2px; background: var(--meter-track); overflow: hidden; display: block; }
+.insp-vec i b { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+.insp-vec em { font-style: normal; font-family: var(--mono); text-align: right; color: var(--faint); }
+/* 参数多时右栏会滚，主按钮必须钉在可视区底部，否则「应用到合成页」被滚出视口 */
+.insp-foot {
+  position: sticky; bottom: 0; z-index: 1;
+  margin-top: auto; padding: 12px 0 2px;
+  display: flex; flex-direction: column; gap: 8px;
+  background: var(--surface);
+  box-shadow: 0 -10px 14px -12px rgba(27, 26, 24, .3);
+}
+.insp-foot .btn.primary { width: 100%; justify-content: center; }
+.insp-acts { display: flex; gap: 6px; }
+.insp-acts .btn { flex: 1; justify-content: center; }
+.insp-hr { border: none; border-top: 1px solid var(--border); margin: 16px 0 0; width: 100%; }
+
+/* ---------- model page: 指标带 ---------- */
+.mm-band {
+  display: flex; align-items: stretch; gap: 12px; flex-wrap: wrap;
+  padding-bottom: 14px; border-bottom: 1px solid var(--border); flex: none;
+}
+.mm-state {
+  display: flex; flex-direction: column; gap: 3px; justify-content: center;
+  padding: 9px 15px; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--surface-2); min-width: 128px;
+}
+.mm-state-top { display: flex; align-items: center; gap: 8px; }
+.mm-led { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+.mm-state[data-s="ready"] .mm-led { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent); }
+.mm-state[data-s="loading"] .mm-led { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 18%, transparent); }
+.mm-state[data-s="error"] .mm-led { background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 18%, transparent); }
+.mm-state-top b { font-size: 16.5px; font-weight: 700; color: var(--muted); }
+.mm-state[data-s="ready"] .mm-state-top b { color: var(--ok); }
+.mm-state[data-s="error"] .mm-state-top b { color: var(--danger); }
+.mm-state-sub { font-size: 11px; color: var(--faint); }
+
+/* min-width 是「下限」而不是装饰：mm-band 是 flex-wrap，ops 里的按钮不可压，
+   没有这个下限时 metrics 会一直被压到卡片只剩几十像素（值全变省略号），
+   永远轮不到换行。低于这个宽度就整块掉到下一行独占一行，反而更舒展。 */
+.mm-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; flex: 1; min-width: min(240px, 100%); }
+.mm-metric {
+  display: flex; flex-direction: column; gap: 3px; padding: 9px 12px;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); min-width: 0;
+}
+.mm-metric > span { font-size: 10.5px; color: var(--faint); }
+.mm-metric > b { font-size: 15px; font-weight: 600; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mm-metric .bar { height: 4px; border-radius: 2px; background: var(--meter-track); overflow: hidden; }
+.mm-metric .bar i { display: block; height: 100%; width: 0%; background: var(--accent); border-radius: 2px; transition: width .6s ease; }
+.mm-metric.hot .bar i { background: var(--danger); }
+.mm-metric.hot > b { color: var(--danger); }
+.mm-metric > em { font-size: 10px; font-style: normal; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mm-ops { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+.mm-body { grid-template-columns: minmax(0, 1fr) 336px; }
+.mm-col { display: flex; flex-direction: column; }
+.mm-side-right { display: flex; flex-direction: column; gap: 14px; }
+.mm-note {
+  margin-top: auto; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--surface-2); font-size: 11.5px; line-height: 1.6; color: var(--faint);
+}
+.mm-tech { flex: none; margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
+.mm-tech summary { font-size: 11.5px; color: var(--faint); cursor: pointer; list-style: none; user-select: none; }
+.mm-tech summary::-webkit-details-marker { display: none; }
+.mm-tech summary::before { content: "▸ "; }
+.mm-tech[open] summary::before { content: "▾ "; }
+.mm-tech .preset-detail { margin: 10px 0 0; max-height: 180px; }
+
+/* 库区列表行的操作按钮（与预设卡片同一套） */
 .hist-item .pm-acts { top: 6px; right: 30px; }
 .hist-item .pm-act { width: 20px; height: 20px; font-size: 11px; }
 
@@ -874,7 +1165,7 @@ main#pages { display: block; }
   #waveHeader { display: none; }
   .spacer { display: none; }
   .meters { order: 3; margin-top: 2px; }
-  .meter { width: 84px; }
+  .meter { width: 94px; }
   #tabs { order: 4; margin-left: auto; }
   #themeBtn { order: 5; }
 }
@@ -887,11 +1178,36 @@ main#pages { display: block; }
   .page[data-page="gen"].cur,
   .page[data-page="gen"].cur.hist-collapsed { grid-template-columns: minmax(0, 1fr); }
   .resultcard { min-height: 300px; }
-  .mg-grid { grid-template-columns: 1fr; }
   /* 单栏下侧边栏铺满整行，窄条形态没有意义，强制展开 */
   .histbar.collapsed .hb-body { display: flex; }
   .histbar.collapsed .hb-rail { display: none; }
   .hb-list { max-height: 260px; }
+}
+/* 管理页收窄档：三栏还留着，只是左右两侧让步给中栏（卡片墙不能被压到一张） */
+@media (max-width: 1180px) {
+  .mg-body { grid-template-columns: 190px minmax(0, 1fr) 300px; gap: 16px; }
+  .mm-body { grid-template-columns: minmax(0, 1fr) 300px; }
+  .mm-band { gap: 10px; }
+  .mg-search { width: 210px; }
+}
+/* 指标带 4 列的下限：每张卡要 ≥118px 才放得下「6.7 / 8.0 GB」这种值，
+   4×118 + 3×10(gap) 再加状态块/按钮组约 520，得 1080。
+   断点设在这里而不是 1180：1180 时每列还有 135px，硬切 2 列会突然变成
+   两张 282px 的大卡（视觉断层），明明放得下却被折成 2×2。 */
+@media (max-width: 1080px) {
+  .mm-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+/* 管理页单栏档：目录收成横向 chips，检视面板落到最下方 */
+@media (max-width: 980px) {
+  .mg-body, .mm-body { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .mg-side { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .mg-side-h { margin: 0 2px 0 0; }
+  .mg-side-h:not(:first-child) { margin-top: 0; }
+  .pm-nav { flex-direction: row; flex-wrap: wrap; gap: 6px; }
+  .pm-nav-row { width: auto; }
+  .mg-side-foot { display: none; }
+  .mg-save { margin-top: 14px; }
+  .mg-search { width: 100%; margin-left: 0; order: 3; }
 }
 /* 宽屏档：--layout-max 的上限下，中间栏已能给到 660px；再放宽两侧固定档，
    免得 1920/2560 屏上把富余空间全浪费在留白里。 */
@@ -928,9 +1244,12 @@ main#pages { display: block; }
   /* 极窄视口：编辑行放不下"标签+滑块+数值+峰值"，让滑块独占一行 */
   .edit-row > b { width: 100%; }
   .edit-row input[type="range"] { max-width: none; min-width: 0; }
-  /* 极窄视口：仪表与 tabs 各占一行铺满；主题按钮浮到 header 右上角 */
-  .meter { width: 72px; }
-  .meters { order: 3; width: 100%; justify-content: flex-start; margin-left: 0; }
+  /* 极窄视口：仪表与 tabs 各占一行铺满；主题按钮浮到 header 右上角。
+     四个仪表等分整行、标签与数值上下排——固定 72px 会把「内存 18.0/31.1G」
+     末尾裁掉，竖排后数值独占一行，320px 视口也能完整显示。 */
+  .meter { width: auto; flex: 1 1 0; min-width: 0; }
+  .meter > span { flex-direction: column; align-items: flex-start; gap: 0; }
+  .meters { order: 3; width: 100%; justify-content: flex-start; gap: 8px; margin-left: 0; }
   #tabs { order: 4; width: 100%; margin-left: 0; justify-content: flex-start; }
   .tab { flex: 1; padding: 6px 8px; }
   #themeBtn { position: fixed; top: 8px; right: 10px; order: 0; z-index: 20; }

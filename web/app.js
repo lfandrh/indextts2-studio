@@ -240,10 +240,11 @@ function applyDraft(draft) {
   if (draft.gapMs != null) $("gapMs").value = draft.gapMs;
   if (Array.isArray(draft.emoVector)) setVecInputs(draft.emoVector);
   $("charCount").textContent = `${$("text").value.trim().length} 字`;
-  bindSliders();
+  syncParams();
   emoVisible();
   updateGenSummary();
   scheduleSegments();
+  enforceParamLock();
 }
 
 function draftElapsed(job) {
@@ -452,9 +453,17 @@ function renderModelPill(s) {
   }[phase] || "模型未加载";
 }
 function renderMetrics(m) {
-  $("devText").textContent = m.gpu_name
-    ? m.gpu_name.replace(/^NVIDIA /, "")
-    : "CPU";
+  /* 设备名只留 "RTX 3060 Ti"：四个仪表全显示后 header 预算很紧，完整型号
+     "GeForce RTX 3060 Ti" 要多吃 50px，1180 宽时主题按钮会被挤到第三行。
+     完整名字放进 title，鼠标悬停仍能看到。 */
+  const devPill = $("devPill");
+  if (m.gpu_name) {
+    $("devText").textContent = m.gpu_name.replace(/^NVIDIA\s+/i, "").replace(/^GeForce\s+/i, "");
+    devPill.title = "运行设备：" + m.gpu_name;
+  } else {
+    $("devText").textContent = "CPU";
+    devPill.title = "运行设备：CPU";
+  }
   if (m.cpu_percent !== undefined) setMeter("mCpu", m.cpu_percent, `${Math.round(m.cpu_percent)}%`);
   if (m.mem_total_gb) setMeter("mMem", (m.mem_used_gb / m.mem_total_gb) * 100, `${m.mem_used_gb.toFixed(1)}/${m.mem_total_gb.toFixed(1)}G`);
   const hasGpu = m.gpu_percent !== undefined;
@@ -464,6 +473,35 @@ function renderMetrics(m) {
     setMeter("mGpu", m.gpu_percent, `${m.gpu_percent}%`);
     setMeter("mVram", (m.vram_used_mb / (m.vram_total_mb || 8192)) * 100, `${(m.vram_used_mb / 1024).toFixed(1)}/${((m.vram_total_mb || 0) / 1024).toFixed(1)}G`);
   }
+  syncModelMetrics(m);
+}
+
+/* 模型页把 header 那四个小仪表放大成指标卡：8G 卡上「显存还剩多少」比任何文案都管用，
+   而旧版这一页恰恰一个数字都没有。数据同源于 header 的 /status 轮询，不新增请求。 */
+function mmMetric(id, pct, label, sub) {
+  const el = $(id);
+  if (!el) return;
+  const b = el.querySelector("b");
+  if (label !== undefined && b) b.textContent = label;
+  const bar = el.querySelector(".bar i");
+  if (bar) bar.style.width = `${Math.min(pct ?? 0, 100)}%`;
+  // 8G 卡上 80% 就只剩 1.5G 余量，比 header 的 85% 更早报警
+  el.classList.toggle("hot", (pct ?? 0) > 80);
+  const em = el.querySelector("em");
+  if (em && sub !== undefined) em.textContent = sub;
+}
+function syncModelMetrics(m) {
+  if (m.vram_total_mb) {
+    const total = m.vram_total_mb / 1024;
+    const used = (m.vram_used_mb || 0) / 1024;
+    mmMetric("mmVram", (used / total) * 100, `${used.toFixed(1)}/${total.toFixed(1)}G`, `余量 ${(total - used).toFixed(1)}G`);
+  }
+  if (m.gpu_percent !== undefined) mmMetric("mmGpu", m.gpu_percent, `${Math.round(m.gpu_percent)}%`, "利用率");
+  if (m.mem_total_gb) {
+    const pct = (m.mem_used_gb / m.mem_total_gb) * 100;
+    mmMetric("mmMem", pct, `${m.mem_used_gb.toFixed(1)}/${m.mem_total_gb.toFixed(1)}G`, "系统内存");
+  }
+  if (m.cpu_percent !== undefined) mmMetric("mmCpu", m.cpu_percent, `${Math.round(m.cpu_percent)}%`, "系统");
 }
 async function pollStatus() {
   try {
@@ -718,38 +756,278 @@ $("emoMode").addEventListener("change", emoVisible);
 $("emoMode").addEventListener("change", () => { if ($("emoMode").value != "1") clearEmoFile(); });
 $("emoMode").addEventListener("change", scheduleDraftSave);
 
-/* ---------------- sliders ---------------- */
-const SLIDERS = [
-  { id: "emoWeight", out: "emoWeightOut", dec: 2 },
-  { id: "temperature", out: "temperatureOut", dec: 2 },
-  { id: "topP", out: "topPOut", dec: 2 },
-  { id: "topK", out: "topKOut", dec: 0 },
-  { id: "numBeams", out: "numBeamsOut", dec: 0 },
-  { id: "maxMel", out: "maxMelOut", dec: 0 },
-  { id: "segTokens", out: "segTokensOut", dec: 0 },
+/* ---------------- 参数：滑块 + 数字框同源、单项恢复默认、锁定 ---------------- */
+// 关键约定：滑块（range）始终持有"真值"，数字框只是它的同步显示与输入入口。
+// 因此所有既有读取点（生成请求 / 保存预设 / 草稿）继续读 $(id).value 即可，
+// 不需要判断"以哪个为准"。为保证任意两位小数都能被滑块表示，range 的 step
+// 统一调到 0.01（temperature）/ 1（maxMel、gapMs），不再用 0.05 / 10。
+const PARAMS = [
+  { id: "emoWeight",   dec: 2, lock: false },
+  { id: "temperature", dec: 2, lock: true  },
+  { id: "topP",        dec: 2, lock: true  },
+  { id: "topK",        dec: 0, lock: true  },
+  { id: "numBeams",    dec: 0, lock: true  },
+  { id: "maxMel",      dec: 0, lock: true  },
+  { id: "segTokens",   dec: 0, lock: false },
+  { id: "repPen",      dec: 1, lock: true  },
+  { id: "lenPen",      dec: 1, lock: true  },
+  { id: "gapMs",       dec: 0, lock: true  },
 ];
+const PARAM_BY_ID = Object.fromEntries(PARAMS.map((p) => [p.id, p]));
+// 锁定范围 = 「高级参数」折叠里的 9 项（do_sample 开关 + 8 个数值）；
+// segTokens 属于"怎么切句"，不锁。
+const LOCKED_IDS = ["doSample", ...PARAMS.filter((p) => p.lock).map((p) => p.id)];
 const DEFAULTS = { emoWeight: 0.65, temperature: 0.8, topP: 0.8, topK: 30, numBeams: 3, maxMel: 1500, segTokens: 120, repPen: 10, lenPen: 0, gapMs: 200, doSample: true };
+
+// 前 5 项参数是 range + 配套的 <id>Num 数字框；repPen / lenPen / gapMs 天生就是
+// number 输入，本身即数字框，此时 numEl 直接返回它自己。
+const numEl = (id) => {
+  const paired = $(id + "Num");
+  if (paired) return paired;
+  const self = $(id);
+  return self && self.type === "number" ? self : null;
+};
+const paramDec = (id) => PARAM_BY_ID[id]?.dec ?? 2;
+const fmtParam = (id, v) => Number(v).toFixed(paramDec(id));
 
 function sliderFill(el) {
   const min = +el.min, max = +el.max, v = +el.value;
   el.style.setProperty("--fill", `${((v - min) / (max - min)) * 100}%`);
 }
-function bindSliders() {
-  for (const s of SLIDERS) {
-    const el = $(s.id), out = $(s.out);
-    const upd = () => { out.textContent = Number(el.value).toFixed(s.dec); sliderFill(el); };
-    el.addEventListener("input", upd);
-    upd();
+
+/* 任意输入 → 该参数的合法值：夹到 min/max，按 step 吸附到网格 */
+function normalizeParam(id, raw) {
+  const el = $(id);
+  const min = +el.min, max = +el.max, step = +el.step || 1;
+  let v = Number(raw);
+  if (!Number.isFinite(v)) return null;
+  if (Number.isFinite(min)) v = Math.max(min, v);
+  if (Number.isFinite(max)) v = Math.min(max, v);
+  if (Number.isFinite(step) && step > 0) {
+    const base = Number.isFinite(min) ? min : 0;
+    v = base + Math.round((v - base) / step) * step;
+    v = Number(v.toFixed(6)); // 收掉 0.1 步长产生的 0.30000000000000004
+  }
+  return v;
+}
+
+/* 写值并同步两侧显示。src="num" 表示来源是数字框，此时不回写它，避免打断打字 */
+function setParam(id, raw, src = "") {
+  const v = normalizeParam(id, raw);
+  if (v === null) return false;
+  const el = $(id), num = numEl(id);
+  el.value = v;
+  if (el.type === "range") sliderFill(el);
+  if (num && src !== "num") num.value = fmtParam(id, v);
+  markResetBtn(id);
+  return true;
+}
+
+/* 同步全部参数的显示（替代原来的 bindSliders 调用点） */
+function syncParams() {
+  for (const p of PARAMS) {
+    const el = $(p.id), num = numEl(p.id);
+    if (!el) continue;
+    if (el.type === "range") sliderFill(el);
+    if (num) num.value = fmtParam(p.id, el.value);
+    markResetBtn(p.id);
   }
 }
+
+/* ↺ 的可用感：偏离默认值才变实色，扫一眼就知道哪几项被改过 */
+function markResetBtn(id) {
+  const btn = document.querySelector(`.rdef[data-pid="${id}"]`);
+  const el = $(id);
+  if (!btn || !el) return;
+  const step = Number(el.step) || 1;
+  btn.classList.toggle("on", Math.abs(Number(el.value) - Number(DEFAULTS[id])) > step / 2);
+}
+
+/* 事件只绑一次。原来叫 bindSliders，每次调用都 addEventListener 会叠加监听器 */
+function bindParamEvents() {
+  // 英文参数名在窄栏里会被省略号截断，把全名挂到 title 上
+  document.querySelectorAll(".pitem label span").forEach((s) => { s.title = s.textContent; });
+  for (const p of PARAMS) {
+    const el = $(p.id), num = numEl(p.id);
+    if (el && el.type === "range") {
+      el.addEventListener("input", () => {
+        if (num) num.value = fmtParam(p.id, el.value);
+        sliderFill(el);
+        markResetBtn(p.id);
+      });
+    }
+    if (!num) continue;
+    num.addEventListener("input", () => {
+      const raw = num.value;
+      if (raw === "" || raw === "-" || raw === ".") return; // 打字中间态，等 blur 兜底
+      const v = normalizeParam(p.id, raw);
+      if (v === null) return;
+      // el === num 时（repPen/lenPen/gapMs）不能回写，否则会把正在输入的内容
+      // 覆盖掉——例如输入 "0.5"，打到 "0" 就被夹成 0.1。
+      if (el !== num) {
+        el.value = v;            // 滑块跟着走；数字框保留用户原文
+        sliderFill(el);
+      }
+      markResetBtn(p.id);
+      scheduleDraftSave();
+    });
+    num.addEventListener("blur", () => {
+      const v = normalizeParam(p.id, num.value);
+      if (v === null || num.value === "") { num.value = fmtParam(p.id, el.value); return; }
+      setParam(p.id, v);
+      if (p.id === "segTokens") scheduleSegments();
+      updateGenSummary();
+      scheduleDraftSave();
+    });
+    num.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); num.blur(); }
+    });
+  }
+  // 单项恢复默认值
+  document.querySelectorAll(".rdef").forEach((btn) => {    btn.addEventListener("click", () => {
+      const id = btn.dataset.pid;
+      if (paramLock.locked && LOCKED_IDS.includes(id)) return;
+      setParam(id, DEFAULTS[id]);
+      if (id === "segTokens") scheduleSegments();
+      updateGenSummary();
+      scheduleDraftSave();
+    });
+  });
+}
+
+/* ---------------- 参数锁定：快照 + 服务端持久化 ---------------- */
+// 语义：锁定瞬间记下 9 项的值，之后任何来源（应用预设、草稿恢复、重置）的写入
+// 都被回滚到这份快照。存在服务端 data/ui_state.json，清浏览器缓存不会丢。
+const LOCK_CACHE_KEY = "studioParamLock.v1";
+let paramLock = { locked: false, values: {} };
+
+function snapshotLockedParams() {
+  const out = {};
+  for (const id of LOCKED_IDS) {
+    const el = $(id);
+    out[id] = el.type === "checkbox" ? !!el.checked : String(el.value);
+  }
+  return out;
+}
+
+/* 把快照写回控件 —— 所有覆盖路径的最后一道关 */
+function applyLockSnapshot() {
+  if (!paramLock.locked) return;
+  for (const id of LOCKED_IDS) {
+    const v = paramLock.values[id];
+    if (v === undefined || v === null || v === "") continue;
+    const el = $(id);
+    if (el.type === "checkbox") el.checked = !!v;
+    else setParam(id, v);
+  }
+}
+function enforceParamLock() { applyLockSnapshot(); }
+
+function paintLockUI() {
+  const locked = !!paramLock.locked;
+  const fold = $("advFold");
+  if (fold) fold.classList.toggle("params-locked", locked);
+  $("lockBadge").hidden = !locked;
+  $("lockHint").hidden = !locked;
+  $("paramLock").checked = locked;
+  for (const id of LOCKED_IDS) {
+    const el = $(id), num = numEl(id);
+    if (el) el.disabled = locked;
+    if (num) num.disabled = locked;
+  }
+  document.querySelectorAll(".rdef").forEach((b) => {
+    if (LOCKED_IDS.includes(b.dataset.pid)) b.disabled = locked;
+  });
+}
+
+async function saveParamLock() {
+  try { localStorage.setItem(LOCK_CACHE_KEY, JSON.stringify(paramLock)); } catch (e) { /* 存满也不影响使用 */ }
+  try {
+    await fetch(`${API}/prefs/param-lock`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(paramLock),
+    });
+  } catch (e) { /* 服务端没起：本地缓存仍生效，下次连上再写 */ }
+}
+
+function toggleParamLock(locked) {
+  paramLock = locked
+    ? { locked: true, values: snapshotLockedParams() }
+    : { locked: false, values: {} };
+  paintLockUI();
+  saveParamLock();
+  // 把「眼下看到的数值」记成草稿：锁定期间草稿可能停在锁定前的旧值（刷新时
+  // 被快照覆盖过），解锁后若不落盘，下一次刷新会看到参数自己跳回旧值。
+  scheduleDraftSave();
+  showActionHint(locked ? "参数已锁定：应用预设不再改变这些数值" : "参数已解锁");
+}
+$("paramLock").addEventListener("change", () => toggleParamLock($("paramLock").checked));
+
+/* 先用本地缓存顶上，避免页面先闪一下默认值；随后以服务端为准校正 */
+function loadParamLockFromCache() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LOCK_CACHE_KEY) || "null");
+    if (!raw || typeof raw !== "object") return;
+    paramLock = {
+      locked: !!raw.locked,
+      values: raw.values && typeof raw.values === "object" ? raw.values : {},
+    };
+    paintLockUI();
+    applyLockSnapshot();
+  } catch (e) { /* ignore */ }
+}
+
+async function loadParamLockFromServer() {
+  try {
+    const r = await fetch(`${API}/prefs/param-lock`);
+    if (!r.ok) return;
+    const j = await r.json();
+    // 进入本函数时若已是锁定态，说明上一步的本地缓存已经（或即将）把旧快照
+    // 压到控件上；服务端一旦说「没锁」，这份覆盖就必须被撤掉。
+    const cacheOverlaid = !!paramLock.locked;
+    paramLock = {
+      locked: !!j.locked,
+      values: j.locked && j.values && typeof j.values === "object" ? j.values : {},
+    };
+    paintLockUI();
+    if (paramLock.locked) applyLockSnapshot();
+    else if (cacheOverlaid) restoreLockedParamsFromDraft();
+    try { localStorage.setItem(LOCK_CACHE_KEY, JSON.stringify(paramLock)); } catch (e) { /* ignore */ }
+  } catch (e) { /* 服务端不可用：沿用本地缓存 */ }
+}
+
+/* 本地缓存的快照只是「避免闪一下默认值」的乐观显示，服务端才是权威。
+   当服务端判定未锁定、而缓存已经把快照压到控件上时，要把这 9 项还原成草稿里
+   的真值——否则解锁后参数会一直停在某个浏览器残留的旧快照上，看起来像「锁
+   开关关了但数值没回来」。草稿里缺该项（老版本草稿）就回默认值。 */
+function restoreLockedParamsFromDraft() {
+  const draft = readDraft();
+  for (const id of LOCKED_IDS) {
+    const el = $(id);
+    if (!el) continue;
+    const v = draft ? draft[id] : undefined;
+    if (el.type === "checkbox") el.checked = v == null ? !!DEFAULTS[id] : !!v;
+    else setParam(id, v == null ? DEFAULTS[id] : v);
+  }
+  syncParams();
+  updateGenSummary();
+  scheduleDraftSave();
+}
+
 $("resetParams").addEventListener("click", () => {
+  if (paramLock.locked) {
+    showActionHint("参数已锁定，先解锁再恢复默认值");
+    return;
+  }
   for (const [k, v] of Object.entries(DEFAULTS)) {
     const el = $(k);
     if (el.type === "checkbox") el.checked = v;
-    else el.value = v;
+    else setParam(k, v);
   }
-  bindSliders();
+  syncParams();
   scheduleSegments();
+  updateGenSummary();
   scheduleDraftSave();
 });
 $("segTokens").addEventListener("input", scheduleSegments);
@@ -1490,13 +1768,18 @@ function applyPresetToForm(j) {
   if (adv.repetition_penalty != null) $("repPen").value = adv.repetition_penalty;
   if (adv.max_mel_tokens != null) $("maxMel").value = adv.max_mel_tokens;
   if (adv.max_text_tokens_per_segment != null) $("segTokens").value = adv.max_text_tokens_per_segment;
+  // 旧预设没有 interval_silence 字段，保持当前值不动（不强行回默认值）
+  if (adv.interval_silence != null) $("gapMs").value = adv.interval_silence;
   if (j.emo_text != null) $("emoText").value = j.emo_text || "";
+  // emo_random 一直有存，此前漏了回填
+  if (j.emo_random != null) $("emoRandom").checked = !!j.emo_random;
   setVecInputs(j.emo_vector || [0, 0, 0, 0, 0, 0, 0, 0]);
-  bindSliders();
+  syncParams();
   emoVisible();
   if (j.prompt_audio_url) fetchPresetAudio(j.prompt_audio_url, $("spkFile"), setSpkFile, "spk");
   if (j.emo_audio_url) fetchPresetAudio(j.emo_audio_url, $("emoFile"), setEmoFile, "emo");
   scheduleSegments();
+  enforceParamLock();
   scheduleDraftSave();
 }
 function collectPresetState(fd) {
@@ -1513,6 +1796,7 @@ function collectPresetState(fd) {
   fd.append("repetition_penalty", $("repPen").value);
   fd.append("max_mel_tokens", $("maxMel").value);
   fd.append("max_text_tokens_per_segment", $("segTokens").value);
+  fd.append("interval_silence", $("gapMs").value);
   vecInputs().forEach((s) => fd.append("vec" + (parseInt(s.dataset.i) + 1), s.value));
 }
 
@@ -1661,7 +1945,7 @@ function renderLib() {
           $("emoText").value = ex.emo_text || "";
           setVecInputs([ex.emo_vec_1, ex.emo_vec_2, ex.emo_vec_3, ex.emo_vec_4,
             ex.emo_vec_5, ex.emo_vec_6, ex.emo_vec_7, ex.emo_vec_8]);
-          bindSliders();
+          syncParams();
           emoVisible();
           curPresetName = "";
           scheduleSegments();
@@ -2013,75 +2297,224 @@ window.addEventListener("hashchange", () => {
   if (["gen", "presets", "model"].includes(target)) switchPage(target, false);
 });
 
-/* ---------------- preset manage page (card flow + search) ---------------- */
+/* ---------------- preset manage page：三栏工作台 ----------------
+   左栏筛选目录 / 中栏卡片墙 / 右栏检视面板（未选中时退回创建表单）。
+
+   与旧版三处关键差异：
+   1) 点卡片不再「立刻应用并跳回合成页」，而是选中并在右栏展开详情——管理页的首要动作
+      是看清这条预设是什么，不是一进来就被弹走。要一步到位用卡片上的「应用」。
+   2) 详情一次性预取齐（并发 6），卡片一渲染就带情绪色/音频/参数，筛选计数也才准；
+      旧的逐个 .then 会让卡片先空后跳。
+   3) 右栏永远有内容：选中→详情，未选中→创建表单。旧版这栏只放了两句免责声明。 */
 const pmCards = $("pmCards"), pmHint = $("pmHint"), pmSearch = $("pmSearch");
-let pmListCache = [];       // all preset names
-let pmCurName = "";
+let pmListCache = [];       // 全部预设名
+let pmSelName = "";         // 右栏正在检视的预设（≠ 已应用的 curPresetName）
+let pmFilter = "all";       // all | audio | noaudio
+let pmEmoFilter = -1;       // -1 = 不限；0..3 = emo_control_method
+const pmDetailMap = new Map();
+
 function pmFlash(msg, isErr) {
   pmHint.textContent = msg;
   pmHint.style.color = isErr ? cssVar("--danger") : "";
 }
 const EMO_MODE_NAMES = ["与音色参考相同", "情感参考音频", "情感向量", "情感描述文本"];
+const EMO_MODE_COLORS = ["#8a8580", "#3f6fb5", "#7c5cc4", "#d07a2a"];
+const EMO_NAMES8 = ["喜悦", "愤怒", "悲伤", "恐惧", "厌恶", "低落", "惊喜", "平静"];
 
-async function refreshPmList() {
-  try {
-    const r = await (await fetch(`${API}/presets`)).json();
-    pmListCache = r.presets || [];
-    renderPmCards();
-  } catch (err) {
-    pmFlash("刷新预设失败: " + err, true);
-  }
+function pmNum(v, dec = 2) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toFixed(dec) : "—";
+}
+function pmEmoOf(d) {
+  const m = d?.emo_control_method;
+  return {
+    m,
+    label: EMO_MODE_NAMES[m] ?? "未知模式",
+    color: EMO_MODE_COLORS[m] ?? "var(--faint)",
+  };
 }
 
 async function pmLoadDetail(name) {
   return presetDetail(name);
 }
 
-async function renderPmCards() {
+/* 并发上限 6，别让 50 条预设把浏览器连接池占满 */
+async function pmEnsureDetails(names) {
+  const todo = names.filter((n) => !pmDetailMap.has(n));
+  if (!todo.length) return;
+  let i = 0;
+  const worker = async () => {
+    while (i < todo.length) {
+      const n = todo[i++];
+      try { pmDetailMap.set(n, await pmLoadDetail(n)); }
+      catch { pmDetailMap.set(n, null); }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(6, todo.length) }, worker));
+}
+
+async function refreshPmList() {
+  try {
+    const r = await (await fetch(`${API}/presets`)).json();
+    pmListCache = r.presets || [];
+    await pmEnsureDetails(pmListCache);
+    if (pmSelName && !pmListCache.includes(pmSelName)) pmSelName = "";
+    pmClampSelection();   // 列表可能刚变过，选中项要跟着收敛到可见集合
+    renderPmNav();
+    renderPmCards();
+    renderInspector(pmSelName);
+  } catch (err) {
+    pmFlash("刷新预设失败: " + err, true);
+  }
+}
+
+function pmVisibleNames() {
   const q = (pmSearch.value || "").trim().toLowerCase();
-  const names = pmListCache.filter((n) => !q || n.toLowerCase().includes(q));
+  return pmListCache.filter((n) => {
+    if (q && !n.toLowerCase().includes(q)) return false;
+    const d = pmDetailMap.get(n);
+    if (pmFilter === "audio") return !!d?.prompt_audio_url;
+    if (pmFilter === "noaudio") return !!d && !d.prompt_audio_url;
+    if (pmEmoFilter >= 0) return d?.emo_control_method === pmEmoFilter;
+    return true;
+  });
+}
+
+/* 选中项必须落在可见集合里：不合法就退到第一条可见（进页面时 pmSelName 为空，
+   也由这里落到第一条，右栏才有内容可看）。可见集合为空（搜索无匹配）时保留
+   原选中，避免打字打到一半右栏跳空。 */
+function pmClampSelection() {
+  const names = pmVisibleNames();
+  if (names.length && !names.includes(pmSelName)) pmSelName = names[0];
+}
+
+function renderPmNav() {
+  const hasAudio = (n) => !!pmDetailMap.get(n)?.prompt_audio_url;
+  const base = [
+    ["all", "全部预设", pmListCache.length, null],
+    ["audio", "含参考音频", pmListCache.filter(hasAudio).length, null],
+    ["noaudio", "仅参数", pmListCache.filter((n) => pmDetailMap.has(n) && !hasAudio(n)).length, null],
+  ];
+  $("pmNav").replaceChildren(...base.map(([k, label, n]) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "pm-nav-row" + (pmFilter === k ? " cur" : "");
+    const s = document.createElement("span");
+    s.textContent = label;
+    const cnt = document.createElement("b");
+    cnt.textContent = n;
+    b.append(s, cnt);
+    b.addEventListener("click", () => {
+      pmFilter = k; pmEmoFilter = -1;
+      renderPmNav(); pmRepaint();
+    });
+    return b;
+  }));
+
+  $("pmNavEmo").replaceChildren(...EMO_MODE_NAMES.map((label, i) => {
+    const n = pmListCache.filter((nm) => pmDetailMap.get(nm)?.emo_control_method === i).length;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "pm-nav-row" + (pmEmoFilter === i ? " cur" : "");
+    const dot = document.createElement("span");
+    dot.className = "nav-dot";
+    dot.style.background = EMO_MODE_COLORS[i];
+    const s = document.createElement("span");
+    s.textContent = label;
+    const cnt = document.createElement("b");
+    cnt.textContent = n;
+    b.append(dot, s, cnt);
+    b.addEventListener("click", () => {
+      pmEmoFilter = pmEmoFilter === i ? -1 : i;
+      pmFilter = "all";
+      renderPmNav(); pmRepaint();
+    });
+    return b;
+  }));
+
+  $("pmCount").textContent = `${pmListCache.length} 个预设`;
+}
+
+function renderPmCards() {
+  const names = pmVisibleNames();
+  $("pmShown").textContent = names.length === pmListCache.length
+    ? `共 ${names.length} 个`
+    : `${names.length} / ${pmListCache.length}`;
   pmCards.replaceChildren();
+
   if (!names.length) {
     const empty = document.createElement("div");
     empty.className = "pm-empty";
-    empty.textContent = q ? `没有匹配「${q}」的预设` : "暂无预设，可在右侧创建";
+    const q = (pmSearch.value || "").trim();
+    empty.textContent = q
+      ? `没有匹配「${q}」的预设`
+      : (pmListCache.length ? "当前筛选下没有预设" : "暂无预设，可在右侧创建第一条");
     pmCards.appendChild(empty);
     return;
   }
+
   for (const name of names) {
+    const d = pmDetailMap.get(name);
     const card = document.createElement("div");
-    card.className = "pm-card" + (name === pmCurName ? " cur" : "");
+    card.className = "pm-card" + (name === pmSelName ? " cur" : "");
+    card.tabIndex = 0;
     card.innerHTML = `
-      <span class="pm-name"></span>
-      <span class="pm-meta"><span class="pm-m1">加载中…</span></span>
+      <div class="pm-card-head"><span class="pm-dot"></span><span class="pm-name"></span></div>
+      <div class="pm-row"><span class="pm-tag pm-flag"></span></div>
+      <span class="pm-params"></span>
+      <div class="pm-foot"><span class="pm-emo"></span><button class="pm-apply" type="button">应用</button></div>
       <span class="pm-acts">
         <button class="pm-act" data-act="rename" type="button" title="改名">改</button>
         <button class="pm-act" data-act="duplicate" type="button" title="复制">复</button>
       </span>
       <button class="pm-del" type="button" title="删除此预设">✕</button>`;
     card.querySelector(".pm-name").textContent = name;
+    card.querySelector(".pm-name").title = name;   // 名称让位给操作按钮后会省略，hover 给全名
     card.querySelector(".pm-del").setAttribute("aria-label", "删除预设 " + name);
-    const m1 = card.querySelector(".pm-m1");
-    // lazy detail: first line of info (emo mode + audio)
-    pmLoadDetail(name).then((d) => {
-      if (!d) { m1.textContent = "详情加载失败"; return; }
+
+    const emo = pmEmoOf(d);
+    card.querySelector(".pm-dot").style.background = emo.color;
+    const emoEl = card.querySelector(".pm-emo");
+    emoEl.textContent = emo.label + (name === curPresetName ? " · 已应用" : "");
+    emoEl.title = emo.label;
+
+    const flag = card.querySelector(".pm-flag");
+    const params = card.querySelector(".pm-params");
+    if (!d) {
+      flag.textContent = "详情不可用";
+      flag.classList.add("mute");
+      params.textContent = "—";
+    } else if (d.prompt_audio_url) {
+      flag.textContent = "含音频";
+      flag.classList.add("on");
+    } else {
+      flag.textContent = "无音频";
+      flag.classList.add("mute");
+    }
+    if (d) {
       const adv = d.advanced_params || {};
-      m1.textContent = `${EMO_MODE_NAMES[d.emo_control_method] ?? d.emo_control_method} · ${d.prompt_audio_url ? "含音频" : "无音频"} · temp ${adv.temperature ?? "-"}`;
-    });
-    // click card → apply preset (jump to gen page)
-    card.addEventListener("click", async (e) => {
+      const bits = [];
+      if (adv.temperature != null) bits.push(`temp ${pmNum(adv.temperature)}`);
+      if (adv.top_p != null) bits.push(`top_p ${pmNum(adv.top_p)}`);
+      if (adv.num_beams != null) bits.push(`beam ${adv.num_beams}`);
+      params.textContent = bits.join(" · ") || "默认采样参数";
+      params.title = params.textContent;
+    }
+
+    card.addEventListener("click", (e) => {
       if (e.target.closest(".pm-del") || e.target.closest(".pm-act")) return;
-      pmCurName = name;
-      if (await applyPresetByName(name)) switchPage("gen");
+      if (e.target.closest(".pm-apply")) { pmApplyPreset(name); return; }
+      pmSelect(name);
     });
-    // 改名 / 复制 / 删除共用一组操作
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pmSelect(name); }
+    });
     card.querySelectorAll(".pm-act").forEach((btn) => {
       btn.addEventListener("click", async (e) => {
         e.stopPropagation();
         await pmPresetAction(name, btn.dataset.act);
       });
     });
-    // click ✕ → delete with confirm
     card.querySelector(".pm-del").addEventListener("click", async (e) => {
       e.stopPropagation();
       await pmPresetAction(name, "delete");
@@ -2089,6 +2522,159 @@ async function renderPmCards() {
     pmCards.appendChild(card);
   }
 }
+
+function pmSelect(name) {
+  pmSelName = name;
+  renderPmCards();
+  renderInspector(name);
+}
+
+/* 筛选/搜索改变了「可见集合」后重绘卡片墙 + 右栏。
+   与 pmSelect 的区别：这里不信任 pmSelName，被筛掉的选中项由 pmClampSelection
+   自动收敛，否则右栏会一直挂着一个在卡片墙上根本不存在的预设。
+   右栏只在选中项真的换了才重建——搜索是逐字触发的，每次都重建会把正在试听的
+   参考音频掐断。 */
+function pmRepaint() {
+  const before = pmSelName;
+  pmClampSelection();
+  renderPmCards();
+  if (pmSelName !== before) renderInspector(pmSelName);
+}
+
+async function pmApplyPreset(name) {
+  if (!await applyPresetByName(name)) return;
+  pmSelName = name;
+  renderPmCards();
+  renderInspector(name);
+  switchPage("gen");
+}
+
+/* 右栏：选中→详情；未选中→创建表单，保证这一栏永远有内容 */
+function renderInspector(name) {
+  const insp = $("pmInsp"), create = $("pmCreateBox");
+  const d = name ? pmDetailMap.get(name) : null;
+  if (!name || !d) {
+    insp.hidden = true;
+    create.hidden = false;
+    return;
+  }
+  create.hidden = true;
+  insp.hidden = false;
+
+  const emo = pmEmoOf(d);
+  $("inspDot").style.background = emo.color;
+  $("inspName").textContent = name;
+  $("inspName").title = name;
+
+  const badges = [];
+  const emoTag = document.createElement("span");
+  emoTag.className = "pm-tag";
+  emoTag.textContent = emo.label;
+  emoTag.style.color = emo.color;
+  emoTag.style.borderColor = `color-mix(in srgb, ${emo.color} 40%, transparent)`;
+  badges.push(emoTag);
+  const audioTag = document.createElement("span");
+  audioTag.className = "pm-tag " + (d.prompt_audio_url ? "on" : "mute");
+  audioTag.textContent = d.prompt_audio_url ? "含音频" : "无音频";
+  badges.push(audioTag);
+  if (name === curPresetName) {
+    const applied = document.createElement("span");
+    applied.className = "pm-tag on";
+    applied.textContent = "已应用";
+    badges.push(applied);
+  }
+  $("inspBadges").replaceChildren(...badges);
+
+  // 音色：有音频就给能直接听的播放器，没有就明说会沿用当前音色
+  const audioBox = $("inspAudio");
+  audioBox.replaceChildren();
+  if (d.prompt_audio_url) {
+    const a = document.createElement("audio");
+    a.controls = true;
+    a.preload = "none";
+    a.src = d.prompt_audio_url;
+    a.style.width = "100%";
+    const note = document.createElement("p");
+    note.className = "mg-hint";
+    note.style.margin = "0";
+    note.textContent = "预设自带的参考音频，应用后自动回填到合成页";
+    audioBox.append(a, note);
+  } else {
+    const none = document.createElement("div");
+    none.className = "insp-audio-none";
+    none.textContent = "无参考音频。应用后沿用合成页当前的音色，只替换参数。";
+    audioBox.appendChild(none);
+  }
+
+  // 情感
+  const emoBox = $("inspEmo");
+  emoBox.replaceChildren();
+  const m = d.emo_control_method;
+  if (m === 2) {
+    const vec = Array.isArray(d.emo_vector) ? d.emo_vector.map(Number) : [];
+    const box = document.createElement("div");
+    box.className = "insp-vec";
+    box.style.marginBottom = "8px";
+    EMO_NAMES8.forEach((label, i) => {
+      const v = Math.max(0, Math.min(1, vec[i] ?? 0));
+      const row = document.createElement("div");
+      row.innerHTML = `<span>${label}</span><i><b style="width:${(v * 100).toFixed(1)}%"></b></i><em>${v.toFixed(2)}</em>`;
+      box.appendChild(row);
+    });
+    const note = document.createElement("p");
+    note.className = "mg-hint";
+    note.style.margin = "0";
+    note.textContent = "8 维情感向量，数值越大该情绪越强";
+    emoBox.append(box, note);
+  } else if (m === 3) {
+    const t = document.createElement("div");
+    t.className = "insp-emotext";
+    t.textContent = d.emo_text || "（未填写描述文本）";
+    emoBox.appendChild(t);
+  } else if (m === 1) {
+    if (d.emo_audio_url) {
+      const a = document.createElement("audio");
+      a.controls = true;
+      a.preload = "none";
+      a.src = d.emo_audio_url;
+      a.style.width = "100%";
+      emoBox.appendChild(a);
+    } else {
+      const none = document.createElement("div");
+      none.className = "insp-audio-none";
+      none.textContent = "未保存情感参考音频";
+      emoBox.appendChild(none);
+    }
+  } else {
+    const t = document.createElement("div");
+    t.className = "insp-emotext";
+    t.textContent = "与音色参考音频相同，不额外指定情感";
+    emoBox.appendChild(t);
+  }
+
+  // 采样参数
+  const adv = d.advanced_params || {};
+  const rows = [
+    ["temperature", pmNum(adv.temperature)],
+    ["top_p", pmNum(adv.top_p)],
+    ["top_k", adv.top_k ?? "—"],
+    ["num_beams", adv.num_beams ?? "—"],
+    ["length_penalty", pmNum(adv.length_penalty)],
+    ["repetition_penalty", pmNum(adv.repetition_penalty)],
+    ["max_mel_tokens", adv.max_mel_tokens ?? "—"],
+    ["分句 Token 上限", adv.max_text_tokens_per_segment ?? "—"],
+  ];
+  $("inspParams").replaceChildren(...rows.map(([k, v]) => {
+    const row = document.createElement("div");
+    const s = document.createElement("span");
+    s.textContent = k;
+    const b = document.createElement("b");
+    b.textContent = v;
+    row.append(s, b);
+    return row;
+  }));
+}
+
 
 /* 预设操作统一处理：rename / duplicate / delete。
    刷新两处列表（管理页 + 生成页库区）并同步各处缓存与选中态。 */
@@ -2107,8 +2693,10 @@ async function pmPresetAction(name, act) {
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "改名失败");
       const j = await r.json();
       presetDetailCache.delete(name);
-      if (pmCurName === name) pmCurName = j.name || trimmed;
-      if (curPresetName === name) { curPresetName = j.name || trimmed; updateGenSummary(); }
+      pmDetailMap.delete(name);
+      const renamed = j.name || trimmed;
+      if (pmSelName === name) pmSelName = renamed;
+      if (curPresetName === name) { curPresetName = renamed; updateGenSummary(); }
       pmFlash(`已改名: ${name} → ${j.name || trimmed}`);
     } else if (act === "duplicate") {
       const r = await fetch(`${API}/presets/` + encodeURIComponent(name) + "/duplicate", {
@@ -2123,7 +2711,8 @@ async function pmPresetAction(name, act) {
       const r = await fetch(`${API}/presets/` + encodeURIComponent(name), { method: "DELETE" });
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "删除失败");
       presetDetailCache.delete(name);
-      if (pmCurName === name) pmCurName = "";
+      pmDetailMap.delete(name);
+      if (pmSelName === name) pmSelName = "";
       if (curPresetName === name) { curPresetName = ""; updateGenSummary(); }
       pmFlash("已删除预设: " + name);
     }
@@ -2132,19 +2721,38 @@ async function pmPresetAction(name, act) {
     renderLib();
   } catch (err) { pmFlash("操作失败: " + err.message, true); }
 }
-pmSearch.addEventListener("input", renderPmCards);
-$("btnPmRefresh").addEventListener("click", () => { presetDetailCache.clear(); refreshPmList(); pmFlash("已刷新"); });
+/* 搜索只改变可见集合，选中项的合法性由 pmRepaint 统一收口 */
+pmSearch.addEventListener("input", pmRepaint);
+$("btnPmRefresh").addEventListener("click", () => {
+  presetDetailCache.clear();
+  pmDetailMap.clear();
+  refreshPmList();
+  pmFlash("已刷新");
+});
+/* 顶栏新建 = 把右栏切回创建表单并聚焦输入框（右栏本来就是它的归宿） */
+$("btnPmNew").addEventListener("click", () => {
+  pmSelName = "";
+  renderPmCards();
+  renderInspector("");
+  $("pmName").focus();
+});
+$("inspApply").addEventListener("click", () => { if (pmSelName) pmApplyPreset(pmSelName); });
+$("inspRename").addEventListener("click", () => { if (pmSelName) pmPresetAction(pmSelName, "rename"); });
+$("inspDup").addEventListener("click", () => { if (pmSelName) pmPresetAction(pmSelName, "duplicate"); });
+$("inspDel").addEventListener("click", () => { if (pmSelName) pmPresetAction(pmSelName, "delete"); });
 $("btnPmCreate").addEventListener("click", async () => {
   const name = $("pmName").value.trim();
   if (!name) { pmFlash("请输入预设名称", true); return; }
   try {
     if (!await savePresetByName(name)) return;
     $("pmName").value = "";
-    pmCurName = name;
-    pmFlash("预设已创建: " + name);
+    // 同名覆盖时必须先失效缓存再刷新，否则 pmEnsureDetails 会命中旧详情
+    presetDetailCache.delete(name);
+    pmDetailMap.delete(name);
+    pmSelName = name;
     await refreshPmList();
     await refreshPresets();
-    presetDetailCache.delete(name); // 创建即覆盖旧值，强制下次拉最新
+    pmFlash("预设已创建: " + name);
   } catch (e) { pmFlash("创建失败: " + e.message, true); }
 });
 
@@ -2188,6 +2796,8 @@ function mmElapsedTimer(label) {
   const t0 = Date.now();
   mmState.textContent = `${label}… 0s`;
   mmState.className = "mono";
+  const box = $("mmStateBox");
+  if (box) box.dataset.s = "loading";
   return setInterval(() => {
     mmState.textContent = `${label}… ${Math.round((Date.now() - t0) / 1000)}s`;
   }, 500);
@@ -2202,7 +2812,26 @@ async function refreshModelPage() {
       unloading: "卸载中", error: "加载失败", unloaded: "未加载",
     };
     mmState.textContent = stateNames[phase] || stateNames.unloaded;
-    mmState.className = "mono " + (phase === "ready" ? "ok" : phase === "unloaded" ? "off" : "");
+    // 颜色/状态灯交给父级 data-s，不再用 className 覆盖（否则会清掉 mono）
+    const stateBox = $("mmStateBox");
+    if (stateBox) {
+      stateBox.dataset.s = phase === "ready" ? "ready"
+        : phase === "error" ? "error"
+        : phase === "unloaded" ? "off" : "loading";
+    }
+    const stateSub = $("mmStateSub");
+    if (stateSub) {
+      stateSub.textContent = mmGenerating
+        ? "正在生成 · 模型操作已锁定"
+        : ({
+          ready: "常驻显存，可直接合成",
+          loading: "正在加载权重…",
+          reloading: "正在重载模型…",
+          unloading: "正在释放显存…",
+          error: "请查看下方错误信息",
+          unloaded: "首次生成时自动加载",
+        }[phase] || "");
+    }
     for (const k of CFG_KEYS) { const el = $(CFG_BOX[k]); if (el) el.checked = !!s[k]; }
     $("cfgSteps").value = s.diffusion_steps ?? 25;
     $("cfgRate").value = s.inference_cfg_rate ?? 0.7;
@@ -2379,15 +3008,19 @@ applyTheme(localStorage.getItem("theme") || (matchMedia("(prefers-color-scheme: 
 const _savedHist = localStorage.getItem(HIST_KEY);
 histSetCollapsed(_savedHist === null ? window.innerWidth < 1360 : _savedHist === "1", false);
 refreshHistory();
-bindSliders();
+bindParamEvents();
+syncParams();
 emoVisible();
 updateSegments();
 updateGenSummary();
 switchLib(readDraft()?.libTab === "examples" ? "examples" : "presets");
 (async () => {
   await Promise.all([restoreDraft(), refreshPresets(), loadExamples()]);
+  // 草稿恢复完再套锁定：锁定优先级最高，且先用本地缓存避免闪一下默认值
+  loadParamLockFromCache();
   renderLib();
   restoreJob();
+  loadParamLockFromServer(); // 服务端为准，校正本地缓存
 })();
 refreshPmList();
 renderGlossary();

@@ -58,7 +58,7 @@
         <summary>分句预览 <span class="q" title="输入文本后实时更新；拖动下方滑块可调整每段的 Token 上限">?</span></summary>
         <div class="seg-scroll"><div class="seg-list" id="segList"></div></div>
         <!-- 分句最大 Token 直接决定上面怎么切，放在预览下方改动即时可见 -->
-        <div class="slider"><label for="segTokens">分句最大 Token <span>max_text_tokens_per_segment</span></label><div class="srow"><input type="range" id="segTokens" min="20" max="600" step="2" value="120"><output id="segTokensOut">120</output></div></div>
+        <div class="slider pitem"><label for="segTokens">分句最大 Token <span>max_text_tokens_per_segment</span></label><div class="srow"><input type="range" id="segTokens" min="20" max="600" step="1" value="120"><input type="number" class="pnum" id="segTokensNum" min="20" max="600" step="1" value="120" inputmode="numeric" aria-label="分句最大 Token 数值"><button class="rdef" type="button" data-pid="segTokens" aria-label="分句最大 Token 恢复默认值" title="恢复默认值 120">↺</button></div></div>
       </details>
     </div>
 
@@ -121,25 +121,86 @@
         <div class="hint-line">实验功能，生成结果可能不稳定</div>
       </div>
 
-      <div class="slider emo-w">
+      <div class="slider emo-w pitem">
         <label for="emoWeight">情感权重 <span>emo_alpha</span></label>
-        <div class="srow"><input type="range" id="emoWeight" min="0" max="1" step="0.01" value="0.65"><output id="emoWeightOut">0.65</output></div>
+        <div class="srow">
+          <input type="range" id="emoWeight" min="0" max="1" step="0.01" value="0.65">
+          <input type="number" class="pnum" id="emoWeightNum" min="0" max="1" step="0.01" value="0.65" inputmode="decimal" aria-label="情感权重数值">
+          <button class="rdef" type="button" data-pid="emoWeight" aria-label="情感权重恢复默认值" title="恢复默认值 0.65">↺</button>
+        </div>
       </div>
       <label class="switch"><input type="checkbox" id="emoRandom"><span class="tk"></span>情感随机采样</label>
     </details>
 
-    <details class="fold">
-      <summary>高级参数 <span class="q" title="采样参数保持默认即可，生成效果更稳定">?</span></summary>
+    <details class="fold" id="advFold">
+      <summary>高级参数 <span class="q" title="采样参数保持默认即可，生成效果更稳定">?</span><span class="lockbadge" id="lockBadge" hidden>已锁定</span></summary>
+      <label class="switch lockrow" title="锁定后：应用预设、刷新页面、切换角色都不会改变下列数值；锁定状态存在服务端，清浏览器缓存也不会丢。">
+        <input type="checkbox" id="paramLock"><span class="tk"></span>锁定高级参数
+      </label>
+      <div class="lockhint" id="lockHint" hidden>已锁定 · 应用预设不会覆盖以下数值</div>
       <label class="chk"><input type="checkbox" id="doSample" checked> do_sample <span>采样模式</span></label>
-      <div class="slider"><label for="temperature">采样温度 <span>temperature</span></label><div class="srow"><input type="range" id="temperature" min="0.1" max="2" step="0.05" value="0.8"><output id="temperatureOut">0.80</output></div></div>
-      <div class="slider"><label for="topP">核采样 <span>top_p</span></label><div class="srow"><input type="range" id="topP" min="0" max="1" step="0.01" value="0.8"><output id="topPOut">0.80</output></div></div>
-      <div class="slider"><label for="topK">候选数 <span>top_k</span></label><div class="srow"><input type="range" id="topK" min="1" max="100" step="1" value="30"><output id="topKOut">30</output></div></div>
-      <div class="slider"><label for="numBeams">束搜索宽度 <span>num_beams</span></label><div class="srow"><input type="range" id="numBeams" min="1" max="10" step="1" value="3"><output id="numBeamsOut">3</output></div></div>
-      <div class="slider"><label for="maxMel">最大 Mel Token <span>max_mel_tokens</span></label><div class="srow"><input type="range" id="maxMel" min="50" max="1815" step="10" value="1500"><output id="maxMelOut">1500</output></div></div>
+      <div class="slider pitem">
+        <label for="temperature">采样温度 <span>temperature</span></label>
+        <div class="srow">
+          <input type="range" id="temperature" min="0.1" max="2" step="0.01" value="0.8">
+          <input type="number" class="pnum" id="temperatureNum" min="0.1" max="2" step="0.01" value="0.80" inputmode="decimal" aria-label="采样温度数值">
+          <button class="rdef" type="button" data-pid="temperature" aria-label="采样温度恢复默认值" title="恢复默认值 0.80">↺</button>
+        </div>
+      </div>
+      <div class="slider pitem">
+        <label for="topP">核采样 <span>top_p</span></label>
+        <div class="srow">
+          <input type="range" id="topP" min="0" max="1" step="0.01" value="0.8">
+          <input type="number" class="pnum" id="topPNum" min="0" max="1" step="0.01" value="0.80" inputmode="decimal" aria-label="核采样数值">
+          <button class="rdef" type="button" data-pid="topP" aria-label="核采样恢复默认值" title="恢复默认值 0.80">↺</button>
+        </div>
+      </div>
+      <div class="slider pitem">
+        <label for="topK">候选数 <span>top_k</span></label>
+        <div class="srow">
+          <input type="range" id="topK" min="1" max="100" step="1" value="30">
+          <input type="number" class="pnum" id="topKNum" min="1" max="100" step="1" value="30" inputmode="numeric" aria-label="候选数数值">
+          <button class="rdef" type="button" data-pid="topK" aria-label="候选数恢复默认值" title="恢复默认值 30">↺</button>
+        </div>
+      </div>
+      <div class="slider pitem">
+        <label for="numBeams">束搜索宽度 <span>num_beams</span></label>
+        <div class="srow">
+          <input type="range" id="numBeams" min="1" max="10" step="1" value="3">
+          <input type="number" class="pnum" id="numBeamsNum" min="1" max="10" step="1" value="3" inputmode="numeric" aria-label="束搜索宽度数值">
+          <button class="rdef" type="button" data-pid="numBeams" aria-label="束搜索宽度恢复默认值" title="恢复默认值 3">↺</button>
+        </div>
+      </div>
+      <div class="slider pitem">
+        <label for="maxMel">最大 Mel Token <span>max_mel_tokens</span></label>
+        <div class="srow">
+          <input type="range" id="maxMel" min="50" max="1815" step="1" value="1500">
+          <input type="number" class="pnum" id="maxMelNum" min="50" max="1815" step="1" value="1500" inputmode="numeric" aria-label="最大 Mel Token 数值">
+          <button class="rdef" type="button" data-pid="maxMel" aria-label="最大 Mel Token 恢复默认值" title="恢复默认值 1500">↺</button>
+        </div>
+      </div>
       <div class="grid-num">
-        <div><label for="repPen">重复惩罚 <span>repetition_penalty</span></label><input type="number" id="repPen" min="0.1" max="20" step="0.1" value="10"></div>
-        <div><label for="lenPen">长度惩罚 <span>length_penalty</span></label><input type="number" id="lenPen" min="-2" max="2" step="0.1" value="0"></div>
-        <div><label for="gapMs">段间停顿 <span>interval_silence</span></label><input type="number" id="gapMs" min="10" max="500" step="10" value="200"></div>
+        <div class="pitem">
+          <label for="repPen">重复惩罚 <span>repetition_penalty</span></label>
+          <div class="nrow">
+            <input type="number" id="repPen" min="0.1" max="20" step="0.1" value="10" aria-label="重复惩罚数值">
+            <button class="rdef" type="button" data-pid="repPen" aria-label="重复惩罚恢复默认值" title="恢复默认值 10">↺</button>
+          </div>
+        </div>
+        <div class="pitem">
+          <label for="lenPen">长度惩罚 <span>length_penalty</span></label>
+          <div class="nrow">
+            <input type="number" id="lenPen" min="-2" max="2" step="0.1" value="0" aria-label="长度惩罚数值">
+            <button class="rdef" type="button" data-pid="lenPen" aria-label="长度惩罚恢复默认值" title="恢复默认值 0">↺</button>
+          </div>
+        </div>
+        <div class="pitem">
+          <label for="gapMs">段间停顿 <span>interval_silence</span></label>
+          <div class="nrow">
+            <input type="number" id="gapMs" min="10" max="500" step="1" value="200" aria-label="段间停顿毫秒数">
+            <button class="rdef" type="button" data-pid="gapMs" aria-label="段间停顿恢复默认值" title="恢复默认值 200">↺</button>
+          </div>
+        </div>
       </div>
       <div class="hint-line">段间停顿只在文本被切成多段时生效（单段无效）；每多一段就多一个这样的停顿。</div>
       <button class="linkbtn" id="resetParams" type="button">恢复推荐默认值</button>
@@ -348,37 +409,88 @@
   <div class="page" data-page="presets" hidden>
     <section class="card mg-card">
 
-      <div class="mg-grid">
-        <!-- 左：预设卡片流 -->
-        <div class="mg-col wide-col">
-          <div class="mg-grid-head">
-            <h2 class="mg-h">预设列表</h2>
-            <div class="pm-tools">
-              <input type="text" id="pmSearch" placeholder="搜索预设名称…">
-              <button class="btn ghost mini" id="btnPmRefresh" type="button">刷新</button>
-            </div>
+      <!-- 顶部工具带：横跨三栏，搜索与新建都在这里，右栏才能空出来当检视面板 -->
+      <div class="mg-top">
+        <div class="mg-top-l">
+          <h2 class="mg-h">预设管理</h2>
+          <span class="mg-count mono" id="pmCount">0 个预设</span>
+        </div>
+        <input type="text" id="pmSearch" class="mg-search" placeholder="搜索预设名称…">
+        <div class="mg-top-r">
+          <button class="btn ghost mini" id="btnPmRefresh" type="button">刷新</button>
+          <button class="btn primary mini" id="btnPmNew" type="button">从当前状态创建</button>
+        </div>
+      </div>
+
+      <div class="mg-body">
+        <!-- 左：筛选目录（导航，不是内容） -->
+        <aside class="mg-side">
+          <div class="mg-side-h">筛选</div>
+          <div class="pm-nav" id="pmNav"></div>
+          <div class="mg-side-h">按情绪</div>
+          <div class="pm-nav" id="pmNavEmo"></div>
+          <div class="mg-side-foot">预设存于服务端<br>跨会话可用</div>
+        </aside>
+
+        <!-- 中：卡片墙 -->
+        <div class="mg-main">
+          <div class="mg-main-head">
+            <span class="mg-main-count mono" id="pmShown">—</span>
+            <span class="mg-hint" id="pmHint"></span>
           </div>
           <div class="pm-cards" id="pmCards"></div>
-          <div class="mg-hint" id="pmHint"></div>
         </div>
 
-        <!-- 右：从当前状态创建 -->
-        <div class="mg-col">
-          <h2 class="mg-h">从当前状态创建</h2>
-          <div class="preset-row wide">
-            <input type="text" id="pmName" placeholder="请输入预设名称">
-            <button class="btn primary mini" id="btnPmCreate" type="button">创建</button>
+        <!-- 右：选中时是检视面板，未选中时退回创建表单 -->
+        <aside class="mg-inspect">
+          <div class="pm-insp" id="pmInsp" hidden>
+            <div class="insp-head">
+              <span class="insp-dot" id="inspDot"></span>
+              <h3 class="insp-name" id="inspName">—</h3>
+            </div>
+            <div class="insp-badges" id="inspBadges"></div>
+
+            <div class="insp-sec">
+              <div class="insp-sec-h">音色</div>
+              <div class="insp-audio" id="inspAudio"></div>
+            </div>
+
+            <div class="insp-sec">
+              <div class="insp-sec-h">情感</div>
+              <div id="inspEmo"></div>
+            </div>
+
+            <div class="insp-sec">
+              <div class="insp-sec-h">采样参数</div>
+              <div class="insp-kv" id="inspParams"></div>
+            </div>
+
+            <div class="insp-foot">
+              <button class="btn primary" id="inspApply" type="button">应用到合成页</button>
+              <div class="insp-acts">
+                <button class="btn ghost mini" id="inspRename" type="button">改名</button>
+                <button class="btn ghost mini" id="inspDup" type="button">复制</button>
+                <button class="btn ghost mini danger" id="inspDel" type="button">删除</button>
+              </div>
+            </div>
           </div>
-          <div class="mg-hint">
-            保存「语音合成」页当前的情感控制、采样参数与参考音频。
-            音色 / 情感音频随预设一起保存，应用时自动回填。
+
+          <div class="pm-create" id="pmCreateBox">
+            <h3 class="insp-name">从当前状态创建</h3>
+            <p class="mg-hint">
+              保存「语音合成」页当前的情感控制、采样参数与参考音频。
+              音色 / 情感音频随预设一起保存，应用时自动回填。
+            </p>
+            <div class="preset-row wide">
+              <input type="text" id="pmName" placeholder="请输入预设名称">
+              <button class="btn primary mini" id="btnPmCreate" type="button">创建</button>
+            </div>
+            <hr class="insp-hr">
+            <p class="mg-hint">
+              预设存放在服务端，跨会话可用；删除操作不可恢复，请谨慎操作。
+            </p>
           </div>
-          <h2 class="mg-h" style="margin-top:18px">预设说明</h2>
-          <div class="mg-hint">
-            预设存放在服务端，跨会话可用；删除操作不可恢复，请谨慎操作。
-            预设较多时可用上方搜索框按名称过滤。
-          </div>
-        </div>
+        </aside>
       </div>
 
     </section>
@@ -388,54 +500,109 @@
   <div class="page" data-page="model" hidden>
     <section class="card mg-card">
 
-      <div class="mg-grid">
-        <!-- 左：状态与操作 -->
-        <div class="mg-col">
-          <h2 class="mg-h">模型状态</h2>
-          <div class="kv">
-            <span>加载状态</span><b class="mono" id="mmState">–</b>
+      <!-- 指标带：状态 + 显存/GPU/内存/CPU + 模型操作 -->
+      <div class="mm-band">
+        <div class="mm-state" id="mmStateBox">
+          <div class="mm-state-top">
+            <span class="mm-led" id="mmLed"></span>
+            <b class="mono" id="mmState">–</b>
           </div>
-          <pre class="preset-detail wide" id="mmRuntime">–</pre>
-          <div class="mg-btnrow">
-            <button class="btn ghost" id="btnModelLoad" type="button">加载模型</button>
-            <button class="btn ghost danger" id="btnModelUnload" type="button">卸载模型</button>
-            <button class="btn primary" id="btnModelRestart" type="button">重启并应用配置</button>
+          <span class="mm-state-sub" id="mmStateSub">等待状态</span>
+        </div>
+
+        <!-- 数据来自 header 同一条 /status 轮询，不新增请求 -->
+        <div class="mm-metrics">
+          <div class="mm-metric" id="mmVram">
+            <span>显存</span><b class="mono">--</b><div class="bar"><i></i></div><em>余量 --</em>
           </div>
-          <div class="err" id="mmErr"></div>
-          <div class="mg-hint">
-            生成中「加载 / 重启」不可用，需等本次生成结束；「卸载」可主动中断当前生成。
-            两项半精度开关需重启模型生效；
-            cuDNN 自动调优、扩散步数、CFG 强度保存后立即生效。
+          <div class="mm-metric" id="mmGpu">
+            <span>GPU</span><b class="mono">--</b><div class="bar"><i></i></div><em>利用率</em>
+          </div>
+          <div class="mm-metric" id="mmMem">
+            <span>内存</span><b class="mono">--</b><div class="bar"><i></i></div><em>系统</em>
+          </div>
+          <div class="mm-metric" id="mmCpu">
+            <span>CPU</span><b class="mono">--</b><div class="bar"><i></i></div><em>系统</em>
           </div>
         </div>
 
-        <!-- 右：加速选项 -->
-        <div class="mg-col">
-          <div class="mg-grid-head">
-            <h2 class="mg-h">加速选项</h2>
+        <div class="mm-ops">
+          <button class="btn ghost" id="btnModelLoad" type="button">加载模型</button>
+          <button class="btn ghost danger" id="btnModelUnload" type="button">卸载模型</button>
+          <button class="btn primary" id="btnModelRestart" type="button">重启并应用配置</button>
+        </div>
+      </div>
+
+      <div class="err" id="mmErr"></div>
+
+      <div class="mg-body mm-body">
+        <!-- 左：按生效方式分组的配置项 -->
+        <div class="mg-main mm-col">
+          <div class="mg-main-head">
+            <h3 class="mg-sub-h">精度与加速</h3>
             <button class="btn ghost mini" id="btnPresetCfg" type="button" title="开启 s2mel 半精度与 GPT 半精度，关闭 cuDNN 自动调优；扩散步数 25、CFG 强度 0.7">推荐配置</button>
           </div>
+
           <div class="q-legend">
             <p><span class="qzb near">几乎无损</span>数值有微差，听感基本无区分</p>
             <p><span class="qzb drop">音质略变</span>有轻微差异，但提速明显</p>
             <p><span class="qzb warn">⚠ 实测更慢</span>开启后反而更慢，建议保持关闭</p>
           </div>
-          <label class="switch"><input type="checkbox" id="cfgS2melFp16"><span class="tk"></span>s2mel 扩散半精度<span class="qzb drop">音质略变</span><b class="qinfo" title="实测 180 字文本提速约 32%（最大提速点）；CFM 扩散 FP32→FP16。细节听感可能有轻微差异">ⓘ</b></label>
-          <label class="switch"><input type="checkbox" id="cfgFp16"><span class="tk"></span>GPT 主模型半精度<span class="qzb near">几乎无损</span><b class="qinfo" title="显存减半、推理更快；推荐默认开启">ⓘ</b></label>
-          <label class="switch"><input type="checkbox" id="cfgCudnnBench"><span class="tk"></span>cuDNN 自动调优<span class="qzb warn">⚠ 实测更慢</span><b class="qinfo" title="实测负优化：cuDNN 会为每个新的输入长度重新搜索卷积算法。BigVGAN 单步 3.35s → 97s，整段 38s → 141s（RTF 6.1 → 20.8）。除非音频长度固定不变，否则保持关闭；保存即生效">ⓘ</b></label>
-          <label class="switch"><input type="checkbox" id="cfgW2vFp16"><span class="tk"></span>w2v-bert 语义编码半精度<span class="qzb warn">⚠ 需自测</span><b class="qinfo" title="w2v-bert-2.0 语义编码器转 FP16，约省 1GB 显存，是 8G 卡 OOM 的关键可优化项；转换后请自测音色与可懂度">ⓘ</b></label>
-          <label class="switch"><input type="checkbox" id="cfgQwenFp16"><span class="tk"></span>Qwen 情绪模型半精度<span class="qzb near">现状默认</span><b class="qinfo" title="Qwen 情绪模型 FP16（默认开启，当前加载已是 float16）；关闭可回退 FP32 以便排查音质问题">ⓘ</b></label>
-          <div class="slider mg-slider">
-            <label for="cfgSteps">扩散步数 <span>DIFFUSION_STEPS · 推荐 8~16</span></label>
-            <div class="srow"><input type="range" id="cfgSteps" min="1" max="50" step="1" value="25"><output id="cfgStepsOut">25</output></div>
+
+          <div class="cfg-group-h">精度 <span>需重启模型生效</span></div>
+          <div class="cfg-item">
+            <label class="switch"><input type="checkbox" id="cfgS2melFp16"><span class="tk"></span>s2mel 扩散半精度<span class="qzb drop">音质略变</span><b class="qinfo" title="实测 180 字文本提速约 32%（最大提速点）；CFM 扩散 FP32→FP16。细节听感可能有轻微差异">ⓘ</b></label>
+            <p class="cfg-desc">CFM 扩散 FP32→FP16，180 字实测提速约 32%，是最大提速点</p>
           </div>
-          <div class="slider mg-slider">
-            <label for="cfgRate">CFG 强度 <span>CFG_RATE · 0 = 接近 2 倍提速</span></label>
-            <div class="srow"><input type="range" id="cfgRate" min="0" max="1" step="0.01" value="0.7"><output id="cfgRateOut">0.70</output></div>
+          <div class="cfg-item">
+            <label class="switch"><input type="checkbox" id="cfgFp16"><span class="tk"></span>GPT 主模型半精度<span class="qzb near">几乎无损</span><b class="qinfo" title="显存减半、推理更快；推荐默认开启">ⓘ</b></label>
+            <p class="cfg-desc">显存减半、推理更快，与前一项同属重启生效</p>
           </div>
-          <button class="btn primary mg-save" id="btnCfgSave" type="button">保存配置</button>
+          <div class="cfg-item">
+            <label class="switch"><input type="checkbox" id="cfgW2vFp16"><span class="tk"></span>w2v-bert 语义编码半精度<span class="qzb warn">⚠ 需自测</span><b class="qinfo" title="w2v-bert-2.0 语义编码器转 FP16，约省 1GB 显存，是 8G 卡 OOM 的关键可优化项；转换后请自测音色与可懂度">ⓘ</b></label>
+            <p class="cfg-desc">约省 1GB 显存，8G 卡 OOM 的关键项；转换后请自测音色</p>
+          </div>
+          <div class="cfg-item">
+            <label class="switch"><input type="checkbox" id="cfgQwenFp16"><span class="tk"></span>Qwen 情绪模型半精度<span class="qzb near">现状默认</span><b class="qinfo" title="Qwen 情绪模型 FP16（默认开启，当前加载已是 float16）；关闭可回退 FP32 以便排查音质问题">ⓘ</b></label>
+            <p class="cfg-desc">默认即为 FP16；关闭可回退 FP32，用于排查音质问题</p>
+          </div>
+
+          <div class="cfg-group-h">性能 <span>保存即生效</span></div>
+          <div class="cfg-item">
+            <label class="switch"><input type="checkbox" id="cfgCudnnBench"><span class="tk"></span>cuDNN 自动调优<span class="qzb warn">⚠ 实测更慢</span><b class="qinfo" title="实测负优化：cuDNN 会为每个新的输入长度重新搜索卷积算法。BigVGAN 单步 3.35s → 97s，整段 38s → 141s（RTF 6.1 → 20.8）。除非音频长度固定不变，否则保持关闭；保存即生效">ⓘ</b></label>
+            <p class="cfg-desc">负优化：BigVGAN 单步 3.35s → 97s，整段 38s → 141s。保持关闭</p>
+          </div>
         </div>
+
+        <!-- 右：数值参数 -->
+        <aside class="mg-side mm-side-right">
+          <h3 class="mg-sub-h">质量与速度</h3>
+
+          <div class="slider mg-slider">
+            <label for="cfgSteps">扩散步数 <span>DIFFUSION_STEPS</span></label>
+            <div class="srow"><input type="range" id="cfgSteps" min="1" max="50" step="1" value="25"><output id="cfgStepsOut">25</output></div>
+            <p class="cfg-desc">8 最快 · 25 均衡 · 50 最细</p>
+          </div>
+
+          <div class="slider mg-slider">
+            <label for="cfgRate">CFG 强度 <span>CFG_RATE</span></label>
+            <div class="srow"><input type="range" id="cfgRate" min="0" max="1" step="0.01" value="0.7"><output id="cfgRateOut">0.70</output></div>
+            <p class="cfg-desc">0 = 接近 2 倍提速，0.7 为默认值</p>
+          </div>
+
+          <div class="mm-note">
+            生成中「加载 / 重启」不可用，需等本次生成结束；「卸载」可主动中断当前生成。
+          </div>
+
+          <button class="btn primary mg-save" id="btnCfgSave" type="button">保存配置</button>
+        </aside>
       </div>
+
+      <!-- 排查用日志：降级到底部折叠，不再占主界面 -->
+      <details class="mm-tech">
+        <summary>技术详情 · 当前生效的配置项</summary>
+        <pre class="preset-detail" id="mmRuntime">–</pre>
+      </details>
 
     </section>
   </div><!-- /page model -->
