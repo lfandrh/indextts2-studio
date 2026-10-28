@@ -8,6 +8,11 @@ const $ = (id) => document.getElementById(id);
    音频/静态资源（/audio、/assets）不带前缀。 */
 const API = "/api/v1";
 
+/* 关闭/删除图标（矢量，取自 index.html 的图标精灵）。
+   以前这里是 "✕" / "×" 文本字符：字号一改就歪，深浅主题下字重还不一样。
+   edit.js 在 app.js 之后加载，共用这一个常量。 */
+const ICON_CLOSE = '<svg class="ico" aria-hidden="true"><use href="#i-close"></use></svg>';
+
 /* 文本字数：软阈值 + 硬上限，与后端 server.py 同口径
    - TEXT_CHARS_SOFT 只做提示，超过照常生成
    - TEXT_CHARS_HARD 之后 textarea 会被 maxlength 挡住，服务端也会 400 */
@@ -1882,7 +1887,7 @@ function renderLib() {
           <button class="pm-act" data-act="rename" type="button" title="改名">改</button>
           <button class="pm-act" data-act="duplicate" type="button" title="复制">复</button>
         </span>
-        <button class="pm-del" type="button" title="删除此预设">✕</button>`;
+        <button class="pm-del" type="button" title="删除此预设">${ICON_CLOSE}</button>`;
       row.querySelector(".htext").textContent = name;
       row.title = "点击应用此预设";
       row.querySelector(".pm-del").setAttribute("aria-label", "删除预设 " + name);
@@ -1891,6 +1896,8 @@ function renderLib() {
         if (!d) { meta.textContent = "-"; return; }
         const adv = d.advanced_params || {};
         meta.textContent = `${["同参考", "情感音频", "向量", "文本"][d.emo_control_method] ?? "-"} · ${d.prompt_audio_url ? "含音频" : "无音频"} · temp ${adv.temperature ?? "-"}`;
+        // 卡片只有 160px 宽，这行必然省略；把全文挂到 title 上，悬停能看全
+        meta.title = meta.textContent;
       });
       row.addEventListener("click", async (e) => {
         if (e.target.closest(".pm-del") || e.target.closest(".pm-act")) return;
@@ -1926,6 +1933,7 @@ function renderLib() {
       row.innerHTML = `<span class="htext"></span><span class="hmeta"></span>`;
       row.querySelector(".htext").textContent = ex.text || "";
       row.querySelector(".hmeta").textContent = (ex.prompt_audio || "").split("/").pop();
+      row.querySelector(".hmeta").title = row.querySelector(".hmeta").textContent;
       row.title = "点击加载示例音频与参数";
       row.addEventListener("click", async () => {
         try {
@@ -2068,10 +2076,11 @@ function renderHistory() {
   for (const it of histItems) {
     const row = document.createElement("div");
     row.className = "hb-item" + (it.id === histCurId ? " cur" : "");
-    row.innerHTML = `<span class="hb-text"></span><span class="hb-meta"></span><button class="pm-del" type="button" title="删除这条记录">✕</button>`;
+    row.innerHTML = `<span class="hb-text"></span><span class="hb-meta"></span><button class="pm-del" type="button" title="删除这条记录">${ICON_CLOSE}</button>`;
     row.querySelector(".hb-text").textContent = it.text || "(无文本)";
     row.querySelector(".hb-meta").textContent =
       `${histFmtTime(it.created_at)} · ${Number(it.elapsed).toFixed(1)}s · ${histFmtSize(it.size)} · ${EMO_LABEL[it.emo_mode] ?? "-"}`;
+    row.querySelector(".hb-meta").title = row.querySelector(".hb-meta").textContent;
     row.title = "点击载入到右侧播放器";
     const del = row.querySelector(".pm-del");
     del.setAttribute("aria-label", "删除这条历史记录");
@@ -2193,7 +2202,7 @@ async function renderGlossary() {
       const del = document.createElement("button");
       del.className = "gl-del";
       del.type = "button";
-      del.textContent = "×";
+      del.innerHTML = ICON_CLOSE;
       del.title = `删除术语「${key}」`;
       del.setAttribute("aria-label", `删除术语 ${key}`);
       del.addEventListener("click", () => removeTerm(key));
@@ -2467,7 +2476,7 @@ function renderPmCards() {
         <button class="pm-act" data-act="rename" type="button" title="改名">改</button>
         <button class="pm-act" data-act="duplicate" type="button" title="复制">复</button>
       </span>
-      <button class="pm-del" type="button" title="删除此预设">✕</button>`;
+      <button class="pm-del" type="button" title="删除此预设">${ICON_CLOSE}</button>`;
     card.querySelector(".pm-name").textContent = name;
     card.querySelector(".pm-name").title = name;   // 名称让位给操作按钮后会省略，hover 给全名
     card.querySelector(".pm-del").setAttribute("aria-label", "删除预设 " + name);

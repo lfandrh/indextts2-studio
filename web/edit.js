@@ -362,7 +362,7 @@
         chip.className = "op-chip";
         chip.appendChild(document.createTextNode(text));
         const del = document.createElement("i");
-        del.textContent = "✕";
+        del.innerHTML = ICON_CLOSE;
         del.title = "移除该操作";
         del.setAttribute("aria-label", "移除操作 " + text);
         del.addEventListener("click", () => removeOp(kind));

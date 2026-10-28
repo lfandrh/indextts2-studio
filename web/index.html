@@ -20,6 +20,23 @@
 </head>
 <body>
 
+<!-- 图标精灵：内联 SVG，描边走 currentColor，深浅两套主题共用一份。
+     刻意不用字体图标（外链字体在离线/国内环境不可达）也不用 PNG（换主题要备两套）。
+     用法：<svg class="ico"><use href="#i-restore"></use></svg> -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-restore" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/>
+    </symbol>
+    <symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="9"/><path d="M12.3 11.2v5"/><path d="M12.3 7.8h.01"/>
+    </symbol>
+    <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
+      <path d="M6 6l12 12"/><path d="M18 6L6 18"/>
+    </symbol>
+  </defs>
+</svg>
+
 <header>
   <div class="hdr-row">
     <div class="brand"><span class="dot"></span>IndexTTS2 <small>语音克隆 · 情感控制</small></div>
@@ -55,10 +72,10 @@
       <div class="grow"><textarea id="text" rows="4" maxlength="10000" placeholder="输入要合成的文本…">欢迎使用 IndexTTS2 语音合成工作台！上传参考音频，即刻克隆你想要的声音</textarea></div>
       <div class="opfoot mono"><span id="charCount">0 字</span><span id="segInfo">分句预览待输入</span></div>
       <details class="fold seg-fold" id="segFold" open>
-        <summary>分句预览 <span class="q" title="输入文本后实时更新；拖动下方滑块可调整每段的 Token 上限">?</span></summary>
+        <summary>分句预览 <span class="q" title="输入文本后实时更新；拖动下方滑块可调整每段的 Token 上限"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></span></summary>
         <div class="seg-scroll"><div class="seg-list" id="segList"></div></div>
         <!-- 分句最大 Token 直接决定上面怎么切，放在预览下方改动即时可见 -->
-        <div class="slider pitem"><label for="segTokens">分句最大 Token <span>max_text_tokens_per_segment</span></label><div class="srow"><input type="range" id="segTokens" min="20" max="600" step="1" value="120"><input type="number" class="pnum" id="segTokensNum" min="20" max="600" step="1" value="120" inputmode="numeric" aria-label="分句最大 Token 数值"><button class="rdef" type="button" data-pid="segTokens" aria-label="分句最大 Token 恢复默认值" title="恢复默认值 120">↺</button></div></div>
+        <div class="slider pitem"><label for="segTokens">分句最大 Token <span>max_text_tokens_per_segment</span></label><div class="srow"><input type="range" id="segTokens" min="20" max="600" step="1" value="120"><input type="number" class="pnum" id="segTokensNum" min="20" max="600" step="1" value="120" inputmode="numeric" aria-label="分句最大 Token 数值"><button class="rdef" type="button" data-pid="segTokens" aria-label="分句最大 Token 恢复默认值" title="恢复默认值 120"><svg class="ico" aria-hidden="true"><use href="#i-restore"></use></svg></button></div></div>
       </details>
     </div>
 
@@ -84,7 +101,7 @@
     </div>
 
     <details class="fold emo-fold">
-      <summary>情感控制 <span class="q" title="默认与音色参考音频相同；可切换情感参考音频 / 向量 / 描述文本">?</span></summary>
+      <summary>情感控制 <span class="q" title="默认与音色参考音频相同；可切换情感参考音频 / 向量 / 描述文本"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></span></summary>
       <select id="emoMode">
         <option value="0" selected>与音色参考音频相同</option>
         <option value="1">使用情感参考音频</option>
@@ -126,14 +143,14 @@
         <div class="srow">
           <input type="range" id="emoWeight" min="0" max="1" step="0.01" value="0.65">
           <input type="number" class="pnum" id="emoWeightNum" min="0" max="1" step="0.01" value="0.65" inputmode="decimal" aria-label="情感权重数值">
-          <button class="rdef" type="button" data-pid="emoWeight" aria-label="情感权重恢复默认值" title="恢复默认值 0.65">↺</button>
+          <button class="rdef" type="button" data-pid="emoWeight" aria-label="情感权重恢复默认值" title="恢复默认值 0.65"><svg class="ico" aria-hidden="true"><use href="#i-restore"></use></svg></button>
         </div>
       </div>
       <label class="switch"><input type="checkbox" id="emoRandom"><span class="tk"></span>情感随机采样</label>
     </details>
 
     <details class="fold" id="advFold">
-      <summary>高级参数 <span class="q" title="采样参数保持默认即可，生成效果更稳定">?</span><span class="lockbadge" id="lockBadge" hidden>已锁定</span></summary>
+      <summary>高级参数 <span class="q" title="采样参数保持默认即可，生成效果更稳定"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></span><span class="lockbadge" id="lockBadge" hidden>已锁定</span></summary>
       <label class="switch lockrow" title="锁定后：应用预设、刷新页面、切换角色都不会改变下列数值；锁定状态存在服务端，清浏览器缓存也不会丢。">
         <input type="checkbox" id="paramLock"><span class="tk"></span>锁定高级参数
       </label>
@@ -144,7 +161,7 @@
         <div class="srow">
           <input type="range" id="temperature" min="0.1" max="2" step="0.01" value="0.8">
           <input type="number" class="pnum" id="temperatureNum" min="0.1" max="2" step="0.01" value="0.80" inputmode="decimal" aria-label="采样温度数值">
-          <button class="rdef" type="button" data-pid="temperature" aria-label="采样温度恢复默认值" title="恢复默认值 0.80">↺</button>
+          <button class="rdef" type="button" data-pid="temperature" aria-label="采样温度恢复默认值" title="恢复默认值 0.80"><svg class="ico" aria-hidden="true"><use href="#i-restore"></use></svg></button>
         </div>
       </div>
       <div class="slider pitem">
@@ -152,7 +169,7 @@
         <div class="srow">
           <input type="range" id="topP" min="0" max="1" step="0.01" value="0.8">
           <input type="number" class="pnum" id="topPNum" min="0" max="1" step="0.01" value="0.80" inputmode="decimal" aria-label="核采样数值">
-          <button class="rdef" type="button" data-pid="topP" aria-label="核采样恢复默认值" title="恢复默认值 0.80">↺</button>
+          <button class="rdef" type="button" data-pid="topP" aria-label="核采样恢复默认值" title="恢复默认值 0.80"><svg class="ico" aria-hidden="true"><use href="#i-restore"></use></svg></button>
         </div>
       </div>
       <div class="slider pitem">
@@ -160,7 +177,7 @@
         <div class="srow">
           <input type="range" id="topK" min="1" max="100" step="1" value="30">
           <input type="number" class="pnum" id="topKNum" min="1" max="100" step="1" value="30" inputmode="numeric" aria-label="候选数数值">
-          <button class="rdef" type="button" data-pid="topK" aria-label="候选数恢复默认值" title="恢复默认值 30">↺</button>
+          <button class="rdef" type="button" data-pid="topK" aria-label="候选数恢复默认值" title="恢复默认值 30"><svg class="ico" aria-hidden="true"><use href="#i-restore"></use></svg></button>
         </div>
       </div>
       <div class="slider pitem">
@@ -168,7 +185,7 @@
         <div class="srow">
           <input type="range" id="numBeams" min="1" max="10" step="1" value="3">
           <input type="number" class="pnum" id="numBeamsNum" min="1" max="10" step="1" value="3" inputmode="numeric" aria-label="束搜索宽度数值">
-          <button class="rdef" type="button" data-pid="numBeams" aria-label="束搜索宽度恢复默认值" title="恢复默认值 3">↺</button>
+          <button class="rdef" type="button" data-pid="numBeams" aria-label="束搜索宽度恢复默认值" title="恢复默认值 3"><svg class="ico" aria-hidden="true"><use href="#i-restore"></use></svg></button>
         </div>
       </div>
       <div class="slider pitem">
@@ -176,7 +193,7 @@
         <div class="srow">
           <input type="range" id="maxMel" min="50" max="1815" step="1" value="1500">
           <input type="number" class="pnum" id="maxMelNum" min="50" max="1815" step="1" value="1500" inputmode="numeric" aria-label="最大 Mel Token 数值">
-          <button class="rdef" type="button" data-pid="maxMel" aria-label="最大 Mel Token 恢复默认值" title="恢复默认值 1500">↺</button>
+          <button class="rdef" type="button" data-pid="maxMel" aria-label="最大 Mel Token 恢复默认值" title="恢复默认值 1500"><svg class="ico" aria-hidden="true"><use href="#i-restore"></use></svg></button>
         </div>
       </div>
       <div class="grid-num">
@@ -184,21 +201,21 @@
           <label for="repPen">重复惩罚 <span>repetition_penalty</span></label>
           <div class="nrow">
             <input type="number" id="repPen" min="0.1" max="20" step="0.1" value="10" aria-label="重复惩罚数值">
-            <button class="rdef" type="button" data-pid="repPen" aria-label="重复惩罚恢复默认值" title="恢复默认值 10">↺</button>
+            <button class="rdef" type="button" data-pid="repPen" aria-label="重复惩罚恢复默认值" title="恢复默认值 10"><svg class="ico" aria-hidden="true"><use href="#i-restore"></use></svg></button>
           </div>
         </div>
         <div class="pitem">
           <label for="lenPen">长度惩罚 <span>length_penalty</span></label>
           <div class="nrow">
             <input type="number" id="lenPen" min="-2" max="2" step="0.1" value="0" aria-label="长度惩罚数值">
-            <button class="rdef" type="button" data-pid="lenPen" aria-label="长度惩罚恢复默认值" title="恢复默认值 0">↺</button>
+            <button class="rdef" type="button" data-pid="lenPen" aria-label="长度惩罚恢复默认值" title="恢复默认值 0"><svg class="ico" aria-hidden="true"><use href="#i-restore"></use></svg></button>
           </div>
         </div>
         <div class="pitem">
           <label for="gapMs">段间停顿 <span>interval_silence</span></label>
           <div class="nrow">
             <input type="number" id="gapMs" min="10" max="500" step="1" value="200" aria-label="段间停顿毫秒数">
-            <button class="rdef" type="button" data-pid="gapMs" aria-label="段间停顿恢复默认值" title="恢复默认值 200">↺</button>
+            <button class="rdef" type="button" data-pid="gapMs" aria-label="段间停顿恢复默认值" title="恢复默认值 200"><svg class="ico" aria-hidden="true"><use href="#i-restore"></use></svg></button>
           </div>
         </div>
       </div>
@@ -207,7 +224,7 @@
     </details>
 
     <details class="fold">
-      <summary>术语读音 <span class="q" title="自定义个别专业术语的读音，如 IndexTTS2">?</span></summary>
+      <summary>术语读音 <span class="q" title="自定义个别专业术语的读音，如 IndexTTS2"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></span></summary>
       <label class="switch gl-cascade"><input type="checkbox" id="glCascade"><span class="tk"></span>级联替换读音
         <b class="qinfo" title="关闭（默认）：每条术语只作用于你输入的原文，读音里如果含有其它术语，不会被再次改写。
 打开：替换结果会留在文本里，后面的术语会继续改写它——适合把读音拆成多条来组合，比如「集团」读作「控股」、「控股」读作「母公司」。
@@ -217,7 +234,7 @@
         <input type="text" id="glTerm" placeholder="术语（如 IndexTTS2）">
         <input type="text" id="glZh" placeholder="中文读法">
         <input type="text" id="glEn" placeholder="英文读法">
-        <button class="btn ghost mini" id="btnAddTerm" type="button">添加</button>
+        <button class="btn ghost" id="btnAddTerm" type="button">添加</button>
       </div>
       <div class="gl-error" id="glError" hidden></div>
       <div class="gl-table" id="glTable"></div>
@@ -417,8 +434,8 @@
         </div>
         <input type="text" id="pmSearch" class="mg-search" placeholder="搜索预设名称…">
         <div class="mg-top-r">
-          <button class="btn ghost mini" id="btnPmRefresh" type="button">刷新</button>
-          <button class="btn primary mini" id="btnPmNew" type="button">从当前状态创建</button>
+          <button class="btn ghost" id="btnPmRefresh" type="button">刷新</button>
+          <button class="btn primary" id="btnPmNew" type="button">从当前状态创建</button>
         </div>
       </div>
 
@@ -483,7 +500,7 @@
             </p>
             <div class="preset-row wide">
               <input type="text" id="pmName" placeholder="请输入预设名称">
-              <button class="btn primary mini" id="btnPmCreate" type="button">创建</button>
+              <button class="btn primary" id="btnPmCreate" type="button">创建</button>
             </div>
             <hr class="insp-hr">
             <p class="mg-hint">
@@ -526,10 +543,11 @@
           </div>
         </div>
 
+        <!-- 一屏只留一个实心红：加载是正向主操作；卸载与重启都是次要动作（卸载靠红字保留危险语义） -->
         <div class="mm-ops">
-          <button class="btn ghost" id="btnModelLoad" type="button">加载模型</button>
+          <button class="btn primary" id="btnModelLoad" type="button">加载模型</button>
           <button class="btn ghost danger" id="btnModelUnload" type="button">卸载模型</button>
-          <button class="btn primary" id="btnModelRestart" type="button">重启并应用配置</button>
+          <button class="btn ghost" id="btnModelRestart" type="button">重启并应用配置</button>
         </div>
       </div>
 
@@ -551,25 +569,25 @@
 
           <div class="cfg-group-h">精度 <span>需重启模型生效</span></div>
           <div class="cfg-item">
-            <label class="switch"><input type="checkbox" id="cfgS2melFp16"><span class="tk"></span>s2mel 扩散半精度<span class="qzb drop">音质略变</span><b class="qinfo" title="实测 180 字文本提速约 32%（最大提速点）；CFM 扩散 FP32→FP16。细节听感可能有轻微差异">ⓘ</b></label>
+            <label class="switch"><input type="checkbox" id="cfgS2melFp16"><span class="tk"></span>s2mel 扩散半精度<span class="qzb drop">音质略变</span><b class="qinfo" title="实测 180 字文本提速约 32%（最大提速点）；CFM 扩散 FP32→FP16。细节听感可能有轻微差异"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></b></label>
             <p class="cfg-desc">CFM 扩散 FP32→FP16，180 字实测提速约 32%，是最大提速点</p>
           </div>
           <div class="cfg-item">
-            <label class="switch"><input type="checkbox" id="cfgFp16"><span class="tk"></span>GPT 主模型半精度<span class="qzb near">几乎无损</span><b class="qinfo" title="显存减半、推理更快；推荐默认开启">ⓘ</b></label>
+            <label class="switch"><input type="checkbox" id="cfgFp16"><span class="tk"></span>GPT 主模型半精度<span class="qzb near">几乎无损</span><b class="qinfo" title="显存减半、推理更快；推荐默认开启"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></b></label>
             <p class="cfg-desc">显存减半、推理更快，与前一项同属重启生效</p>
           </div>
           <div class="cfg-item">
-            <label class="switch"><input type="checkbox" id="cfgW2vFp16"><span class="tk"></span>w2v-bert 语义编码半精度<span class="qzb warn">⚠ 需自测</span><b class="qinfo" title="w2v-bert-2.0 语义编码器转 FP16，约省 1GB 显存，是 8G 卡 OOM 的关键可优化项；转换后请自测音色与可懂度">ⓘ</b></label>
+            <label class="switch"><input type="checkbox" id="cfgW2vFp16"><span class="tk"></span>w2v-bert 语义编码半精度<span class="qzb warn">⚠ 需自测</span><b class="qinfo" title="w2v-bert-2.0 语义编码器转 FP16，约省 1GB 显存，是 8G 卡 OOM 的关键可优化项；转换后请自测音色与可懂度"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></b></label>
             <p class="cfg-desc">约省 1GB 显存，8G 卡 OOM 的关键项；转换后请自测音色</p>
           </div>
           <div class="cfg-item">
-            <label class="switch"><input type="checkbox" id="cfgQwenFp16"><span class="tk"></span>Qwen 情绪模型半精度<span class="qzb near">现状默认</span><b class="qinfo" title="Qwen 情绪模型 FP16（默认开启，当前加载已是 float16）；关闭可回退 FP32 以便排查音质问题">ⓘ</b></label>
+            <label class="switch"><input type="checkbox" id="cfgQwenFp16"><span class="tk"></span>Qwen 情绪模型半精度<span class="qzb near">现状默认</span><b class="qinfo" title="Qwen 情绪模型 FP16（默认开启，当前加载已是 float16）；关闭可回退 FP32 以便排查音质问题"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></b></label>
             <p class="cfg-desc">默认即为 FP16；关闭可回退 FP32，用于排查音质问题</p>
           </div>
 
           <div class="cfg-group-h">性能 <span>保存即生效</span></div>
           <div class="cfg-item">
-            <label class="switch"><input type="checkbox" id="cfgCudnnBench"><span class="tk"></span>cuDNN 自动调优<span class="qzb warn">⚠ 实测更慢</span><b class="qinfo" title="实测负优化：cuDNN 会为每个新的输入长度重新搜索卷积算法。BigVGAN 单步 3.35s → 97s，整段 38s → 141s（RTF 6.1 → 20.8）。除非音频长度固定不变，否则保持关闭；保存即生效">ⓘ</b></label>
+            <label class="switch"><input type="checkbox" id="cfgCudnnBench"><span class="tk"></span>cuDNN 自动调优<span class="qzb warn">⚠ 实测更慢</span><b class="qinfo" title="实测负优化：cuDNN 会为每个新的输入长度重新搜索卷积算法。BigVGAN 单步 3.35s → 97s，整段 38s → 141s（RTF 6.1 → 20.8）。除非音频长度固定不变，否则保持关闭；保存即生效"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></b></label>
             <p class="cfg-desc">负优化：BigVGAN 单步 3.35s → 97s，整段 38s → 141s。保持关闭</p>
           </div>
         </div>
