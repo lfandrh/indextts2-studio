@@ -221,6 +221,43 @@ def cap_prompt_files(prompts_dir: str, keep: int = PROMPTS_KEEP) -> int:
 AUDIO_MAX_BYTES = 20 * 1024 * 1024
 
 
+# ---------------------------------------------------------------------------
+# 情感向量归一化（纯数学）
+# ---------------------------------------------------------------------------
+# 与 indextts/infer_v2.py:IndexTTS2.normalize_emo_vec 同源。此前 server 直接
+# 调 tts.normalize_emo_vec()，而 LazyTTS 的每个方法开头都是 ensure_loaded()——
+# 于是「对 8 个数做一次乘加」的代价变成了把 6.7GB 模型整个加载起来：
+#   1. 开机后第一次用"情感向量控制"生成，点下按钮后界面长时间停在"准备生成…"，
+#      没有进度也没有取消按钮；
+#   2. 显存不够时用户看到的是 Request failed (500)，与真实原因无关；
+#   3. 这行跑在 _register_job() 之前、不持推理锁，加载途中点"卸载模型"会把
+#      _tts 置空，最后状态变成"说了卸载其实又被拉起来了"。
+# 搬到这里后是纯函数，启动即可用，也不再有上面三条。
+#
+# 维度顺序（与前端 8 个滑块的标签一致）：
+#   [happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]
+EMO_VEC_BIAS = (0.9375, 0.875, 1.0, 1.0, 0.9375, 0.9375, 0.6875, 0.5625)
+# 总和上限 0.8：超过会让情感把音色和语调一起压掉，合成结果听起来失真。
+EMO_VEC_SUM_MAX = 0.8
+
+
+def normalize_emo_vec(emo_vector, apply_bias: bool = True):
+    """按偏置表缩放 8 维情感向量，并把总和压到 0.8 以内。
+
+    纯数学，不依赖模型权重，所以服务刚起、模型还没加载时也能调用。
+    与 infer_v2 的实现逐位一致（tests/test_server_helpers.py 有对齐断言，
+    改这里必须同步改那边，否则两边行为会悄悄分叉）。
+    """
+    vec = [float(v) for v in emo_vector]
+    if apply_bias:
+        vec = [v * bias for v, bias in zip(vec, EMO_VEC_BIAS)]
+    total = sum(vec)
+    if total > EMO_VEC_SUM_MAX:
+        scale = EMO_VEC_SUM_MAX / total
+        vec = [v * scale for v in vec]
+    return vec
+
+
 def looks_like_audio(data: bytes) -> bool:
     """Cheap magic-byte sniff: wav / mp3 (ID3 or frame sync) / flac / ogg / m4a."""
     if not data or len(data) < 12:

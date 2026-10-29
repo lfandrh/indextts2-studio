@@ -22,17 +22,26 @@
   color-scheme: light;
 
   /* 表面三档：bg 最暗（页面底），surface 最亮（卡片） */
-  --bg: #f2f1ee;
+  --bg: #f5f4f1;
   --surface: #ffffff;
-  --surface-2: #f7f6f3;
+  --surface-2: #fbfaf8;
   --ink: #1b1a18;
   --muted: #56514a;
-  /* faint 用于 11px 微标签与装饰；取 #7a746a 是为在白底上过 4.5:1，
-     真正的说明文字请用 --muted（7:1），否则小字会糊成一片灰。 */
-  --faint: #7a746a;
-  --border: #e3e0da;
+  /* faint 用于微标签与装饰；真正的说明文字请用 --muted（7:1），否则小字会糊成一片灰。
+     加深历史：#7a746a（4.63:1，刚卡 WCAG AA 4.5 线、余量为零）
+             → #6b6559（5.80:1）
+             → #625c51（约 6.6:1，2026-10-29 顶栏状态条/音色卡片小字偏淡）。
+     回滚：把本行改回 #6b6559 即可，其余 59 处引用不用动。 */
+  --faint: #625c51;
+  --border: #e8e5df;
 
-  --primary: #d2372e;      /* 品牌红：只做主操作实心底 */
+  /* 品牌红拆两个令牌，只有深色主题下会分叉：
+     --primary       当「颜色」用：文字、描边、进度条、波形，要求它在底色上看得见；
+     --primary-solid 当「实心底」用：白字/白图标压在上面，要求它压得住白字。
+     浅色下两者同值（视觉零变化）；深色下亮红配白字只有 3.83:1 不达 AA，
+     所以实心底单独走深一档 —— 见 html[data-theme="dark"]。 */
+  --primary: #d2372e;
+  --primary-solid: #d2372e;
   --primary-ink: #ffffff;
   --danger: #c62f36;       /* 删除专用，与品牌红解耦，可独立调 */
   --accent: #1f5fe0;       /* 数据蓝：滑块、进度、数值、选中，不做正文色 */
@@ -40,15 +49,23 @@
   --warn: #a0690a;
   /* 轨道（进度条底槽、滑块未填充段、开关关闭态）必须自己看得见，
      它承担「总量」的语义。原来的 #eceae5 对表头底色只有 1.06:1、
-     对卡片底色 1.11:1，等于不存在：10% 的仪表只剩一根孤立短线。 */
-  --meter-track: #c7c0b4;
+     对卡片底色 1.11:1，等于不存在：10% 的仪表只剩一根孤立短线。
+     灰度已整体调低一档（#c7c0b4 → #d3cdc1）：滑块未填充段、开关关闭态、
+     进度槽三处都靠它，浓度太高会让整页到处是「灰条」抢注意力。 */
+  --meter-track: #d3cdc1;
 
-  /* 字号 6 档 */
+  /* 字号 5 档 —— 变量名沿用旧刻度名，值已整体抬一档（11/12/13/15 → 12/13/14/16）。
+     这样改名成本为零：123 处选择器不用动，也不会漏改一处掉回老刻度。
+     抬档的原因：字体已从雅黑换成 Noto Sans SC。Noto 是等线骨架、笔画粗细均匀，
+     12px 时横画约 1 像素实色，再降到 11px 横画只剩「半像素 + 反锯齿灰边」，
+     笔画直接淡掉。雅黑有装饰性粗度所以 11px 撑得住，Noto 撑不住。
+     **12px 是中文可读下限，不要再往下开第六档。**
+     读的时候按注释的用途记，不要按变量名里的数字记。 */
   --fs-18: 18px;   /* 页面标题 */
-  --fs-15: 15px;   /* 区块标题 / 大文本域 */
-  --fs-13: 13px;   /* 小节标题、正文、控件 */
-  --fs-12: 12px;   /* 辅助行、数值 */
-  --fs-11: 11px;   /* 微标签、徽章 */
+  --fs-15: 16px;   /* 区块标题 / 大文本域 */
+  --fs-13: 14px;   /* 小节标题、正文、控件（14 × 1.5 = 21px 舒适行高） */
+  --fs-12: 13px;   /* 辅助行、短说明 */
+  --fs-11: 12px;   /* 微标签、徽章、数值 —— 下限 */
 
   /* 圆角 4 档 */
   --r-sm: 6px;
@@ -72,29 +89,49 @@
   --shadow: 0 1px 2px rgba(27, 26, 24, .06);
   --shadow-pop: 0 16px 40px -12px rgba(27, 26, 24, .3), 0 2px 8px rgba(27, 26, 24, .08);
 
+  /* 悬浮提示专用三色（见 15c）。为什么不复用 --surface / --ink：
+     浅色下 --surface 就是纯白，气泡和白卡片同色，看起来和浏览器原生那层白框
+     一模一样 —— 用户第一眼就会觉得「没改」。这里让提示反相：深底浅字。
+     深色下不用同一种反相（否则界面里突兀地亮起一块），改成比卡片再抬半档的
+     暖灰 + 一道极淡描边，靠阴影与页面分离。 */
+  --tip-bg: #26231f;
+  --tip-ink: #f6f2ea;
+  --tip-line: transparent;
+
   /* 页面内容最大宽度：导航栏、workspace、页脚三处必须同宽，否则宽屏上边界对不齐 */
   --layout-max: 1680px;
 
-  --mono: "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
-  --sans: "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
+  /* 等宽栈必须带中文字体兜底：Cascadia / Consolas / SF Mono / Menlo 都没有汉字，
+     缺了这一步中文会掉到系统默认的 NSimSun（宋体），在 11~13px 下明显发虚、
+     和旁边思源黑体不是一套。加了 Noto 之后拉丁与数字仍走等宽，汉字走思源。 */
+  --mono: "Cascadia Mono", Consolas, "SF Mono", Menlo, "Noto Sans SC", "Microsoft YaHei", monospace;
+  /* 拉丁走 Inter，中文走 Noto Sans SC（均为本地自托管，web/fonts/）。
+     Noto 是可变字体 100-900，所以 400/500/600/700 都有真字重，不是模拟加粗。
+     最后的系统字体只是兜底（字体文件缺失时不至于掉成 Times）。 */
+  --sans: "Inter", "Noto Sans SC", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
 }
 
 html[data-theme="dark"] {
   color-scheme: dark;
   --bg: #131211;
   --surface: #1c1b19;
-  --surface-2: #232120;
+  --surface-2: #201f1e;
   --ink: #edeae4;
   --muted: #b3ada3;
   --faint: #918b81;
   --border: #2e2c29;
 
-  --primary: #e5503f;
+  --primary: #e5503f;        /* 文字/描边/进度：对 --bg 约 4.6:1，不要再调暗，否则小字发灰 */
+  --primary-solid: #c23a2a;  /* 实心底 + 白字 5.3:1；比 --primary 深一档换取 AA */
   --danger: #f2555a;
   --accent: #7ca1f2;
   --ok: #4cc38a;
   --warn: #e0a437;
-  --meter-track: #413d38;
+  --meter-track: #383430;
+
+  --tip-bg: #302c28;
+  --tip-ink: #f2eee6;
+  --tip-line: transparent;
 
   --shadow: 0 1px 2px rgba(0, 0, 0, .4);
   --shadow-pop: 0 18px 44px -12px rgba(0, 0, 0, .6), 0 2px 8px rgba(0, 0, 0, .4);
@@ -169,14 +206,14 @@ header {
 /* 副标题只在宽屏出现，且宽度预算优先给仪表条 */
 .brand small { display: none; color: var(--muted); font-weight: 500; font-size: var(--fs-12); }
 
-/* 顶栏那条波形横带：浓度已经画在画布颜色里（闲置 58%），这里不再叠 opacity，
-   否则再乘 .9 会淡成一层灰粉 */
+/* 顶栏那条波形横带：高度与透明度按原设计（28px 会把那条淡横线撑成一条灰带） */
 #waveHeader {
-  height: 24px;
-  flex: 1 1 100px;
+  height: 26px;
+  flex: 1 1 120px;
   min-width: 40px;
-  max-width: 420px;
+  max-width: 480px;
   align-self: center;
+  opacity: .9;
 }
 .spacer { flex: 1 1 0; min-width: 0; }
 
@@ -200,9 +237,9 @@ header {
 .pill[data-s="ready"] .led { background: var(--ok); }
 @keyframes blink { 50% { opacity: .25; } }
 
-/* 仪表条：宽度 94 是按最长的「内存 18.0/31.1G」定的（11px 等宽下
-   标签 21 + 间距 8 + 数值 62 = 91）。flex:none 让整条在空间不足时换行，
-   而不是被压窄后把数字挤到相邻元素上。 */
+/* 仪表条：宽度 104 按最长的「内存 15.1/31.1G」实测定的——11px 等宽下
+   标签 21 + 间距 4 + 数值 70 ≈ 98px，留 6px 余量，避免末尾的 G 被切。
+   flex:none 让整条在空间不足时整体换行，而不是被压窄后把数字挤到相邻元素上。 */
 .meters {
   display: flex;
   gap: var(--s2);
@@ -216,7 +253,7 @@ header {
   display: flex;
   flex-direction: column;
   gap: var(--s1);
-  width: 96px;
+  width: 104px;
   flex: none;
   font-family: var(--mono);
   font-size: var(--fs-11);
@@ -235,7 +272,9 @@ header {
   line-height: 14px;
   min-width: 0;
 }
-.meter > span b { overflow: hidden; text-overflow: ellipsis; flex: none; }
+/* 数值允许收缩并省略号收尾：极长数值（如 128G 机器）宁可显示「127.9/12…」，
+   也不要被父级 overflow:hidden 硬切掉最后一位。正常宽度下不会触发收缩。 */
+.meter > span b { min-width: 0; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; }
 .meter b { color: var(--ink); font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .meter .bar { height: 3px; border-radius: var(--r-pill); background: var(--meter-track); overflow: hidden; }
 .meter .bar i { display: block; height: 100%; width: 0%; background: var(--accent); border-radius: var(--r-pill); transition: width .6s ease; }
@@ -276,10 +315,26 @@ header {
   display: grid;
   place-items: center;
   padding: 0;
+  /* 图标按钮内部是 SVG（用 px 定尺寸），字号本不影响外观；
+     但 UA 默认 13.33px 会在万一放入文字字符时随浏览器/系统缩放漂移，显式钉住。 */
+  font-size: var(--fs-13);
+  line-height: 1;
   transition: background .18s ease, border-color .18s ease;
 }
 .iconbtn:hover { background: var(--surface-2); border-color: color-mix(in srgb, var(--faint) 40%, var(--border)); }
 .iconbtn:disabled { opacity: .45; cursor: not-allowed; }
+
+/* 右侧工具组（外链 + 主题）：打包成一个不可拆的整体，空间不足时整组换行
+   而不是让主题按钮单独掉到下一行（那会读成两截）。
+   margin-left:auto 在单行时是空操作（spacer 已吃掉剩余空间），
+   换行时则让这一整组贴右——1280/1200 档第一行被页签占满，工具组会落到第二行，
+   靠右才像「工具区」，靠左会像漏排。 */
+.hdr-tools { display: flex; align-items: center; gap: var(--s2); flex: none; margin-left: auto; }
+/* 外链组（更多模型 / GitHub）：与页签分开一档，视觉上读作「站内导航 | 站外链接 · 设置」。
+   链接复用 iconbtn 外观，只需补掉 a 的下划线。 */
+.hdr-links { display: flex; gap: var(--s1); flex: none; }
+.hdr-links a.iconbtn { text-decoration: none; }
+.hdr-links a.iconbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* ---------- 4. 布局骨架 ---------- */
 main#pages {
@@ -293,14 +348,25 @@ main#pages {
 .page { display: none; }
 .page.cur { display: block; }
 
+/* 生成页三栏：左栏（参数）宽度由 --gen-left 定死，右栏历史栏宽度由
+   --gen-hist 定，两个变量互相独立 —— 展开/收起历史栏时只有中间栏变，
+   左栏必须纹丝不动。
+   之前把左栏直接写进 grid-template-columns，于是：
+     基础规则     .page[data-page="gen"].cur.hist-collapsed  → 左栏 minmax(520,560)
+     1600 媒体查询 .page[data-page="gen"].cur               → 左栏 minmax(560,620)
+   后者特异性更低，压不过前者 → 宽屏下「收起」用 560、「展开」用 620，
+   开一下历史栏左栏就胖 60px，中间栏被挤瘪。改用变量后两条规则都只改
+   自己的那一个变量，特异性不再互相干扰。 */
 .page[data-page="gen"].cur {
+  --gen-left: minmax(520px, 560px);
+  --gen-hist: 268px;
   display: grid;
-  grid-template-columns: minmax(520px, 560px) minmax(0, 1fr) 268px;
+  grid-template-columns: var(--gen-left) minmax(0, 1fr) var(--gen-hist);
   gap: var(--gap);
   align-items: stretch;
 }
 .page[data-page="gen"].cur.hist-collapsed {
-  grid-template-columns: minmax(520px, 560px) minmax(0, 1fr) 46px;
+  --gen-hist: 46px;
 }
 
 /* 卡片 = 页面级容器：唯一的 14px 圆角 + hairline，无阴影 */
@@ -314,16 +380,77 @@ main#pages {
   flex-direction: column;
 }
 
+/* 脚标：之前是「一行浅灰长句 + 手写 · 分隔」，没有边界、没有层次，
+   读起来像随手贴的说明。现在给一条与内容左右对齐的细线收口，键位独立成键帽，
+   分隔交给 CSS——文案里不再出现 ·。 */
 footer {
+  position: relative;
   max-width: var(--layout-max);
   width: 100%;
   margin: 0 auto;
-  padding: 0 var(--s6) var(--s6);
+  padding: var(--s4) var(--s6) var(--s6);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  row-gap: var(--s2);
   color: var(--faint);
   font-size: var(--fs-12);
 }
+/* 细线用伪元素而不是 border-top：border 会连左右 padding 一起画满，
+   和两侧留白的卡片对不齐；inset 左右留同样的 --s6，线才落在内容边界上。
+   颜色用 ink 的低透明度而不是 --border：--border 在浅色下只有 13 级色差，
+   1px 会被背景吃掉，看着像没画。 */
+footer::before {
+  content: "";
+  position: absolute;
+  inset: 0 var(--s6) auto;
+  height: 1px;
+  background: color-mix(in srgb, var(--ink) 16%, transparent);
+}
+.fh-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+/* 项与项之间一道 10px 竖线，比「·」更安静，也不会把中英文混排挤在一起 */
+.fh-item + .fh-item { margin-left: var(--s4); }
+.fh-item + .fh-item::before {
+  content: "";
+  width: 1px;
+  height: 10px;
+  margin-right: calc(var(--s4) - 5px); /* 到右边内容 16px，与左间距对称 */
+  background: var(--border);
+}
+/* 键帽：等宽字 + 1px 边框 + 2px 底边，像一颗实体键；底色比页面底亮一档。
+   横向内边距走 --s1，纵向 3px 是键帽比例的硬需求（4px 会把 12px 的字撑得比整行还高），
+   圆角取最小档 --r-sm，不另造数值。 */
+footer kbd {
+  font-family: var(--mono);
+  font-size: var(--fs-11);
+  line-height: 1;
+  min-width: 18px;
+  padding: 3px var(--s1);
+  text-align: center;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--muted);
+}
 footer a { color: var(--muted); }
 
+/* ---- 断点体系（改断点前先读这张表）----
+   默认（无媒体查询）        所有宽度：gen 页三栏 grid（--gen-left 决定左栏宽度）
+   max-1240                gen 页转单列；管理页只收窄两侧，不转单列
+   max-1100                管理页转单列；app-shell 关闭，页面恢复整页滚动
+   max-768                 手机
+   min-1101                开 app-shell：页面不滚，各栏自己滚
+   min-1600                左栏 560 → 620
+
+   1101~1240 是**有意重叠**：这一档已经开了 app-shell（不整页滚），
+   但 gen 页仍是单列三卡堆叠。两件事互不冲突，别把其中一个的断点挪走。
+   1101(min) 与 1100(max) 的 ±1 是常规写法，避免 1100.5px 这种小数边界两头不沾。 */
 /* 宽屏改成应用式布局：页面本身不滚动，各栏自己滚。
    这样生成按钮和资源库能真正钉在各自可视区底部。 */
 @media (min-width: 1101px) {
@@ -340,7 +467,13 @@ footer a { color: var(--muted); }
   .resultcard > .ph,
   .resultcard > .sc-loading,
   .resultcard > #resultBody { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
-  .resultcard > .history { position: static; flex: none; }
+  .resultcard > .history { position: relative; flex: none; }
+  /* 结果区内部纵向布局：编辑面板压到底，多出来的高度变成波形区与编辑区
+     之间的一段呼吸带。子项一律 flex: none —— 内容超高时宁可整块滚动，
+     也不能把波形压扁；margin-top: auto 在空间不足时自动归零。 */
+  .resultcard > #resultBody { display: flex; flex-direction: column; }
+  .resultcard > #resultBody > * { flex: none; }
+  .resultcard > #resultBody > .edit-panel { margin-top: auto; }
 
   .mg-card { height: 100%; min-height: 0; overflow: hidden; }
   .mg-side, .mg-main, .mg-inspect { overflow-y: auto; overscroll-behavior: contain; }
@@ -349,7 +482,12 @@ footer a { color: var(--muted); }
 /* ---------- 5. 按钮 ---------- */
 /* 三个角色 × 三个尺寸，除此之外不许再有第四种长相。
    .ghost 就是「次要操作」：白底 + 1px 描边 + 墨色字。
-   需要无边无边距的文字按钮，用 .linkbtn，不要造 .ghost.no-border。 */
+   需要无边无边距的文字按钮，用 .linkbtn，不要造 .ghost.no-border。
+
+   字重取 500 而不是 600：600 在 11–12px 上笔画并得太拢，中文小字会糊成黑块，
+   500 是「看清但不发闷」的那一档，与正文 400 的层级差也够。
+   实底按钮（.primary / .danger）的描边必须与底色同色：留 transparent 的话
+   1px 边框区会透出下层白底，按钮边缘看着像缺了一圈。 */
 .btn {
   display: inline-flex;
   align-items: center;
@@ -363,7 +501,7 @@ footer a { color: var(--muted); }
   color: var(--ink);
   font-family: var(--sans);
   font-size: var(--fs-12);
-  font-weight: 600;
+  font-weight: 500;
   line-height: 1;
   cursor: pointer;
   white-space: nowrap;
@@ -373,7 +511,7 @@ footer a { color: var(--muted); }
 .btn:disabled { opacity: .45; cursor: not-allowed; transform: none; filter: none; }
 .btn svg { flex: none; }
 
-.btn.primary { background: var(--primary); color: var(--primary-ink); }
+.btn.primary { background: var(--primary-solid); border-color: var(--primary-solid); color: var(--primary-ink); }
 .btn.primary:hover { filter: brightness(1.07); }
 .btn.primary:disabled { filter: none; }
 
@@ -383,7 +521,7 @@ footer a { color: var(--muted); }
 .btn.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); background: var(--surface); }
 .btn.danger:hover { background: color-mix(in srgb, var(--danger) 8%, var(--surface)); }
 /* 实底 danger 只在非描边时出现；描边变体是红底红字不可读 */
-.btn.danger:not(.ghost) { background: var(--danger); color: #fff; border-color: transparent; }
+.btn.danger:not(.ghost) { background: var(--danger); color: #fff; border-color: var(--danger); }
 
 /* 尺寸：mini 用于工具条与行内小动作，big 只给每屏唯一的主操作 */
 .btn.mini { height: 26px; padding: 0 var(--s2); font-size: var(--fs-11); }
@@ -409,7 +547,8 @@ textarea, select, input[type="text"], input[type="number"] {
   padding: 0 var(--s3);
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
-  background: var(--surface-2);
+  /* 与折叠面板、拖放区同一档：淡一层的次级底，靠边框划出可输入的范围 */
+  background: color-mix(in srgb, var(--surface-2) 50%, transparent);
   color: var(--ink);
   font-family: var(--sans);
   font-size: var(--fs-13);
@@ -467,7 +606,7 @@ input.pnum {
   font-variant-numeric: tabular-nums;
   appearance: textfield;
   -moz-appearance: textfield;
-  background: var(--surface-2);
+  background: color-mix(in srgb, var(--surface-2) 50%, transparent);
   border: 1px solid var(--border);
   color: var(--ink);
 }
@@ -521,8 +660,8 @@ input[type="range"]:disabled { cursor: not-allowed; }
 .switch {
   display: flex;
   align-items: center;
-  gap: var(--s2);
-  margin-top: var(--s2);
+  gap: var(--s2);          /* 原 9px：唯一一个不在 4px 网格上的间距 */
+  margin-top: 10px;
   font-size: var(--fs-13);
   cursor: pointer;
   user-select: none;
@@ -542,8 +681,8 @@ input[type="range"]:disabled { cursor: not-allowed; }
 }
 .switch input:focus-visible + .tk { outline: 2px solid var(--accent); outline-offset: 2px; }
 .switch .tk {
-  width: 36px;
-  height: 20px;
+  width: 34px;
+  height: 19px;
   border-radius: var(--r-pill);
   background: var(--meter-track);
   position: relative;
@@ -555,16 +694,15 @@ input[type="range"]:disabled { cursor: not-allowed; }
   position: absolute;
   top: 2px;
   left: 2px;
-  width: 16px;
-  height: 16px;
+  width: 15px;
+  height: 15px;
   border-radius: 50%;
   background: var(--surface);
-  border: 1px solid color-mix(in srgb, var(--ink) 12%, transparent);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .3);
   transition: left .2s ease;
 }
 .switch input:checked + .tk { background: var(--accent); }
-.switch input:checked + .tk::after { left: 18px; }
-.switch.cfg-disabled { opacity: .55; cursor: not-allowed; }
+.switch input:checked + .tk::after { left: 17px; }
 /* 「采样模式」是下面三个采样滑块的开关，与它们同属一组，间距跟着滑块走 */
 .switch.samplerow { margin-top: var(--s3); }
 /* 开关行里的原始参数名，与滑块 <label> 里的同名小字同一套（等宽、靠右） */
@@ -588,7 +726,8 @@ input[type="range"]:disabled { cursor: not-allowed; }
   text-align: center;
   color: var(--faint);
   cursor: pointer;
-  background: var(--surface-2);
+  /* 与结果区波形同一档：淡一层的次级底，虚线框自己划出了边界 */
+  background: color-mix(in srgb, var(--surface-2) 50%, transparent);
   transition: border-color .16s ease, background .16s ease;
 }
 .drop:hover, .drop.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 4%, var(--surface-2)); }
@@ -614,7 +753,8 @@ input[type="range"]:disabled { cursor: not-allowed; }
   margin-top: var(--s3);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
-  background: var(--surface-2);
+  /* 与结果区波形、拖放区同一档：淡一层的次级底，靠边框划出范围 */
+  background: color-mix(in srgb, var(--surface-2) 50%, transparent);
 }
 /* 展开后的内容要自己让出内距。只有 summary 那一行写了 8/12，内容区不补的话，
    下拉框与滑块的方角会直接压在面板边框和 10px 圆角上（分句预览默认展开，
@@ -649,6 +789,42 @@ input[type="range"]:disabled { cursor: not-allowed; }
 }
 .fold[open] summary::before { transform: rotate(45deg); margin-top: -1px; }
 .fold summary:hover { color: var(--ink); }
+
+/* ---------- 7b. 折叠标题行（共用组件） ----------
+   音量/变速面板（details/summary）与资源库（按钮 + 标题）此前是两套长相：
+   一个是 CSS 边框画的 5px 小尖角、藏在纯文字行里；另一个是 14px SVG 箭头
+   装在带边框的方按钮里。现在统一成同一套：同样的箭头图形、同样的开合旋转、
+   同样的标题字重字号、同样的右侧信息位。 */
+.fold-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  /* 两处折叠头统一行高：标题行本身不因内容长短而跳动 */
+  min-height: 26px;
+  user-select: none;
+  list-style: none;
+  color: var(--muted);
+}
+.fold-chev {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform .18s ease;
+}
+/* 收起 = 箭头朝右（可展开），展开 = 箭头朝下（可收起）；
+   两种面板各自在自己的规则里切换朝向（summary 用 [open]，资源库用 .lib-collapsed） */
+.fold-title {
+  font-size: var(--fs-13);
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.fold-head:hover .fold-title { color: var(--ink); }
 
 /* 帮助气泡：14px 圆形图标，点/悬停看 title */
 .q {
@@ -716,7 +892,7 @@ input[type="range"]:disabled { cursor: not-allowed; }
   font-size: var(--fs-11);
   font-weight: 600;
   color: var(--muted);
-  background: var(--surface-2);
+  background: color-mix(in srgb, var(--surface-2) 50%, transparent);
   border: 1px solid var(--border);
   font-variant-numeric: tabular-nums;
 }
@@ -745,6 +921,8 @@ input[type="range"]:disabled { cursor: not-allowed; }
   gap: var(--s2);
   padding: var(--s1) var(--s2);
   border-radius: var(--r-sm);
+  /* 面板底色调淡后，条目原来那点白底差异不够看了，补一道细边保住分隔 */
+  border: 1px solid var(--border);
   background: var(--surface);
   font-size: var(--fs-12);
   color: var(--muted);
@@ -760,15 +938,18 @@ input[type="range"]:disabled { cursor: not-allowed; }
 
 /* 参考音频 */
 #spkPlayerBox { margin-top: var(--s3); }
-#spkPlayerBox.over canvas { border-color: var(--accent); }
+#spkPlayerBox.over canvas { box-shadow: inset 0 0 0 1px var(--accent); }
 #spkWave {
   width: 100%;
-  height: 64px;
+  height: 48px;
   display: block;
   border-radius: var(--r-sm);
   touch-action: none;
   cursor: pointer;
-  background: var(--surface-2);
+  /* 不要实心底：一块灰底会让「区域偏高、条子偏矮」同时成立。
+     边框用 inset 描边代替 border —— 不占布局，sizeCanvas 量到的宽度才跟柱子对得上。
+     浓度掺到 70%：留出边界感，但不跟里面的细柱抢视线。虚线试过，读起来像空态，退回实线。 */
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 70%, transparent);
 }
 .refrow { display: flex; align-items: center; gap: var(--s2); margin-top: var(--s2); }
 .refrow .range {
@@ -1003,7 +1184,20 @@ input[type="range"]:disabled { cursor: not-allowed; }
   padding: var(--s3) var(--pad) var(--s3);
   border-radius: 0 0 calc(var(--r-lg) - 1px) calc(var(--r-lg) - 1px);
   background: var(--surface);
-  border-top: 1px solid var(--border);
+  /* 顶边线不用 border-top：这块左右各负了一个 --pad 通栏到卡片边缘
+     （它要贴卡片底部圆角），border-top 会跟着通栏，和上方内容区的
+     分隔线（缩进 --pad）长短对不上。改成伪元素画一条缩进的线就齐了。
+     与右栏资源库 .history 用的是同一套做法。 */
+}
+/* 顶边线：与内容区对齐（左右各缩进 --pad） */
+.cta::before {
+  content: "";
+  position: absolute;
+  left: var(--pad);
+  right: var(--pad);
+  top: 0;
+  height: 1px;
+  background: var(--border);
 }
 .gen-summary {
   font-family: var(--mono);
@@ -1036,42 +1230,46 @@ input[type="range"]:disabled { cursor: not-allowed; }
 /* ---------- 9. 生成页：结果栏 ---------- */
 .resultcard { min-height: 520px; padding-bottom: 0; }
 
-/* 空态 */
+/* 空态：中间那个 88px 的播放圆盘是本页最抢眼的一处「留白说明」。
+   它靠三层同心（圆盘实底 → 10px 卡片色间隙 → 1.5px 描边环）立起来，
+   比一层描边的小圆圈更有分量，也更像一张唱片。 */
 .ph {
   flex: 1;
-  border: 1px dashed var(--border);
-  border-radius: var(--r-md);
+  border: 1.5px dashed var(--border);
+  border-radius: var(--r-lg);
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: var(--s4);
-  padding: var(--s8) var(--s6);
+  padding: 48px 24px;
   min-height: 360px;
   margin-bottom: var(--s1);
-  background: var(--surface-2);
+  background:
+    radial-gradient(220px 150px at 50% 46%, color-mix(in srgb, var(--accent) 5%, transparent), transparent);
 }
 .ph-disc {
-  width: 72px;
-  height: 72px;
+  width: 88px;
+  height: 88px;
   border-radius: 50%;
   display: grid;
   place-items: center;
   color: var(--faint);
-  border: 1px solid var(--border);
-  background: var(--surface);
+  border: 2px solid var(--border);
+  background: var(--surface-2);
+  box-shadow: 0 0 0 10px var(--surface), 0 0 0 11.5px var(--border);
 }
-.ph-disc svg { width: 26px; height: 26px; }
-.ph-wave { display: flex; align-items: center; gap: 2px; height: 40px; }
+.ph-disc svg { width: 34px; height: 34px; }
+.ph-wave { display: flex; align-items: center; gap: 4px; height: 52px; }
 .ph-wave i {
   display: block;
-  width: 3px;
+  width: 3.5px;
   border-radius: var(--r-pill);
   background: var(--border);
   animation: phbreathe 2.6s ease-in-out infinite;
 }
 .ph-wave i:nth-child(odd) { animation-delay: .4s; }
-@keyframes phbreathe { 0%, 100% { height: 8px; } 50% { height: 32px; } }
+@keyframes phbreathe { 0%, 100% { height: 10px; } 50% { height: 40px; } }
 .ph-text { font-size: var(--fs-15); font-weight: 600; color: var(--muted); }
 .ph-est { font-size: var(--fs-12); color: var(--faint); }
 
@@ -1182,19 +1380,25 @@ input[type="range"]:disabled { cursor: not-allowed; }
 }
 .err.on { display: block; }
 
-/* 大播放器 */
-.bigplayer { display: flex; gap: var(--s3); align-items: stretch; }
+/* 大播放器。
+   padding-left 是给 hover 放大留的余量：.bigp:hover 会 scale(1.03)，
+   54px 的圆按钮放大后左右各溢出约 0.8px，而按钮左边缘紧贴 #resultBody
+   的内容盒左沿（overflow-y:auto 会连带把 overflow-x 算成 auto），
+   溢出那一点点正好被切掉，看上去就是「左边被啃了一口」。
+   4px > 0.8px，溢出全部落在 padding 里，不再被裁。 */
+.bigplayer { display: flex; gap: var(--s3); align-items: stretch; padding-left: 4px; }
 .bigp {
-  width: 52px;
-  height: 52px;
+  width: 54px;
+  height: 54px;
   border-radius: 50%;
   flex: none;
   align-self: center;
-  background: var(--primary);
+  background: var(--primary-solid);
   color: var(--primary-ink);
   border: none;
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--primary) 30%, transparent);
 }
-.bigp:hover { background: var(--primary); filter: brightness(1.06); }
+.bigp:hover { background: var(--primary-solid); transform: translateY(-1px) scale(1.03); filter: brightness(1.06); }
 .bp-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 #waveTrim {
   width: 100%;
@@ -1203,21 +1407,55 @@ input[type="range"]:disabled { cursor: not-allowed; }
   border-radius: var(--r-sm);
   touch-action: none;
   cursor: crosshair;
-  background: var(--surface-2);
+  /* 透明底会显得「什么都没有」：给一层半浓度的 surface-2 当衬底，
+     比原来的实底淡一半，又不至于空。 */
+  background: color-mix(in srgb, var(--surface-2) 50%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 70%, transparent);
 }
+/* 时间轴：左端起点 / 中间选区 / 右端总长。三列网格，中间一列按内容宽，
+   两侧各占一份剩余宽度，起点贴左、总长贴右，选区居中。 */
+.bp-axis {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: var(--s2);
+  margin-top: 6px;
+  font-size: var(--fs-11);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.bp-axis > :first-child { justify-self: start; }
+.bp-axis > :last-child { justify-self: end; }
+.bp-axis > :nth-child(2) { color: var(--muted); }
 .bp-meta {
   display: flex;
   justify-content: space-between;
+  align-items: baseline;
   gap: var(--s2);
   margin-top: var(--s2);
   font-size: var(--fs-12);
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
-.trim-hint { font-size: var(--fs-11); color: var(--faint); margin-top: var(--s3); }
+.trim-hint { font-size: var(--fs-11); color: var(--faint); margin-top: var(--s2); opacity: .8; }
 .sel-actions { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; margin-top: var(--s3); }
 .sel-actions #dlSrcBtn { margin-left: auto; }
-.dl-row { margin-top: var(--s2); }
+/* 源文件名：另起一行、右对齐，正好落在「下载」按钮下方。
+   限宽 + 省略号，过长时向左截断，不会把行撑高 */
+.dl-row {
+  margin-top: var(--s1);
+  text-align: right;
+  min-width: 0;
+}
+.dl-row .dl-name {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  word-break: normal;
+  vertical-align: bottom;
+}
 .dl-name {
   font-family: var(--mono);
   font-size: var(--fs-11);
@@ -1228,6 +1466,25 @@ input[type="range"]:disabled { cursor: not-allowed; }
 
 /* 音频编辑 */
 .edit-panel { margin-top: var(--s4); padding-top: var(--s4); border-top: 1px solid var(--border); }
+/* 音量 / 变速折叠面板：不是所有人都用这两个滑块，收起时右栏少两行控件。
+   折叠态仍然把当前两个数值显示在摘要行上（收起 ≠ 没生效）；
+   数值非默认时用品牌红标出，一眼能看出是否改过。
+   标题行直接复用 7b 的共用组件（.fold-head / .fold-chev / .fold-title），
+   与下方资源库的折叠头是同一套长相。 */
+.edit-fold > summary { cursor: pointer; padding: 0; }
+.edit-fold > summary::-webkit-details-marker { display: none; }
+/* 收起时箭头朝右，展开时朝下 —— 与资源库一致 */
+.edit-fold > summary .fold-chev { transform: rotate(-90deg); }
+.edit-fold[open] > summary .fold-chev { transform: rotate(0deg); }
+.edit-fold > summary:hover .fold-title { color: var(--ink); }
+.edit-fold-vals {
+  margin-left: auto;
+  font-size: var(--fs-11);
+  font-weight: 400;
+  color: var(--faint);
+}
+.edit-fold-vals.on { color: var(--primary); font-weight: 600; }
+.edit-fold[open] .edit-rows { margin-top: var(--s3); }
 .sec-t {
   display: flex;
   align-items: baseline;
@@ -1245,18 +1502,34 @@ input[type="range"]:disabled { cursor: not-allowed; }
    60px 装得下最长的「+24.0 dB」，104px 装得下「峰值 +24.0 dBFS」「保音高 · 结果 4.55s」。 */
 .edit-row {
   display: grid;
-  grid-template-columns: 30px minmax(0, 1fr) 60px 104px;
+  grid-template-columns: 30px minmax(0, 1fr) 56px;
   column-gap: var(--s2);
-  row-gap: var(--s1);
+  row-gap: 2px;
   align-items: center;
+}
+/* 并排两列：每列各拿一半宽度。列宽写死（标签 30 / 数值 56）后，
+   两列的滑轨两端仍然严格对齐——这是上一轮「看不得不对齐」的底线。 */
+.edit-rows {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--s4);
+  align-items: start;
   margin-bottom: var(--s3);
 }
-.edit-row > b { font-size: var(--fs-12); font-weight: 600; color: var(--muted); }
-.edit-row input[type="range"] { min-width: 0; }
-/* 「降到不削波」只在削波时出现：放第二行、贴着滑轨左端起，绝不回头挤窄滑轨 */
-.edit-row > #gainMax { grid-column: 2 / 3; grid-row: 2; justify-self: start; }
-.tempo-wrap { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.tempo-wrap input[type="range"] { flex: none; width: 100%; min-width: 0; }
+.edit-row > b { grid-column: 1; grid-row: 1; font-size: var(--fs-12); font-weight: 600; color: var(--muted); }
+.edit-row > input[type="range"] { grid-column: 2; grid-row: 1; min-width: 0; }
+.edit-row > .edit-val { grid-column: 3; grid-row: 1; justify-self: end; }
+/* 第二行整行铺开：音量放「峰值 / 削波按钮」，变速放「刻度 / 保音高」。
+   不再跟着滑轨抢宽度，削波按钮出现时也不会把滑轨挤窄。 */
+.edit-sub {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-width: 0;
+}
+.edit-sub .edit-ticks { flex: 1; min-width: 0; }
 .edit-ticks { display: flex; justify-content: space-between; padding: 0 var(--s1); }
 .edit-ticks .tick {
   background: none;
@@ -1289,16 +1562,10 @@ input[type="range"]:disabled { cursor: not-allowed; }
    标签一行、滑轨（含刻度）独占一行、数值与备注一行。刻度因此拿到整行宽度，
    仍然与滑轨等宽，位置也仍然按倍率等距；备注也不会被挤成好几行。 */
 .edit-panel { container-type: inline-size; }
+/* 面板窄到放不下两列时退回上下两行：滑轨重新拿到整行宽度，
+   第二行的刻度也不用挤在半列里。列内结构不变，不需要另一套模板。 */
 @container (max-width: 470px) {
-  /* 窄面板回到三行式：标签一行、滑轨（含刻度）独占一行、数值与备注一行。
-     数值列同样写死——用 auto 的话「0.0 dB」比「1.00×」宽 7px，备注又会错开。 */
-  .edit-row { grid-template-columns: 60px minmax(0, 1fr); row-gap: 2px; }
-  .edit-row > b { grid-column: 1 / -1; }
-  .edit-row > input[type="range"] { grid-column: 1 / -1; }
-  .tempo-wrap { grid-column: 1 / -1; }
-  .edit-row > #gainMax { grid-column: 1 / -1; grid-row: auto; }
-  /* 整行宽了，备注不必再硬撑一行 */
-  .edit-note { white-space: normal; }
+  .edit-rows { grid-template-columns: minmax(0, 1fr); gap: var(--s3); }
 }
 
 .ops-row { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; margin-top: 2px; }
@@ -1323,9 +1590,9 @@ input[type="range"]:disabled { cursor: not-allowed; }
 
 #resultPreview { margin-top: var(--s4); padding-top: var(--s4); border-top: 1px solid var(--border); }
 .out-player { display: flex; align-items: center; gap: var(--s2); }
-.out-play { width: 28px; height: 28px; border-radius: 50%; flex: none; background: var(--primary); color: var(--primary-ink); border: none; }
+.out-play { width: 28px; height: 28px; border-radius: 50%; flex: none; background: var(--primary-solid); color: var(--primary-ink); border: none; }
 .out-play:hover { filter: brightness(1.06); }
-#waveOut { flex: 1; min-width: 0; height: 26px; display: block; border-radius: var(--r-sm); background: var(--surface-2); }
+#waveOut { flex: 1; min-width: 0; height: 26px; display: block; border-radius: var(--r-sm); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 70%, transparent); }
 .out-dur {
   font-size: var(--fs-11);
   color: var(--muted);
@@ -1345,14 +1612,49 @@ input[type="range"]:disabled { cursor: not-allowed; }
   padding: var(--s3) var(--pad) var(--pad);
   border-radius: 0 0 calc(var(--r-lg) - 1px) calc(var(--r-lg) - 1px);
   background: var(--surface);
-  border-top: 1px solid var(--border);
+  /* 顶边线不用 border-top：这块左右各负了一个 --pad 通栏到卡片边缘
+     （它要贴卡片底部圆角），border-top 会跟着通栏，和上方内容区的
+     分隔线（.edit-panel，缩进 --pad）长短对不上 —— 同一张卡里两条
+     横线右端不齐，一眼能看出来。改成伪元素画一条缩进的线就齐了。 */
+}
+/* 顶边线：与内容区对齐（左右各缩进 --pad）。
+   .history 是 sticky，本身就是定位祖先；单列下它会退回 static，
+   那里要补 position: relative，否则伪元素会相对更外层的祖先定位。 */
+.history::before {
+  content: "";
+  position: absolute;
+  left: var(--pad);
+  right: var(--pad);
+  top: 0;
+  height: 1px;
+  background: var(--border);
 }
 .lib-head { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; margin-bottom: var(--s2); }
-.lib-fold-btn { width: 24px; height: 24px; flex: none; }
-.lib-fold-btn svg { transition: transform .18s ease; }
+/* 折叠头与「音量与变速」面板同一套：裸箭头按钮（不再套描边方块），
+   收起时箭头朝右、展开时朝下，与 summary 那侧完全一致。 */
+.lib-fold-btn {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  padding: 0;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  font-size: var(--fs-13);   /* 钉住，别走 UA 默认 13.33px */
+  line-height: 1;
+  transition: background .16s ease, color .16s ease;
+}
+.lib-fold-btn:hover { background: color-mix(in srgb, var(--faint) 12%, transparent); color: var(--ink); }
+.lib-head .fold-head:hover .fold-title { color: var(--ink); }
+.lib-fold-btn .fold-chev { transform: rotate(0deg); }
+.history.lib-collapsed .lib-fold-btn .fold-chev { transform: rotate(-90deg); }
 .history.lib-collapsed .lib-tools,
+.history.lib-collapsed .lib-tabs,
 .history.lib-collapsed .hist-list { display: none; }
-.history.lib-collapsed .lib-fold-btn svg { transform: rotate(-90deg); }
 .history.lib-collapsed { margin-top: 0; }
 .lib-tabs { display: flex; gap: var(--s1); }
 .libtab {
@@ -1419,11 +1721,19 @@ input[type="range"]:disabled { cursor: not-allowed; }
   font-variant-numeric: tabular-nums;
 }
 
-/* 卡片右上角动作：改名/复制/删除，hover 才浮出 */
-.pm-acts {
+/* 卡片右上角动作：改名/复制/删除，hover 才浮出。
+   用 .pm-bar 把「改 / 复 / 关闭」合成一个绝对定位的 flex 行，顺序横排 + 固定 2px 间距，
+   从根本上杜绝两个按钮组互相重叠——旧版 .pm-acts 与 .pm-del 各自 absolute、
+   且 right 值接近（12px vs 8px），导致「关闭」直接压在「复」上。 */
+.pm-bar {
   position: absolute;
   top: var(--s2);
-  right: var(--s3);
+  right: var(--s2);
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.pm-acts {
   display: flex;
   gap: 2px;
   opacity: 0;
@@ -1450,9 +1760,7 @@ input[type="range"]:disabled { cursor: not-allowed; }
 .pm-act:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .pm-act:disabled { opacity: .4; cursor: wait; }
 .pm-del {
-  position: absolute;
-  top: var(--s2);
-  right: var(--s2);
+  /* 不再独立 absolute：作为 .pm-bar 里的最后一个 flex 子项，与「改/复」同排 */
   width: 22px;
   height: 22px;
   border: none;
@@ -1463,14 +1771,16 @@ input[type="range"]:disabled { cursor: not-allowed; }
   display: grid;
   place-items: center;
   padding: 0;
+  font-size: var(--fs-13);   /* 钉住，别走 UA 默认 13.33px */
+  line-height: 1;
   transition: opacity .15s ease, color .15s ease, background .15s ease;
 }
 .pm-del:hover { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
 .pm-del .ico { width: 12px; height: 12px; }
-/* 库区卡片里恒常显示，否则不知道能删 */
+/* 库区卡片（底部资源库）删除按钮与改/复同组，hover 才显，否则挡住预设名 */
 .hist-item .pm-del { opacity: 0; }
 .hist-item:hover .pm-del { opacity: 1; }
-@media (hover: none) { .hist-item .pm-del { opacity: 1; } }
+@media (hover: none) { .hist-item .pm-del, .hist-item .pm-acts { opacity: 1; } }
 
 /* ---------- 11. 生成页：右栏生成历史 ---------- */
 .histbar { padding: 0; overflow: hidden; }
@@ -1751,7 +2061,14 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   background: var(--surface-2);
   white-space: nowrap;
 }
-.pm-tag.on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 24%, transparent); background: color-mix(in srgb, var(--accent) 6%, transparent); }
+/* 「含音频」「已应用」这类状态标签用主色红，跟页面主色统一。
+   原来用 --accent（数据蓝），但这一页的主色是红，蓝色标签和红框
+   「应用」按钮同屏出现时互相抢眼，且蓝色在本页没有任何语义。 */
+.pm-tag.on {
+  color: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 26%, transparent);
+  background: color-mix(in srgb, var(--primary) 6%, transparent);
+}
 .pm-tag.mute { color: var(--faint); }
 .pm-card .pm-row:empty { display: none; }
 .pm-params {
@@ -1780,7 +2097,7 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   flex: none;
   transition: background .15s ease, color .15s ease;
 }
-.pm-apply:hover { background: var(--primary); color: var(--primary-ink); }
+.pm-apply:hover { background: var(--primary-solid); color: var(--primary-ink); }
 .pm-empty { grid-column: 1 / -1; color: var(--faint); font-size: var(--fs-12); padding: var(--s8) var(--s1); text-align: center; }
 
 /* 右：检视面板 */
@@ -1903,6 +2220,8 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
 
 /* ---------- 14. 模型管理页 ---------- */
 .mm-band {
+  /* 左侧两块共用同一宽度，看起来才像一对而不是两块随手摆的盒子 */
+  --mm-tile: 180px;
   display: flex;
   align-items: stretch;
   gap: var(--s2);
@@ -1915,13 +2234,18 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   display: flex;
   flex-direction: column;
   gap: 2px;
-  justify-content: center;
+  /* 与「显存」同构：内容顶对齐，两块的标签行、数值行才会落在同一条线上 */
+  justify-content: flex-start;
   padding: var(--s2) var(--s3);
+  width: var(--mm-tile);
+  flex: none;
   border-radius: var(--r-md);
   border: 1px solid var(--border);
   background: var(--surface-2);
-  min-width: 124px;
+  min-width: 0;
 }
+/* 卡片顶部的类别标签（模型状态 / 显存），两块共用同一套排版 */
+.mm-tile-label { font-size: var(--fs-11); color: var(--muted); line-height: 1; }
 .mm-state-top { display: flex; align-items: center; gap: var(--s2); }
 .mm-led { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
 .mm-state[data-s="ready"] .mm-led { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 16%, transparent); }
@@ -1932,14 +2256,10 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
 .mm-state[data-s="error"] .mm-state-top b { color: var(--danger); }
 .mm-state-sub { font-size: var(--fs-11); color: var(--faint); }
 
-/* min-width 是下限而不是装饰：mm-band 是 flex-wrap，按钮不可压，
-   没有下限时 metrics 会被一直压到只剩几十像素（数值全变省略号），永远轮不到换行。 */
-.mm-metrics {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: var(--s2);
-  flex: 1;
-  min-width: min(240px, 100%);
+/* 「显存」卡与「模型状态」同宽同构，两块并排成一个读数组 */
+.mm-vram {
+  width: var(--mm-tile);
+  flex: none;
 }
 .mm-metric {
   display: flex;
@@ -1951,7 +2271,8 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   background: var(--surface-2);
   min-width: 0;
 }
-.mm-metric > span { font-size: var(--fs-11); color: var(--muted); }
+/* 与 .mm-tile-label 同排版：两块卡的首行高度一致，数值行才能对齐 */
+.mm-metric > span { font-size: var(--fs-11); color: var(--muted); line-height: 1; }
 .mm-metric > b {
   font-size: var(--fs-15);
   font-weight: 600;
@@ -1973,7 +2294,16 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.mm-ops { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
+/* 指标带只剩左侧两块（状态 + 显存），操作按钮用 auto 外边距吃掉中段空白、贴到右端，
+   与内容区右边缘对齐；窄屏整体换行时 auto 不会造成额外缩进。 */
+.mm-ops { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; margin-left: auto; }
+/* 三个动作只保留一个红实底：卸载的描边改回中性灰、只留红字表达危险，
+   否则「加载」和「卸载」两团红挨在一起互相抢焦点。悬停时再补红边。 */
+.mm-ops .btn.ghost.danger { border-color: var(--border); background: var(--surface); }
+.mm-ops .btn.ghost.danger:hover {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+}
 
 .mm-body { grid-template-columns: minmax(0, 1fr) 336px; }
 .mm-col { display: flex; flex-direction: column; }
@@ -2087,6 +2417,197 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
 .modal-foot { display: flex; gap: var(--s2); justify-content: flex-end; align-items: center; }
 .modal-foot input[type="text"] { flex: 1; min-width: 0; }
 
+/* ---------- 15b. 参考音频裁剪 ----------
+   颜色只用既有令牌：选区=数据蓝 --accent（"我框了哪一段"是数据，不是操作），
+   试听进度=品牌红 --primary（与参考音频区"已播部分"同色），
+   状态用 --ok/--warn/--danger 的左侧 3px 色条表达，不新增色相、不引入阴影。 */
+
+/* 参考音频区的超长提示（>15 秒才出现）。
+   文字用 --muted 而不是 --warn：#a0690a 在 --surface-2 上只有 4.44:1，
+   12px 小字压线不稳；把"注意"的颜色交给图标，正文保证可读。 */
+.spk-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s1);
+  margin: var(--s2) 0 0;
+  font-size: var(--fs-11);
+  line-height: 1.5;
+  color: var(--muted);
+}
+.spk-warn .ico { width: 13px; height: 13px; margin-top: 1px; color: var(--warn); }
+
+/* 「裁剪」与「更换音频」同为 ghost mini，但图标+文字之间收一档间距 */
+.ref-tool { flex: none; height: 26px; gap: var(--s1); }
+.ref-tool .ico { width: 13px; height: 13px; }
+
+.clip-modal {
+  width: min(720px, 100%);
+  gap: 0;                                  /* 各块间距按语义定，不用统一 gap */
+  padding: var(--s4);
+  max-height: calc(100vh - var(--s8) * 2);
+  overflow-y: auto;                        /* 只在小高度窗口里才会滚 */
+}
+.clip-head { display: flex; align-items: center; gap: var(--s2); margin-bottom: var(--s1); }
+.clip-head .modal-title { flex: 1; min-width: 0; margin: 0; }
+.clip-head .iconbtn { width: 26px; height: 26px; }
+.clip-meta {
+  margin: 0 0 var(--s3);
+  font-size: var(--fs-11);
+  line-height: 1.5;
+  color: var(--faint);
+  overflow-wrap: anywhere;
+}
+
+.clip-stage {
+  position: relative;
+  height: 124px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  overflow: hidden;
+  cursor: crosshair;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;            /* 拖把手时不要触发页面滚动 */
+}
+.clip-stage.dragging { cursor: grabbing; }
+/* 左右各留 10px：把手 17px 宽、居中在 0% 与 100% 时，整个把手仍在 stage 内可见
+   （留 8px 时 17px 的把手会被 clip 掉一半） */
+.clip-track { position: absolute; inset: 6px 10px; }
+#clipWave { display: block; width: 100%; height: 100%; }
+
+.clip-handle {
+  position: absolute;
+  top: 50%;
+  width: 17px;
+  height: 38px;
+  transform: translate(-50%, -50%);
+  display: grid;
+  place-items: center;
+  border: 1.5px solid var(--accent);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  cursor: ew-resize;
+  transition: background .12s ease, border-color .12s ease;
+}
+.clip-handle::after {
+  content: "";
+  width: 2px;
+  height: 16px;
+  border-radius: 1px;
+  background: var(--accent);
+}
+.clip-handle:hover { background: color-mix(in srgb, var(--accent) 12%, var(--surface)); }
+/* 拖动中：整块变实心，竖条反白。按下就亮，松手才灭 —— 这是「抓住了」的唯一视觉凭据，
+   否则只有光标从 crosshair 变 grabbing，在波形上几乎看不出来。 */
+.clip-handle.is-drag { background: var(--accent); border-color: var(--accent); }
+.clip-handle.is-drag::after { background: var(--surface); }
+.clip-handle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.clip-axis {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s2);
+  margin-top: var(--s2);
+  font-size: var(--fs-11);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.clip-range { color: var(--accent); font-weight: 600; }
+
+.clip-status {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-height: 34px;
+  margin-top: var(--s3);
+  padding: var(--s2) var(--s3);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--faint);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  font-size: var(--fs-12);
+  color: var(--muted);
+}
+.clip-status[data-tone="ok"] { border-left-color: var(--ok); }
+.clip-status[data-tone="warn"] { border-left-color: var(--warn); }
+.clip-status[data-tone="danger"] { border-left-color: var(--danger); }
+/* hint = 操作引导（「再拖 3px 开始重框」这种），比常规说明显眼、比警告轻 */
+.clip-status[data-tone="hint"] { border-left-color: var(--accent); color: var(--ink); }
+.clip-status-text { flex: 1; min-width: 0; line-height: 1.5; }
+.clip-status .btn { flex: none; height: 24px; }
+
+.clip-tools {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  flex-wrap: wrap;
+  margin-top: var(--s3);
+}
+.clip-presets { display: flex; gap: var(--s1); flex-wrap: wrap; }
+.clip-preview { margin-left: auto; }
+.clip-preview.playing { border-color: var(--accent); color: var(--accent); }
+.clip-preview.playing svg { display: none; }
+
+.clip-modal .modal-foot { margin-top: var(--s4); }
+
+/* ---------- 15c. 悬浮提示（自绘） ----------
+   原生 title 浮层由浏览器绘制，不在 DOM 里，CSS 碰不到；这里只负责外观，
+   接管逻辑与事件时机在 tip.js（完全对齐原生 title，改了外观不改手感）。
+
+   外观三条约束：
+   1. 它必须一眼看出不是系统气泡 —— 所以浅色下反相成深底浅字（--tip-bg/#26231f），
+      深色下抬到比卡片亮半档的暖灰。用 --surface 会和白卡片糊在一起。
+   2. 字号 12px 是中文下限（见令牌区注释），行高 1.6 让两行长文案不挤。
+   3. 它是一层临时浮层，允许破例用阴影（设计系统里阴影只给浮层），
+      但只投在下方，不要把整块页面压暗。 */
+#tip {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 9999;            /* 必须高于模态的 100：提示可能出现在弹窗里的控件上 */
+  max-width: min(340px, calc(100vw - 16px));
+  padding: 7px 10px;
+  border: 1px solid var(--tip-line);
+  border-radius: var(--r-sm);
+  background: var(--tip-bg);
+  color: var(--tip-ink);
+  font-family: var(--sans);
+  font-size: var(--fs-11);
+  font-weight: 400;
+  line-height: 1.6;
+  letter-spacing: .01em;
+  /* 部分文案用换行分段（术语「级联替换」那条），保留换行但仍按宽度折行，故是 pre-line */
+  white-space: pre-line;
+  overflow-wrap: break-word;
+  /* 中文默认可以在任意字间断行，于是短提示会被切成「可切 / 换…」这种词中间断口。
+     keep-all 让中文只在标点与空格处断，读起来是完整短语；真的遇到超长无标点
+     的句子，再由 overflow-wrap: break-word 兜底强制断开，不会溢出气泡。 */
+  word-break: keep-all;
+  box-shadow: 0 10px 24px -12px rgba(0, 0, 0, .55), 0 1px 3px rgba(0, 0, 0, .12);
+  pointer-events: none;     /* 不吃指针事件，否则会挡住下方元素并触发自己的 pointerout */
+  opacity: 0;
+  transition: opacity .1s ease;
+}
+#tip.on { opacity: 1; }
+
+/* 箭头：旋转 45° 的方块，只留朝外两条边；底色与气泡相同，正好盖住气泡那道边 */
+#tip::before {
+  content: "";
+  position: absolute;
+  left: var(--tip-arrow, 50%);
+  width: 8px;
+  height: 8px;
+  background: var(--tip-bg);
+  border: 1px solid var(--tip-line);
+  transform: translateX(-50%) rotate(45deg);
+}
+#tip[data-dir="down"]::before { top: -5px; border-right: 0; border-bottom: 0; }
+#tip[data-dir="up"]::before { bottom: -5px; border-left: 0; border-top: 0; }
+/* 元素太窄 / 贴着视口边缘时箭头顶不到元素中心，宁可不画，也别指到空气里 */
+#tip[data-arrow="0"]::before { display: none; }
+
 /* ---------- 16. 响应式（4 档） ----------
    1600 宽屏 / 1241–1599 标准 / 769–1240 单列 / ≤768 手机。
    旧的 1280 / 1180 / 1080 / 980 / 480 全部并入这四档。 */
@@ -2094,7 +2615,8 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
 /* 宽屏：中间栏能拿到更多，两侧固定档放宽（1920/2560 上不留大块空白） */
 @media (min-width: 1600px) {
   .page[data-page="gen"].cur {
-    grid-template-columns: minmax(560px, 620px) minmax(0, 1fr) 300px;
+    --gen-left: minmax(560px, 620px);
+    --gen-hist: 300px;
   }
   .brand small { display: inline; }
 }
@@ -2125,8 +2647,14 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   .page:not([data-page="gen"]).cur { overflow: visible; }
   .ops, .histbar, .resultcard, .mg-card { overflow: visible; }
   .resultcard > .ph, .resultcard > .sc-loading, .resultcard > #resultBody { overflow: visible; }
-  .resultcard > .history { position: static; }
-  .history { position: static; margin-top: var(--s4); }
+  .resultcard > .history { position: relative; }
+  /* 单列下 .history 退回 static（不再是定位祖先），伪元素那条顶边线
+     会飘到更外层祖先上，必须补 relative 把它拉回来。 */
+  .history { position: relative; margin-top: var(--s4); }
+
+  /* 页面转单列后结果卡变宽，编辑区跟着堆成上下两行：
+     滑轨重新铺满整行（跟上面的波形同宽），"半宽窄滑轨"只在宽屏三栏时成立。 */
+  .edit-rows { grid-template-columns: minmax(0, 1fr); gap: var(--s3); }
 
   .mg-body, .mm-body { grid-template-columns: minmax(0, 1fr); gap: var(--s4); }
   .mg-side { flex-direction: row; flex-wrap: wrap; align-items: center; gap: var(--s1); }
@@ -2136,7 +2664,6 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   .pm-nav-row { width: auto; }
   .mg-side-foot { display: none; }
   input.mg-search { width: 100%; margin-left: 0; order: 3; }
-  .mm-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .mm-band { gap: var(--s2); }
 }
 
@@ -2145,7 +2672,8 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   :root { --pad: var(--s3); --gap: var(--s3); }
   .hdr-row { padding: var(--s2) var(--s3); gap: var(--s1) var(--s2); }
   main#pages { padding-left: var(--s3); padding-right: var(--s3); }
-  footer { padding: 0 var(--s3) var(--s4); }
+  footer { padding: var(--s3) var(--s3) var(--s4); }
+  footer::before { inset: 0 var(--s3) auto; }
   #waveHeader { display: none; }
   .spacer { display: none; }
   .pill { font-size: var(--fs-11); }
@@ -2157,6 +2685,9 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   #tabs { order: 4; width: 100%; justify-content: flex-start; }
   .tab { flex: 1; padding: 0 var(--s2); text-align: center; }
   #themeBtn { position: fixed; top: var(--s2); right: 10px; order: 0; z-index: 20; }
+  /* 主题按钮在手机上脱离文档流（fixed 到右上角），工具组不能再往右推，
+     否则外链两个图标会正好压在它下面；贴着设备胶囊即可。 */
+  .hdr-tools { margin-left: 0; }
 
   .brand small { display: none; }
   .bigplayer { flex-direction: column; align-items: stretch; }
@@ -2173,6 +2704,40 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   .out-foot .btn { width: 100%; }
   .mg-top-r .btn { flex: 1; }
   .mm-ops .btn { flex: 1; }
+  /* 手机上状态与显存各占一半并排，操作按钮整行：避免两块不同宽度参差堆叠 */
+  .mm-state, .mm-vram { flex: 1 1 0; min-width: 0; width: auto; }
+
+  /* 裁剪弹窗：视口高度低于桌面时波形收一档，其余靠内部滚动 */
+  .clip-modal { padding: var(--s3); max-height: calc(100vh - var(--s6) * 2); }
+  .clip-stage { height: 96px; }
+}
+
+/* 窄屏（≤480）：第一行已经放不下「品牌 + 两个状态胶囊 + 外链组」，
+   而且主题按钮是 fixed 在右上角的，外链组挤在第一行末端会正好压到它。
+   与其让外链组单独占一行（手机顶栏从 3 行涨到 4 行），不如排到页签那一行的尾部。
+   margin-right:28px 让开右上角那个 fixed 主题按钮（right:10 + 28 宽，与 12px 内边距
+   的固定差值是 26px，再留 2px 呼吸）。
+   ≤360 时页签可用宽度只剩 ~200px，把页签内边距收到 4px，四个字仍能单行显示。 */
+@media (max-width: 480px) {
+  #tabs { width: auto; flex: 1 1 auto; }
+  .hdr-tools { order: 5; margin-left: auto; margin-right: 28px; }
+  /* 裁剪弹窗：三个快捷档 + 试听在 390px 挤成两截参差，改成各占一行；
+     三个快捷档等分铺满，与下面整行的「试听选区」左边缘对齐。 */
+  .clip-presets { flex: 1 1 100%; }
+  .clip-presets .btn { flex: 1 1 0; min-width: 0; }
+  .clip-preview { margin-left: 0; flex: 1 1 100%; justify-content: center; }
+
+  /* 参考音频行：「播放 + 时间 + 文件名 + 裁剪 + 更换音频」在 390px 一行装不下，
+     文件名会被压到 25px（只剩省略号）。放不下就分两行：先信息、后操作。 */
+  .refrow { flex-wrap: wrap; row-gap: var(--s1); }
+  .ref-name { flex: 1 1 120px; }
+  .ref-tool, .ref-change { order: 5; flex: 1 1 0; }
+}
+@media (max-width: 360px) {
+  .tab { padding: 0 2px; }
+  /* 320px 上「三个页签 + 两个外链图标 + 让位右上角主题按钮」差几个像素装不下，
+     页签内边距与外链间距各收一档即可同排，不必让页签行裂成两行。 */
+  .hdr-links { gap: 2px; }
 }
 
 /* 尊重系统「减少动态效果」 */

@@ -10,6 +10,7 @@ import gc
 import hashlib
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -65,6 +66,7 @@ from indextts.utils.server_helpers import (
     clean_legacy_prompts as _clean_legacy_prompts_impl,
     looks_like_audio as _looks_like_audio,
     cap_prompt_files as _cap_prompt_files,
+    normalize_emo_vec as _normalize_emo_vec,
     ensure_wetext_ascii_path,
     AUDIO_MAX_BYTES,
 )
@@ -288,7 +290,9 @@ class LazyTTS:
         return self.ensure_loaded().infer(*args, **kwargs)
 
     def normalize_emo_vec(self, *args, **kwargs):
-        return self.ensure_loaded().normalize_emo_vec(*args, **kwargs)
+        # 故意不走 ensure_loaded()：这只是 8 个数的乘加，为此加载 6.7GB 模型
+        # 是最贵的错误（详见 server_helpers.normalize_emo_vec 的注释）。
+        return _normalize_emo_vec(*args, **kwargs)
 
     def _apply_backend_flags(self):
         """Apply the live cuDNN benchmark flag.
@@ -479,6 +483,66 @@ def _clamp_seg_tokens(value: int) -> int:
     return n
 
 
+# 生成参数（前端"高级参数"折叠里的 8 个数值）的合法区间，与 web/index.html
+# 对应滑块的 min/max 同口径：
+#   #emoWeight 0~1 / #temperature 0.1~2 / #topP 0~1 / #topK 0~100（0=关闭过滤，比滑块多一个 0）
+#   #numBeams 1~10 / #maxMel 50~1815 / #repPen 0.1~20 / #lenPen -2~2
+# 前端只是 UI 约束，API 必须自己把关——之前这 8 项原样透给模型，于是
+# temperature=0、num_beams=0 这类值会直接进采样/束搜索，报错信息与输入毫无
+# 关系，严重时卡死。
+#
+# 为什么这 8 项「夹取」而不是像每段 token 那样直接 400：
+#   - 越界的后果只是音质/耗时变差，不像段长那样会崩溃或让段数爆炸；
+#   - 调用方通常把自己一整套配置原样透传，1e-7 量级的浮点误差不该让整个
+#     生成失败。夹到边界 + 记一条 warning，任务仍能正常出结果。
+# 每段 token 仍是 400，因为它越界会直接抛 range() 错误（见 _clamp_seg_tokens）。
+GEN_PARAMS = (
+    # (表单字段, 下界, 上界, 是否整数, 默认值)
+    ("emo_weight", 0.0, 1.0, False, 0.65),
+    ("temperature", 0.1, 2.0, False, 0.8),
+    ("top_p", 0.0, 1.0, False, 0.8),
+    # 下界取 0 而不是滑块的 1：0 在生成接口里是「关闭 top_k 过滤」的行家写法
+    # （下游 1498 行把 0 转成 None）。夹到 1 会把「不过滤」变成「只留最高概率
+    # 的那一个 token」，语义正好拧反，音质会明显受损。
+    ("top_k", 0, 100, True, 30),
+    ("num_beams", 1, 10, True, 3),
+    ("max_mel_tokens", 50, 1815, True, 1500),
+    # 下界 1.0 而不是 0.1：该参数直通 HF 的 RepetitionPenaltyLogitsProcessor，
+    # 语义是 penalty<1 "鼓励重复"（score<0 ? score*penalty : score/penalty），
+    # 不是"更弱的惩罚"。实测 0.5 会 100% 生成到撞 max_mel_tokens 上限（音频
+    # 29.95s vs 正常 3.4s），0.1 更会让 CUDA 报 device-side assert 并把上下文
+    # 打死——之后连默认参数都失败，且 unload/load 救不回来，只能重启进程。
+    ("repetition_penalty", 1.0, 20.0, False, 10.0),
+    ("length_penalty", -2.0, 2.0, False, 0.0),
+)
+
+
+def _clamp_gen_params(values: dict) -> dict:
+    """把 8 个生成参数夹到合法区间，非有限值回退默认值。
+
+    NaN / inf 单独处理是有原因的：float("nan") 能被正常解析，于是
+    temperature=nan 会一路带进采样和束搜索，结果是整段静音或直接崩在 CUDA
+    kernel 里，而报错信息跟"参数填错"毫无关系。
+    """
+    out = {}
+    for field, lo, hi, integer, dflt in GEN_PARAMS:
+        raw = values.get(field, dflt)
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            logger.warning("参数 %s=%r 不是数字，回退默认值 %s", field, raw, dflt)
+            v = float(dflt)
+        else:
+            if not math.isfinite(v):
+                logger.warning("参数 %s=%r 不是有限数，回退默认值 %s", field, raw, dflt)
+                v = float(dflt)
+            elif v < lo or v > hi:
+                logger.warning("参数 %s=%s 超出范围 [%s, %s]，已夹到边界", field, v, lo, hi)
+                v = min(max(v, lo), hi)
+        out[field] = int(round(v)) if integer else v
+    return out
+
+
 def _validate_audio_upload(data: bytes, label: str) -> None:
     """上传校验：大小上限 + 常见音频容器的魔数嗅探，在落盘前给出可读的 4xx。
 
@@ -536,9 +600,41 @@ import shutil
 import subprocess as _sp
 
 
+# NVIDIA 在 Windows 上有两个安装位置：
+#   新驱动（R440 起）→ %SystemRoot%\System32，天然在 DLL/PATH 搜索范围里；
+#   老驱动、部分 OEM 驱动 → %ProgramFiles%\NVIDIA Corporation\NVSMI\，**不在 PATH**。
+# 只按裸名找，会在老驱动机器上让 NVML 和 nvidia-smi 两条通道一起失效 ——
+# 表现就是别人机器上 GPU/显存两块仪表整块消失、设备名显示成 CPU。
+def _nvsmi_dir():
+    """NVIDIA 老式安装目录（多数机器上并不存在）。"""
+    pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    return os.path.join(pf, "NVIDIA Corporation", "NVSMI")
+
+
+_SMI_EXE = {"path": None, "t": 0.0}
+_SMI_EXE_RETRY_SEC = 60.0
+
+
+def _smi_exe():
+    """定位 nvidia-smi.exe：PATH 优先，其次 NVSMI 目录。找不到则 60s 后再试。"""
+    if _SMI_EXE["path"]:
+        return _SMI_EXE["path"]
+    now = time.time()
+    if _SMI_EXE["t"] and now - _SMI_EXE["t"] < _SMI_EXE_RETRY_SEC:
+        return None
+    _SMI_EXE["t"] = now
+    exe = shutil.which("nvidia-smi")
+    if not exe and sys.platform == "win32":
+        cand = os.path.join(_nvsmi_dir(), "nvidia-smi.exe")
+        if os.path.isfile(cand):
+            exe = cand
+    _SMI_EXE["path"] = exe
+    return exe
+
+
 def _nvidia_smi(query: str):
     """兜底通道：fork nvidia-smi 解析 stdout。"""
-    exe = shutil.which("nvidia-smi")
+    exe = _smi_exe()
     if not exe:
         return None
     try:
@@ -570,19 +666,40 @@ class _NvmlMem(ctypes.Structure):
 # Unknown Error"（驱动升级后命令行外壳与驱动不自洽），但它依赖的 nvml.dll
 # 完全正常。旧实现只走 nvidia-smi，一次失败就让显存 / 利用率永久显示 "--"。
 # 顺带收益：不用每次刷新都 fork 一个 ~200ms 的子进程。
-_NVML_LIBS = (
-    ("nvml.dll",) if sys.platform == "win32"
-    else ("libnvidia-ml.so.1", "libnvidia-ml.so")
-)
-_NVML = {"lib": None, "handle": None, "dead": False}
+def _nvml_libs():
+    """候选 DLL，按可靠性排序：裸名（System32 在搜索路径里）→ NVSMI 全路径。"""
+    if sys.platform == "win32":
+        cands = ["nvml.dll"]
+        legacy = os.path.join(_nvsmi_dir(), "nvml.dll")
+        if os.path.isfile(legacy):
+            cands.append(legacy)
+        return tuple(cands)
+    return ("libnvidia-ml.so.1", "libnvidia-ml.so")
+
+
+_NVML_LIBS = _nvml_libs()
+_NVML = {"lib": None, "handle": None, "dead": False, "dead_t": 0.0}
+# 加载失败后的冷却时间。旧实现一旦失败就把 dead 钉死到进程结束 ——
+# 开机自启时驱动往往比服务晚就绪，那一次失败会让 GPU 指标整场缺席。
+_NVML_RETRY_SEC = 15.0
+
+
+def _nvml_fail():
+    """标记 NVML 不可用并开始冷却；冷却到期后 _nvml_open 会重试一次。"""
+    _NVML["dead"] = True
+    _NVML["dead_t"] = time.time()
+    return False
 
 
 def _nvml_open() -> bool:
-    """惰性加载 nvml 并缓存 device 0 句柄；加载失败则永久跳过，交给 smi 兜底。"""
+    """惰性加载 nvml 并缓存 device 0 句柄；加载失败则冷却后再试，期间交给 smi 兜底。"""
     if _NVML["handle"] is not None:
         return True
     if _NVML["dead"]:
-        return False
+        if time.time() - _NVML["dead_t"] < _NVML_RETRY_SEC:
+            return False
+        _NVML["dead"] = False
+        _NVML["lib"] = None
     lib = None
     for name in _NVML_LIBS:
         try:
@@ -591,14 +708,12 @@ def _nvml_open() -> bool:
         except OSError:
             continue
     if lib is None:
-        _NVML["dead"] = True
-        return False
+        return _nvml_fail()
     try:
         init = getattr(lib, "nvmlInit_v2", None) or lib.nvmlInit
         init.restype = ctypes.c_int
         if init() != 0:
-            _NVML["dead"] = True
-            return False
+            return _nvml_fail()
         get_handle = (
             getattr(lib, "nvmlDeviceGetHandleByIndex_v2", None)
             or lib.nvmlDeviceGetHandleByIndex
@@ -607,8 +722,7 @@ def _nvml_open() -> bool:
         get_handle.restype = ctypes.c_int
         handle = ctypes.c_void_p()
         if get_handle(0, ctypes.byref(handle)) != 0 or not handle.value:
-            _NVML["dead"] = True
-            return False
+            return _nvml_fail()
         lib.nvmlDeviceGetUtilizationRates.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(_NvmlUtil)
         ]
@@ -622,38 +736,47 @@ def _nvml_open() -> bool:
             get_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint]
             get_name.restype = ctypes.c_int
     except Exception:
-        _NVML["dead"] = True
-        return False
+        return _nvml_fail()
     _NVML["lib"], _NVML["handle"] = lib, handle
     return True
 
 
 def _nvml_reads():
-    """一次读齐 (util%, used_mb, total_mb, name)；任一环节失败返回 None。"""
+    """一次读齐 (util%, used_mb, total_mb, name)。
+
+    四项相互独立：某一项读不到只该是 None，不能连其它项一起丢。旧实现在
+    util 失败时直接 return None，把本来读得到的显存也一起扔了 —— 部分老卡和
+    虚拟化环境的 utilization 会返回 NOT_SUPPORTED，于是整块指标消失。
+    全部读不到才返回 None，交给 nvidia-smi 兜底。
+    """
     if not _nvml_open():
         return None
     lib, handle = _NVML["lib"], _NVML["handle"]
+    util_pct = used_mb = total_mb = name = None
     try:
         util = _NvmlUtil()
-        if lib.nvmlDeviceGetUtilizationRates(handle, ctypes.byref(util)) != 0:
-            return None
+        if lib.nvmlDeviceGetUtilizationRates(handle, ctypes.byref(util)) == 0:
+            util_pct = int(util.gpu)
+    except Exception:
+        pass
+    try:
         mem = _NvmlMem()
-        if lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem)) != 0:
-            return None
-        name = None
+        if lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem)) == 0:
+            used_mb = int(mem.used) // 1024**2
+            total_mb = int(mem.total) // 1024**2
+    except Exception:
+        pass
+    try:
         get_name = getattr(lib, "nvmlDeviceGetName", None)
         if get_name is not None:
             buf = ctypes.create_string_buffer(96)
             if get_name(handle, buf, len(buf)) == 0:
                 name = buf.value.decode("utf-8", "replace").strip() or None
-        return (
-            int(util.gpu),
-            int(mem.used) // 1024**2,
-            int(mem.total) // 1024**2,
-            name,
-        )
     except Exception:
+        pass
+    if util_pct is None and used_mb is None and name is None:
         return None
+    return (util_pct, used_mb, total_mb, name)
 
 
 # 静态信息（型号 / 显存总量）缓存，但失败后每 15s 允许重试一次：
@@ -672,7 +795,7 @@ def _gpu_static_info():
     _gpu_info_cache["t"] = now
 
     r = _nvml_reads()
-    if r is not None:
+    if r is not None and (r[3] or r[2]):
         # 个别驱动版本读不到型号名；退化成 "GPU" 也强过整块指标消失
         info = {"name": r[3] or "GPU", "vram_total_mb": r[2] or None}
     else:
@@ -723,13 +846,19 @@ def metrics():
     gpu = _gpu_static_info()
     if gpu:
         util, used = _gpu_readings()
-        if util is not None and used is not None:
+        # 两项各自独立：某个驱动把 utilization 报成 "N/A" 时，不该连显存一起丢
+        if util is not None:
             try:
                 data["gpu_percent"] = int(util)
-                data["vram_used_mb"] = int(used)
-                data["vram_total_mb"] = gpu.get("vram_total_mb") or 0
             except (TypeError, ValueError):
-                pass  # 个别驱动返回 "N/A"，宁可少两项也不让整次轮询 500
+                pass
+        if used is not None:
+            try:
+                data["vram_used_mb"] = int(used)
+            except (TypeError, ValueError):
+                pass
+        if gpu.get("vram_total_mb"):
+            data["vram_total_mb"] = int(gpu["vram_total_mb"])
     data["gpu_name"] = (gpu or {}).get("name")
     return data
 
@@ -737,10 +866,37 @@ def metrics():
 # ---- web UI: static files live in web/ and are served from the site root ----
 _WEB_DIR = os.path.join(current_dir, "web")
 
-# 静态资源内容指纹：启动时读 web/ 下各文件 md5 前 8 位作版本号，注入 index.html
+# 静态资源内容指纹：读 web/ 下各文件 md5 前 8 位作版本号，注入 index.html
 # 的 ?v= 占位符。文件改动 → 指纹变 → URL 变，配合长缓存头让浏览器自动拉新，
 # 不再手工维护 ?v=20260912 这类日期版本号。
-_ASSET_FINGERPRINT = {}
+# （结果只存在下面的 _ASSET_FP_CACHE 里；原先另有一个只写不读的指纹字典，
+#   属于死状态，已删。）
+
+# 指纹缓存：fname -> ((mtime_ns, size), md5_8)
+# 原来的实现只在进程启动时算一遍并常驻内存，文件改了字典也不会变 —— 于是改个
+# CSS 也必须重启进程才能让浏览器拿到新 URL，而重启会把显存里的模型一并释放，
+# 下次还得重新加载。改成请求时按 mtime 判活：没改过就直接用缓存，改过才重算，
+# 代价是几次 os.stat（微秒级），换来「改前端只需刷新浏览器」。
+_ASSET_FP_CACHE = {}
+
+
+def _fingerprint(fname: str) -> str:
+    path = os.path.join(_WEB_DIR, fname)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "0"
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _ASSET_FP_CACHE.get(fname)
+    if hit and hit[0] == key:
+        return hit[1]
+    try:
+        with open(path, "rb") as f:
+            fp = hashlib.md5(f.read()).hexdigest()[:8]
+    except OSError:
+        return "0"
+    _ASSET_FP_CACHE[fname] = (key, fp)
+    return fp
 
 
 def _build_asset_fingerprints():
@@ -748,10 +904,7 @@ def _build_asset_fingerprints():
         fpath = os.path.join(_WEB_DIR, fname)
         if not os.path.isfile(fpath) or fname == "index.html":
             continue
-        try:
-            with open(fpath, "rb") as f:
-                _ASSET_FINGERPRINT[fname] = hashlib.md5(f.read()).hexdigest()[:8]
-        except OSError:
+        if _fingerprint(fname) == "0":
             continue
 
 
@@ -764,9 +917,27 @@ def _asset_response(name: str):
     静态资源带一年 immutable 缓存：URL 中的 ?v= 内容指纹变了浏览器才会拉新，
     所以可以放心让浏览器与磁盘缓存长期复用（app.js 52KB + style.css 32KB
     每次刷新都重新下载纯属浪费）。
+
+    例外：web/fonts/ 下的字体文件（100+ 片 woff2）走相对路径引用，
+    按子目录整体放行，其余仍只认 basename，防目录穿越。
     """
     fname = os.path.basename(name)
-    path = os.path.join(_WEB_DIR, fname)
+    if "/" in name or "\\" in name:
+        # 只放行 fonts/ 开头的子目录（fonts/noto/xxx.woff2、fonts/inter/xxx.woff2），
+        # 且必须仍在 fonts/ 内 —— 其余一律拒绝，防目录穿越。
+        parts = [p for p in name.replace("\\", "/").split("/") if p]
+        if len(parts) < 2 or parts[0] != "fonts":
+            raise HTTPException(404, "Not found")
+        if any(p in (".", "..") for p in parts):
+            raise HTTPException(404, "Not found")
+        rel = os.path.join(*parts)
+        path = os.path.normpath(os.path.join(_WEB_DIR, rel))
+        fonts_root = os.path.join(_WEB_DIR, "fonts")
+        if not path.startswith(fonts_root + os.sep):
+            raise HTTPException(404, "Not found")
+        fname = os.path.basename(path)
+    else:
+        path = os.path.join(_WEB_DIR, fname)
     if not os.path.isfile(path):
         raise HTTPException(404, "Not found")
     media = {
@@ -793,12 +964,13 @@ def index():
             html = f.read()
     except OSError as e:
         raise HTTPException(500, f"Failed to read index.html: {e}")
-    # 把 ?v=xxx 占位符替换为内容指纹；favicon 之类没指纹的保持原样
-    html = re.sub(r'\?v=\{([a-z0-9_.]+)\}', lambda m: f"?v={_ASSET_FINGERPRINT.get(m.group(1), '0')}", html)
+    # 把 ?v=xxx 占位符替换为内容指纹；favicon 之类没指纹的保持原样。
+    # 每次请求现算（带 mtime 缓存），改完前端刷新即可生效，不必重启服务。
+    html = re.sub(r'\?v=\{([a-z0-9_.]+)\}', lambda m: f"?v={_fingerprint(m.group(1))}", html)
     return Response(content=html, media_type="text/html", headers={"Cache-Control": "no-cache"})
 
 
-@app.get("/assets/{name}")
+@app.get("/assets/{name:path}")
 def asset(name: str):
     return _asset_response(name)
 
@@ -990,7 +1162,10 @@ def _prune_finished_jobs():
     stale = [
         job_id for job_id, job in _JOBS.items()
         if job.get("state") in ("done", "error", "cancelled", "stopped")
-        and now - job.get("finished_at", 0) >= JOB_RETENTION_SECONDS
+        # finished_at 兜底：排队中就被取消的任务不经过 worker 收尾，历史上
+        # 这里是 None，`now - None` 会抛 TypeError，把 /jobs/* 和下一次提交
+        # 全打成 500。`or now` 把 None 当"刚结束"，照样保留完整的 300 秒。
+        and now - (job.get("finished_at") or now) >= JOB_RETENTION_SECONDS
     ]
     for job_id in stale:
         _JOBS.pop(job_id, None)
@@ -1065,6 +1240,11 @@ def tts_cancel(job_id: str):
         state = job["state"]
         if state == "queued":
             job["state"] = "cancelled"
+            # 排队中的任务还没进 worker，没人会给它写 finished_at。这里必须
+            # 自己写：否则 finished_at 停在 None，下次 _prune_finished_jobs
+            # 做 now - None 会抛 TypeError，把 /jobs/current、/jobs/{id} 和
+            # 下一次提交（_register_job）全部变成 500。
+            job["finished_at"] = time.time()
             state = "cancelled"
     return {"ok": True, "state": state}
 
@@ -1084,6 +1264,9 @@ def tts_stop(job_id: str, keep_model: bool = False):
         state = job["state"]
         if state == "queued":
             job["state"] = "cancelled"
+            # 与 tts_cancel 同理：没进 worker 就没有收尾代码写 finished_at，
+            # 留成 None 会让 _prune_finished_jobs 抛 TypeError。
+            job["finished_at"] = time.time()
             state = "cancelled"
         elif state == "running":
             job["state"] = "stop_requested"
@@ -1148,6 +1331,26 @@ def do_tts(
     # 422 拒绝，和其它 int 参数（max_text_tokens_per_segment 等）行为一致，
     # 这里只需要夹一下范围，不需要再转一次。
     interval_silence = max(10, min(500, interval_silence))
+    # 8 个生成参数统一夹取（区间与前端滑块同口径，见 GEN_PARAMS 上方注释）。
+    # 这里必须在建 job 之前完成：越界值一旦进了推理线程，报错就与输入无关了。
+    _gen = _clamp_gen_params({
+        "emo_weight": emo_weight,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "num_beams": num_beams,
+        "max_mel_tokens": max_mel_tokens,
+        "repetition_penalty": repetition_penalty,
+        "length_penalty": length_penalty,
+    })
+    emo_weight = _gen["emo_weight"]
+    temperature = _gen["temperature"]
+    top_p = _gen["top_p"]
+    top_k = _gen["top_k"]
+    num_beams = _gen["num_beams"]
+    max_mel_tokens = _gen["max_mel_tokens"]
+    repetition_penalty = _gen["repetition_penalty"]
+    length_penalty = _gen["length_penalty"]
     text_warn = None
     if len(text) > TEXT_CHARS_SOFT:
         # 只警告不拦。段数估算按中文约 1.31 token/字、默认每段 120 token
@@ -1217,7 +1420,8 @@ def do_tts(
     elif mode == 1:
         vec = None
     elif mode == 2:
-        vec = tts.normalize_emo_vec(
+        # 纯数学，不加载模型（见 _normalize_emo_vec 的注释）
+        vec = _normalize_emo_vec(
             [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8], apply_bias=True
         )
     else:
@@ -1340,9 +1544,14 @@ def do_tts(
                 _INFER_LOCK.release()
         except Exception as e:
             logger.error("TTS worker crashed: %s", e, exc_info=True)
-            # 兜底:任何未捕获异常都必须以终止事件收尾,否则 SSE 会永久挂起
+            # 兜底:任何未捕获异常都必须以终止事件收尾,否则 SSE 会永久挂起。
+            # 有些异常 str() 为空(如裸 RuntimeError()),直接插值会让前端只看到
+            # 「Inference failed: 」后面一片空白,用户无从判断。此处退回异常类名。
+            _msg = str(e).strip()
+            if not _msg or _msg == "None":
+                _msg = f"{type(e).__name__}（无错误信息，详见服务端日志）"
             try:
-                record_event({"type": "error", "detail": f"Inference failed: {e}"})
+                record_event({"type": "error", "detail": f"Inference failed: {_msg[:300]}"})
             except Exception:
                 progress_q.put({"type": "error", "detail": "Inference failed"})
 
@@ -1575,7 +1784,10 @@ async def audio_tempo(file: UploadFile = File(...), rate: float = Form(...)):
         raise HTTPException(
             400, f"变速倍率超出范围（{rate}，允许 {_TEMPO_MIN}–{_TEMPO_MAX}）"
         )
-    loop = asyncio.get_event_loop()
+    # get_running_loop：本函数是 async def，一定在事件循环里跑。
+    # get_event_loop() 在 3.10+ 无运行循环时已弃用（会 DeprecationWarning），
+    # 这里取到的本来就是同一个循环，换成不会告警的写法。
+    loop = asyncio.get_running_loop()
     try:
         with tempfile.TemporaryDirectory() as td:
             in_path = os.path.join(td, "in.wav")
@@ -1591,25 +1803,47 @@ async def audio_tempo(file: UploadFile = File(...), rate: float = Form(...)):
 
 
 # ---- generation history -------------------------------------------------------
-# Scope: this server run only (in-memory, nothing persisted). Writes happen from
-# the inference thread, which _INFER_LOCK already serializes, so the list needs no
-# lock of its own -- reads just take a snapshot of an append-only list.
+# Scope: this server run only (in-memory, nothing persisted).
+# 列表不再只由推理线程写：HTTP 线程会清空/单条删除，因此有自己的锁。
+# 音频文件的删除一律丢到后台线程——删除在网络盘、杀软扫描、文件被占用时会长时间
+# 阻塞，以前它发生在推理线程里、且在 done 事件之前，一阻塞用户就永久卡在
+# 「saving audio...」，整个服务排队。
 HISTORY_LIMIT = 20          # auto-clean keeps the newest N; older entries drop off
 
 _history = []               # newest first
 _history_auto_clean = True
+_HISTORY_LOCK = threading.Lock()
+
+
+def _delete_audio_async(file_names) -> None:
+    """Delete output wavs on a daemon thread so a slow disk can't stall anything.
+
+    最坏情况只是文件暂时残留（甚至删不掉），服务本身照常可用——这是刻意的取舍：
+    宁可漏清理，不可让生成或删除请求卡住。
+    """
+    names = [n for n in file_names if n]
+    if not names:
+        return
+
+    def run():
+        for n in names:
+            try:
+                os.remove(os.path.join(OUTPUTS_DIR, os.path.basename(n)))
+            except OSError:
+                pass
+
+    threading.Thread(target=run, name="history-delete", daemon=True).start()
 
 
 def _history_trim():
-    """Drop entries past HISTORY_LIMIT, deleting their audio files too."""
-    while len(_history) > HISTORY_LIMIT:
-        old = _history.pop()
-        if not _history_auto_clean:
-            continue
-        try:
-            os.remove(os.path.join(OUTPUTS_DIR, os.path.basename(old["file"])))
-        except OSError:
-            pass
+    """Drop entries past HISTORY_LIMIT; their files go on a background thread."""
+    victims = []
+    with _HISTORY_LOCK:
+        while len(_history) > HISTORY_LIMIT:
+            victims.append(_history.pop())
+    # 条目该丢还是要丢（不论 auto_clean 开关），只有删文件受开关控制
+    if _history_auto_clean:
+        _delete_audio_async([e["file"] for e in victims])
 
 
 def _history_add(file_name: str, text: str, elapsed: float, emo_mode: int) -> dict:
@@ -1629,18 +1863,22 @@ def _history_add(file_name: str, text: str, elapsed: float, emo_mode: int) -> di
         "size": size,
         "created_at": time.time(),
     }
-    _history.insert(0, entry)
+    with _HISTORY_LOCK:
+        _history.insert(0, entry)
+    # trim 只做"从列表里摘掉"，文件删除已丢后台，所以这里不会阻塞推理线程
     _history_trim()
     return entry
 
 
 @api.get("/history")
 def history_list():
+    with _HISTORY_LOCK:
+        items = list(_history)          # 快照：避免边删边读拿到不一致的列表
     return JSONResponse({
-        "items": _history,
+        "items": items,
         "limit": HISTORY_LIMIT,
         "auto_clean": _history_auto_clean,
-        "count": len(_history),
+        "count": len(items),
     })
 
 
@@ -1648,41 +1886,42 @@ def history_list():
 def history_config(auto_clean: bool = Form(...)):
     global _history_auto_clean
     _history_auto_clean = bool(auto_clean)
-    return JSONResponse({"auto_clean": _history_auto_clean, "count": len(_history)})
+    with _HISTORY_LOCK:
+        count = len(_history)
+    return JSONResponse({"auto_clean": _history_auto_clean, "count": count})
 
 
 @api.delete("/history")
 def history_clear():
-    """Clear the list; with auto-clean on, the audio files go too."""
-    removed = len(_history)
+    """Clear the list; with auto-clean on, the audio files go too (in background)."""
+    with _HISTORY_LOCK:
+        removed = len(_history)
+        victims = [e["file"] for e in _history]
+        _history.clear()
+    # 列表立刻清空（用户视角已生效），文件删除丢后台，删除慢了也不拖住这个请求
     if _history_auto_clean:
-        for e in list(_history):
-            try:
-                os.remove(os.path.join(OUTPUTS_DIR, os.path.basename(e["file"])))
-            except OSError:
-                pass
-    _history.clear()
+        _delete_audio_async(victims)
     return JSONResponse({"ok": True, "removed": removed, "count": 0})
 
 
 @api.delete("/history/{item_id}")
 def history_remove(item_id: str):
-    hit = None
-    for e in _history:
-        if e["id"] == item_id:
-            hit = e
-            break
+    with _HISTORY_LOCK:
+        hit = None
+        for e in _history:
+            if e["id"] == item_id:
+                hit = e
+                break
+        # 原地删除：_history 是全局单例，推理线程会向它 insert；此处一旦重绑定
+        # 新列表，并发插入会落到被丢弃的旧列表上（条目和自动清理都丢）。
+        if hit is not None:
+            _history.remove(hit)
+        count = len(_history)
     if hit is None:
         raise HTTPException(404, "History entry not found")
-    # 原地删除：_history 是全局单例，推理线程会向它 insert；此处一旦重绑定
-    # 新列表，并发插入会落到被丢弃的旧列表上（条目和自动清理都丢）。
-    _history.remove(hit)
     if _history_auto_clean:
-        try:
-            os.remove(os.path.join(OUTPUTS_DIR, os.path.basename(hit["file"])))
-        except OSError:
-            pass
-    return JSONResponse({"ok": True, "count": len(_history)})
+        _delete_audio_async([hit["file"]])
+    return JSONResponse({"ok": True, "count": count})
 
 
 @api.get("/presets")
@@ -1721,6 +1960,24 @@ def presets_create(
 ):
     name = _fix_mojibake(name)
     emo_text = _fix_mojibake(emo_text)
+    # safe_preset_name 会把 ". / _ / 空格" 这类净化后为空的名字兜底成 "untitled"。
+    # 以前这种输入会静默建成一个不叫用户所填名字的预设并返回 200，误操作几次
+    # 列表里就堆一串 untitled。这里显式拒绝，而真正想叫 untitled 的不受影响。
+    if safe_preset_name(name) == "untitled" and name.strip() != "untitled":
+        raise HTTPException(400, "预设名不能为空或只含符号（. / _ / 空格等），请换一个名字")
+    # 落盘的参数也要夹：预设是把"上次用的配置"存起来复用，存进 JSON 的越界值
+    # 会原样显示在预设卡片上（例如温度 9），应用时又要在 do_tts 里被夹一次。
+    # 同一个 helper 处理，保证存进去的就是真正会生效的值。
+    _gen = _clamp_gen_params({
+        "emo_weight": emo_weight,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "num_beams": num_beams,
+        "max_mel_tokens": max_mel_tokens,
+        "repetition_penalty": repetition_penalty,
+        "length_penalty": length_penalty,
+    })
     # 同名保护：未显式声明 overwrite 时返回 409，由前端弹确认，不再静默覆盖
     if preset_exists(name):
         if not overwrite:
@@ -1728,21 +1985,21 @@ def presets_create(
         delete_preset(name)
     data = {
         "emo_control_method": int(emo_control_method),
-        "emo_weight": float(emo_weight),
+        "emo_weight": _gen["emo_weight"],
         "emo_vector": [float(v) for v in (vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8)],
         "emo_text": emo_text or "",
         "emo_random": bool(use_random),
         "advanced_params": {
             "do_sample": bool(do_sample),
-            "top_p": float(top_p),
-            "top_k": int(top_k),
-            "temperature": float(temperature),
-            "length_penalty": float(length_penalty),
-            "num_beams": int(num_beams),
-            "repetition_penalty": float(repetition_penalty),
-            "max_mel_tokens": int(max_mel_tokens),
+            "top_p": _gen["top_p"],
+            "top_k": _gen["top_k"],
+            "temperature": _gen["temperature"],
+            "length_penalty": _gen["length_penalty"],
+            "num_beams": _gen["num_beams"],
+            "repetition_penalty": _gen["repetition_penalty"],
+            "max_mel_tokens": _gen["max_mel_tokens"],
             "max_text_tokens_per_segment": int(max_text_tokens_per_segment),
-            "interval_silence": int(interval_silence),
+            "interval_silence": max(10, min(500, int(interval_silence))),
         },
     }
 
@@ -1762,6 +2019,12 @@ def presets_create(
             with open(emo_tmp, "wb") as f:
                 f.write(emo_data)
         save_preset(name, data, prompt_audio=prompt_tmp, emo_audio=emo_tmp)
+    except HTTPException:
+        # _validate_audio_upload 抛的 400/413 已经带着可读原因，必须原样上抛。
+        # 落进下面的 except Exception 会被重包成 500，用户只看到
+        # "Failed to save preset: 400: 预设音色音频不是可识别的音频文件"——
+        # 一条既说 500 又夹着 400 的报错（/audio/tempo 早就是这么写的，这里漏了）。
+        raise
     except Exception as e:
         raise HTTPException(500, f"Failed to save preset: {e}")
     finally:
@@ -1823,6 +2086,10 @@ def presets_rename(name: str, req: dict = Body(...)):
     if not new_name or not str(new_name).strip():
         raise HTTPException(400, "新名称不能为空")
     new_name = _fix_mojibake(str(new_name))
+    # 与创建路径同款拦截：改名成 ". / _ / 空格" 只会被净化成 untitled，
+    # 以前会 200 成功并把预设悄悄改名为一个用户没输入过的名字。
+    if safe_preset_name(new_name) == "untitled" and new_name.strip() != "untitled":
+        raise HTTPException(400, "新名称不能为空或只含符号（. / _ / 空格等），请换一个名字")
     try:
         final = rename_preset(name, new_name)
     except ValueError as e:
@@ -1835,6 +2102,10 @@ def presets_duplicate(name: str, req: dict | None = Body(None)):
     """复制预设；未指定新名时默认「原名_copy」。"""
     new_name = ((req or {}).get("name") or "").strip() or f"{name}_copy"
     new_name = _fix_mojibake(str(new_name))
+    # 与创建/改名路径同款拦截：传 ". / _ / 空格" 只会被净化成 untitled，
+    # 以前会 200 成功并建出一个用户没输入过名字的预设。
+    if safe_preset_name(new_name) == "untitled" and new_name.strip() != "untitled":
+        raise HTTPException(400, "新名称不能为空或只含符号（. / _ / 空格等），请换一个名字")
     try:
         final = duplicate_preset(name, new_name)
     except ValueError as e:
@@ -1891,7 +2162,11 @@ def prefs_param_lock_get():
 
 @api.put("/prefs/param-lock")
 def prefs_param_lock_put(req: dict = Body(...)):
-    locked = req.get("locked", False)
+    # locked 必须显式给出：以前用 req.get("locked", False)，字段名拼错（如 "lock"）
+    # 会静默取默认值 False，把用户已保存的参数锁定整份清空，且返回 200 毫无提示。
+    if "locked" not in req:
+        raise HTTPException(400, "缺少 locked 字段（是否锁定的开关）；要清除锁定请显式传 locked=false")
+    locked = req["locked"]
     if not isinstance(locked, bool):
         raise HTTPException(400, "locked 必须是布尔值")
     raw = req.get("values") or {}
@@ -1949,12 +2224,22 @@ def examples_list(include_experimental: bool = False):
     return JSONResponse({"examples": _load_examples(include_experimental=include_experimental)})
 
 
+_EXAMPLE_AUDIO_EXT = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
+
+
 @api.get("/examples/{name}")
 def examples_file(name: str):
-    path = os.path.join(current_dir, "examples", os.path.basename(name))
-    if not os.path.exists(path):
+    # 只放行音频。examples/ 里除了示例音频还有 cases.jsonl（示例清单）和
+    # batch/ 子目录；原先只取 basename 就返回，于是 /examples/cases.jsonl
+    # 也能下载，而且 media_type 被写死成 audio/wav——一个 jsonl 当 wav 下发。
+    # 用 404 而不是 403，不额外透露"这个文件存在但你不能拿"。
+    base = os.path.basename(name)
+    if not base.lower().endswith(_EXAMPLE_AUDIO_EXT):
         raise HTTPException(404, "Not found")
-    return FileResponse(path, media_type="audio/wav")
+    path = os.path.join(current_dir, "examples", base)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Not found")
+    return FileResponse(path)
 
 
 @api.post("/segments")

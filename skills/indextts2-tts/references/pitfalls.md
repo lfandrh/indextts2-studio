@@ -184,7 +184,7 @@ v1.1.0 起脚本启动时会把非 tty 的 stdout/stderr 固定成 UTF-8（`erro
 
 音频被 `max_mel_tokens` 截断。**不报错，只是变短**。
 
-**处理**：读 `done` 事件的 `mel_capped`，为 `true` 就告诉用户。优先切短文本，其次调大 `max_mel_tokens`。
+**处理**：读 `done` 事件的 `mel_capped`，为 `true` 就告诉用户。优先切短文本，其次调大 `max_mel_tokens` —— 但它有硬上界 **1815**（与网页 `#maxMel` 滑块一致），传更大只会被静默夹回 1815，音频还是不够长就只能回去切文本。
 
 ### `normalize_fallback` 非 null
 

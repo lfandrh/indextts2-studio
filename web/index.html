@@ -16,6 +16,7 @@
 })();
 </script>
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/fonts.css?v={fonts.css}">
 <link rel="stylesheet" href="/assets/style.css?v={style.css}">
 </head>
 <body>
@@ -34,8 +35,27 @@
     <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
       <path d="M6 6l12 12"/><path d="M18 6L6 18"/>
     </symbol>
+    <symbol id="i-scissors" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>
+      <path d="M20 4 8.12 15.88"/><path d="M14.8 14.8 20 20"/>
+    </symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/>
+      <path d="M12 9v4"/><path d="M12 17h.01"/>
+    </symbol>
     <symbol id="i-play" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></symbol>
     <symbol id="i-pause" viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></symbol>
+    <!-- 外链图标：GitHub 用官方 mark（实心，识别度最高）；
+         B 站官方 mark 的实心路径过长且易失真，这里按其核心形态（电视 + 天线 + 双眼）
+         自绘为描边版，与 sprite 里其它图标的笔画风格一致，17px 下仍可辨认。 -->
+    <symbol id="i-github" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/>
+    </symbol>
+    <symbol id="i-bili" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="2.5" y="7" width="19" height="13" rx="3.5"/>
+      <path d="m7 3.5 3 3.5"/><path d="m17 3.5-3 3.5"/>
+      <path d="M8.6 12.2v2.1"/><path d="M15.4 12.2v2.1"/>
+    </symbol>
   </defs>
 </svg>
 
@@ -57,9 +77,19 @@
       <button class="tab" data-page="presets" type="button">预设管理</button>
       <button class="tab" data-page="model" type="button">模型管理</button>
     </nav>
-    <button class="iconbtn" id="themeBtn" aria-label="切换深浅色主题" title="切换主题">
-      <svg id="themeIcon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></svg>
-    </button>
+    <div class="hdr-tools">
+      <div class="hdr-links">
+        <a class="iconbtn" href="https://space.bilibili.com/470166715" target="_blank" rel="noopener noreferrer" aria-label="更多模型（B 站）" title="更多模型（B 站）">
+          <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-bili"></use></svg>
+        </a>
+        <a class="iconbtn" href="https://github.com/lfandrh/indextts2-studio" target="_blank" rel="noopener noreferrer" aria-label="GitHub 项目主页" title="GitHub 项目主页">
+          <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-github"></use></svg>
+        </a>
+      </div>
+      <button class="iconbtn" id="themeBtn" type="button" aria-label="切换深浅色主题" title="切换主题">
+        <svg id="themeIcon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></svg>
+      </button>
+    </div>
   </div>
 </header>
 
@@ -91,12 +121,21 @@
       </label>
       <div id="spkPlayerBox" hidden>
         <canvas id="spkWave" aria-label="参考音频声纹，拖动定位播放位置"></canvas>
+        <!-- 超长提示。原来这句写在 #spkSub 里，但 #spkSub 是 #spkDrop 的子元素，
+             上传后父级 hidden 了，提示跟着一起不可见 —— 等于从来没提示过。 -->
+        <p class="spk-warn" id="spkWarn" hidden>
+          <svg class="ico" aria-hidden="true"><use href="#i-alert"></use></svg>
+          <span id="spkWarnText"></span>
+        </p>
         <div class="refrow">
-          <button class="iconbtn" id="spkPlay" aria-label="播放或暂停参考音频" title="播放/暂停">
+          <button class="iconbtn" id="spkPlay" type="button" aria-label="播放或暂停参考音频" title="播放/暂停">
             <svg id="spkPlayIcon" width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
           </button>
           <span class="range" id="spkTime">0.00s / 0.00s</span>
           <span class="ref-name" id="spkFileName" title=""></span>
+          <button class="btn ghost mini ref-tool" id="spkClip" type="button" title="从这段音频里截取一段作为参考">
+            <svg class="ico" aria-hidden="true"><use href="#i-scissors"></use></svg>裁剪
+          </button>
           <button class="btn ghost mini ref-change" id="spkChange" type="button">更换音频</button>
         </div>
       </div>
@@ -203,7 +242,7 @@
         <div class="pitem">
           <label for="repPen">重复惩罚 <span>repetition_penalty</span></label>
           <div class="nrow">
-            <input type="number" id="repPen" min="0.1" max="20" step="0.1" value="10" aria-label="重复惩罚数值">
+            <input type="number" id="repPen" min="1" max="20" step="0.1" value="10" aria-label="重复惩罚数值">
             <button class="rdef" type="button" data-pid="repPen" aria-label="重复惩罚恢复默认值" title="恢复默认值 10"><svg class="ico" aria-hidden="true"><use href="#i-restore"></use></svg></button>
           </div>
         </div>
@@ -247,7 +286,7 @@
     <!-- main CTA pinned at panel bottom -->
     <div class="cta">
       <div class="gen-summary mono" id="genSummary"></div>
-      <button class="btn primary big" id="genBtn">
+      <button class="btn primary big" id="genBtn" type="button">
         <svg width="21" height="21" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
         生成语音
       </button>
@@ -290,13 +329,19 @@
     <!-- result -->
     <div id="resultBody" style="display:none">
       <div class="bigplayer">
-        <button class="iconbtn bigp" id="bigPlay" aria-label="播放或暂停">
+        <button class="iconbtn bigp" id="bigPlay" type="button" aria-label="播放或暂停">
           <svg id="bigPlayIcon" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
         </button>
         <div class="bp-main">
           <canvas id="waveTrim" aria-label="音频波形，拖拽选择剪辑范围"></canvas>
+          <!-- 时间轴：左端起点 / 中间选区 / 右端总长。选区文案从原来那行
+               小字里升格成骨架，顺带把「拖动选择」的提示意思吸收掉。 -->
+          <div class="bp-axis">
+            <span class="mono" id="axisStart">—</span>
+            <span class="mono" id="trimRange">—</span>
+            <span class="mono" id="axisEnd">—</span>
+          </div>
           <div class="bp-meta">
-            <span class="range mono" id="trimRange">—</span>
             <span class="mono" id="genMeta"></span>
           </div>
           <audio id="player" controls hidden></audio>
@@ -315,7 +360,10 @@
           下载
         </button>
       </div>
-      <div class="dl-row"><span class="dl-name" id="dlSrcName"></span></div>
+      <!-- 源文件名另起一行，右对齐，正好在「下载」按钮下方 -->
+      <div class="dl-row">
+        <span class="dl-name mono" id="dlSrcName"></span>
+      </div>
       <div class="capnote" id="melCapNote" hidden>⚠ 文本超过单段生成长度上限，结尾被截断——请减少每段 Token（分句上限）或调高「最大 mel tokens」后重新生成</div>
       <!-- 文本规范化退化的提示。第一���完整展开；提示过一次之后再发生就降级成
            右上角的小铃铛，点击可随时展开——不重复打扰，但不丢信息。
@@ -327,23 +375,40 @@
 
       <!-- 编辑控件：裁剪靠上方波形拖选，这里管音量 / 变速 / 操作栈 -->
       <div class="edit-panel">
-        <div class="edit-row">
-          <b>音量</b>
-          <input type="range" id="gainRange" min="-24" max="24" step="0.5" value="0" aria-label="音量增益">
-          <span class="edit-val mono" id="gainVal">0.0 dB</span>
-          <span class="edit-note mono" id="peakNote">峰值 —</span>
-          <button class="btn ghost mini" id="gainMax" type="button" hidden></button>
-        </div>
-        <div class="edit-row">
-          <b>变速</b>
-          <!-- 滑块与刻度包成一列：刻度永远和滑轨等宽对齐，点击刻度直接跳到该倍率 -->
-          <div class="tempo-wrap">
-            <input type="range" id="tempoRange" min="0.5" max="2" step="0.01" value="1" aria-label="变速倍率">
-            <div class="edit-ticks" id="tempoTicks" role="group" aria-label="常用变速倍率"></div>
+        <!-- 音量 / 变速折起来：不是所有人都用这两个滑块，展开时右栏会多出
+             两行控件。折叠态在摘要行上直接显示当前两个数值，收起也不丢信息；
+             一旦有非默认的增益或倍率（.on），数值用品牌红标出来，
+             免得「折叠着 = 没生效」被误读。 -->
+        <details class="edit-fold" id="editFold">
+          <summary class="fold-head">
+            <svg class="fold-chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+            <span class="fold-title">音量与变速</span>
+            <span class="edit-fold-vals mono" id="editFoldVals">0.0 dB · 1.00×</span>
+          </summary>
+          <!-- 音量 / 变速并排：上下两行堆叠时滑轨要占满整行（1440 下约 290px），
+               又长又空；并排后每列滑轨收到约 146px，编辑区也少一行。
+               列内仍是「标签 | 滑轨 | 数值」，第二行整行留给备注 / 刻度。 -->
+          <div class="edit-rows">
+            <div class="edit-row">
+              <b>音量</b>
+              <input type="range" id="gainRange" min="-24" max="24" step="0.5" value="0" aria-label="音量增益">
+              <span class="edit-val mono" id="gainVal">0.0 dB</span>
+              <div class="edit-sub">
+                <span class="edit-note mono" id="peakNote">峰值 —</span>
+                <button class="btn ghost mini" id="gainMax" type="button" aria-label="削波处理" title="削波处理" hidden></button>
+              </div>
+            </div>
+            <div class="edit-row">
+              <b>变速</b>
+              <input type="range" id="tempoRange" min="0.5" max="2" step="0.01" value="1" aria-label="变速倍率">
+              <span class="edit-val mono" id="tempoVal">1.00×</span>
+              <div class="edit-sub">
+                <div class="edit-ticks" id="tempoTicks" role="group" aria-label="常用变速倍率"></div>
+                <span class="edit-note" id="tempoNote">保音高</span>
+              </div>
+            </div>
           </div>
-          <span class="edit-val mono" id="tempoVal">1.00×</span>
-          <span class="edit-note" id="tempoNote">保音高</span>
-        </div>
+        </details>
         <div class="ops-row">
           <span class="ops-chips" id="opsChips"></span>
           <button class="btn ghost mini" id="undoBtn" type="button" disabled
@@ -359,7 +424,7 @@
       <div id="resultPreview" hidden>
         <div class="sec-t">编辑结果 <em>试听与下载的就是它</em></div>
         <div class="out-player">
-          <button class="iconbtn out-play" id="outPlay" aria-label="试听编辑结果">
+          <button class="iconbtn out-play" id="outPlay" type="button" aria-label="试听编辑结果">
             <svg id="outPlayIcon" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
           </button>
           <canvas id="waveOut" aria-label="编辑结果波形"></canvas>
@@ -384,9 +449,12 @@
     <!-- preset / example library: secondary, bottom -->
     <div class="history" id="libBox">
       <div class="lib-head">
-        <button class="iconbtn lib-fold-btn" id="libFold" type="button" title="收起资源库" aria-label="收起资源库">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
-        </button>
+        <span class="fold-head">
+          <button class="lib-fold-btn" id="libFold" type="button" title="收起资源库" aria-label="收起资源库">
+            <svg class="fold-chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+          </button>
+          <span class="fold-title">资源库</span>
+        </span>
         <div class="lib-tabs" id="libTabs">
           <button class="libtab cur" data-lib="presets" type="button">预设</button>
           <button class="libtab" data-lib="examples" type="button">示例</button>
@@ -522,6 +590,7 @@
       <!-- 指标带：状态 + 显存/GPU/内存/CPU + 模型操作 -->
       <div class="mm-band">
         <div class="mm-state" id="mmStateBox">
+          <span class="mm-tile-label">模型状态</span>
           <div class="mm-state-top">
             <span class="mm-led" id="mmLed"></span>
             <b class="mono" id="mmState">–</b>
@@ -529,20 +598,10 @@
           <span class="mm-state-sub" id="mmStateSub">等待状态</span>
         </div>
 
-        <!-- 数据来自 header 同一条 /status 轮询，不新增请求 -->
-        <div class="mm-metrics">
-          <div class="mm-metric" id="mmVram">
-            <span>显存</span><b class="mono">--</b><div class="bar"><i></i></div><em>余量 --</em>
-          </div>
-          <div class="mm-metric" id="mmGpu">
-            <span>GPU</span><b class="mono">--</b><div class="bar"><i></i></div><em>利用率</em>
-          </div>
-          <div class="mm-metric" id="mmMem">
-            <span>内存</span><b class="mono">--</b><div class="bar"><i></i></div><em>系统</em>
-          </div>
-          <div class="mm-metric" id="mmCpu">
-            <span>CPU</span><b class="mono">--</b><div class="bar"><i></i></div><em>系统</em>
-          </div>
+        <!-- 只保留「显存」：CPU/GPU/内存顶栏已常驻，这页要的是显存余量（下面精度开关会直接改变它）。
+             数据来自 header 同一条 /status 轮询，不新增请求。 -->
+        <div class="mm-metric mm-vram" id="mmVram">
+          <span>显存</span><b class="mono">--</b><div class="bar"><i></i></div><em>余量 --</em>
         </div>
 
         <!-- 一屏只留一个实心红：加载是正向主操作；卸载与重启都是次要动作（卸载靠红字保留危险语义） -->
@@ -629,7 +688,13 @@
 
 </main>
 
-<footer id="footHint">快捷键 Ctrl+Enter 生成 · Space 播放暂停 · Ctrl+S 存预设 · 主题跟随系统偏好，可点右上角切换</footer>
+<!-- 脚标：静态写的是「语音合成」页那一组，切页签时由 renderFootHint() 重绘 -->
+<footer id="footHint">
+  <span class="fh-item"><kbd>Ctrl</kbd><kbd>Enter</kbd><span>生成</span></span>
+  <span class="fh-item"><kbd>Space</kbd><span>播放暂停</span></span>
+  <span class="fh-item"><kbd>Ctrl</kbd><kbd>S</kbd><span>存预设</span></span>
+  <span class="fh-item"><span>主题跟随系统偏好，可点右上角切换</span></span>
+</footer>
 
 <!-- 轻量模态弹窗：替代原生 alert/confirm/prompt，与主题一致 -->
 <div class="modal-mask" id="modalMask" hidden>
@@ -645,7 +710,61 @@
   </div>
 </div>
 
+<!-- 参考音频裁剪：从整段录音里截出目标片段。
+     不放进左栏就地展开，因为那一栏只有 ~490px，波形拖不准；弹窗能到 720px。 -->
+<div class="modal-mask" id="clipMask" hidden>
+  <div class="modal clip-modal" id="clipBox" role="dialog" aria-modal="true" aria-labelledby="clipTitle" tabindex="-1">
+    <div class="clip-head">
+      <h2 class="modal-title" id="clipTitle">裁剪参考音频</h2>
+      <button class="iconbtn" id="clipClose" type="button" aria-label="关闭裁剪窗口" title="关闭（Esc）">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <p class="clip-meta" id="clipMeta"></p>
+
+    <div class="clip-stage" id="clipStage">
+      <div class="clip-track">
+        <canvas id="clipWave" aria-hidden="true"></canvas>
+        <div class="clip-handle" id="clipHandleL" role="slider" tabindex="0"
+             aria-label="选区起点" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" aria-valuetext="0.00s"></div>
+        <div class="clip-handle" id="clipHandleR" role="slider" tabindex="0"
+             aria-label="选区终点" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" aria-valuetext="0.00s"></div>
+      </div>
+    </div>
+
+    <div class="clip-axis">
+      <span class="mono" id="clipAxisL">0.00s</span>
+      <span class="mono clip-range" id="clipRange">0.00s – 0.00s</span>
+      <span class="mono" id="clipAxisR">0.00s</span>
+    </div>
+
+    <div class="clip-status" id="clipStatus" data-tone="ok">
+      <span class="clip-status-text" id="clipStatusText" aria-live="polite"></span>
+      <button class="btn ghost mini" id="clipStatusFix" type="button" hidden>截到 15 秒</button>
+    </div>
+
+    <div class="clip-tools">
+      <div class="clip-presets">
+        <button class="btn ghost mini" id="clipFirst15" type="button">前 15 秒</button>
+        <button class="btn ghost mini" id="clipAll" type="button">全选</button>
+        <button class="btn ghost mini" id="clipNone" type="button">清空</button>
+      </div>
+      <button class="btn ghost mini clip-preview" id="clipPreview" type="button">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+        <span id="clipPreviewLabel">试听选区</span>
+      </button>
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn ghost" id="clipCancel" type="button">取消</button>
+      <button class="btn primary" id="clipApply" type="button">设为参考音频</button>
+    </div>
+  </div>
+</div>
+
 <script src="/assets/app.js?v={app.js}"></script>
 <script src="/assets/edit.js?v={edit.js}"></script>
+<script src="/assets/clip.js?v={clip.js}"></script>
+<script src="/assets/tip.js?v={tip.js}"></script>
 </body>
 </html>

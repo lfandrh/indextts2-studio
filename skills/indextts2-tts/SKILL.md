@@ -307,6 +307,11 @@ python "$CLIENT" synth --voice v.wav --emo-mode 2 \
 - CLI 显式传入的参数**优先于**预设里的值。
 - 用了与 `emo_mode` 不匹配的情感参数（如没给 `--emo-mode 2` 却传 `--emo-vector`）时，
   脚本会告警"该参数被忽略"——别把这条警告当噪音，服务端确实会丢掉它。
+- 采样与情感参数（`--emo-weight` / `--temperature` / `--top-p` / `--top-k` / `--num-beams` /
+  `--repetition-penalty` / `--max-mel-tokens` / `--length-penalty`）越界时打
+  `[warn] ... server clamps to X` 并就地夹取。这代表用户设的值**没被采纳**，回话时报最终生效值，
+  别照抄他的输入；`top_k=0` 是"关闭过滤"，不是"取 0 个"。同一越界值每次运行只提示一次，
+  `batch` 里看到一次不代表只有第一条被夹——每条都夹过，只是不重复刷屏。
 
 常用开关：
 

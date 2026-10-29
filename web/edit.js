@@ -19,9 +19,10 @@
   const HIST_MAX = 50;          // 快照栈上限
   const TEMPO_CACHE_MAX = 8;    // 变速结果缓存条数
   const GAIN_DEBOUNCE = 80;     // ms，拖动增益时的重算节流
-  // 变速刻度：0.5–2.0 均匀七档，正好把滑轨均分，所以刻度与滑块位置天然对齐。
-  // 既是标尺也是跳转按钮——拖动难对准的值（1.25×）点一下就到。
-  const TEMPO_TICKS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+  // 变速快捷档：并排布局后刻度放在滑轨下面的整行里，不再与滑轨等宽，
+  // 所以它只是「点一下到位」的按钮组，不是标尺——档位不用再卡「均匀七档」，
+  // 直接取最常用的六个（1.75× 留给拖动，滑轨步进 0.01 本来就能到）。
+  const TEMPO_TICKS = [0.5, 0.75, 1, 1.25, 1.5, 2];
   const TEMPO_SNAP = 0.02;      // 拖动落在 1.00±0.02 内吸附回原速，避免误操作出 1.01×
 
   const ED = {
@@ -251,8 +252,9 @@
     const cv = el.outWave;
     if (!cv || !ED.rendered || !el.outCtx) return;
     const { w, h } = sizeCanvas(cv);
+    if (!w || !h) return;      // 容器 0 宽时 Math.floor(x/0)=Infinity，|| 1 兜不住
     const data = ED.rendered.getChannelData(0);
-    const step = Math.floor(data.length / w) || 1;
+    const step = Math.max(1, Math.floor(data.length / w));
     const mid = h / 2;
     const ink = cssVar("--accent"), pri = cssVar("--primary");
     const pos = outAudio.duration ? (outAudio.currentTime / outAudio.duration) * w : 0;
@@ -290,20 +292,23 @@
     syncChips();
   }
 
+  // 变速请求在飞的时候，滑块和刻度按钮已被 setBusy 禁用，但 Ctrl+Z / Ctrl+Y
+  // 和 chip 上的删除 × 是绕过去的 —— 它们都会走到 render() 再发一次请求，
+  // 两个请求重叠时先返回的那个把 busy 清掉，后一个还在飞，用户就能继续拖。
   function undo() {
-    if (ED.cursor <= 0) return;
+    if (ED.busy || ED.cursor <= 0) return;
     ED.cursor--;
     restore(ED.hist[ED.cursor]);
   }
 
   function redo() {
-    if (ED.cursor >= ED.hist.length - 1) return;
+    if (ED.busy || ED.cursor >= ED.hist.length - 1) return;
     ED.cursor++;
     restore(ED.hist[ED.cursor]);
   }
 
   function removeOp(kind) {
-    if (!ED.state[kind]) return;
+    if (ED.busy || !ED.state[kind]) return;
     ED.state[kind] = null;
     pushHistory();
     syncControls();
@@ -329,6 +334,16 @@
     }
   }
 
+  /** 折叠摘要行上的数值：收起时也要看得到当前增益 / 倍率，
+      非默认时标红，免得「折叠着」被误读成「没生效」。 */
+  function syncFoldVals() {
+    const g = Number(el.gainRange.value) || 0;
+    const t = Number(el.tempoRange.value) || 1;
+    const changed = Math.abs(g) > 0.001 || Math.abs(t - 1) > 0.001;
+    el.foldVals.textContent = (g > 0 ? "+" : "") + g.toFixed(1) + " dB · " + t.toFixed(2) + "×";
+    el.foldVals.classList.toggle("on", changed);
+  }
+
   function syncControls() {
     const g = ED.state.gain;
     el.gainRange.value = String(g || 0);
@@ -339,6 +354,7 @@
     fill(el.gainRange);
     fill(el.tempoRange);
     syncTicks();
+    syncFoldVals();
     paintEstimate();
   }
 
@@ -376,7 +392,14 @@
         del.innerHTML = ICON_CLOSE;
         del.title = "移除该操作";
         del.setAttribute("aria-label", "移除操作 " + text);
+        // <i> 既不在 tab 序列里也不响应 Enter/Space：键盘用户能加操作却删不掉，
+        // 只能靠「重置全部」。这里补成可聚焦可激活的按钮语义。
+        del.setAttribute("role", "button");
+        del.tabIndex = 0;
         del.addEventListener("click", () => removeOp(kind));
+        del.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); removeOp(kind); }
+        });
         chip.appendChild(del);
         el.chips.appendChild(chip);
       }
@@ -477,6 +500,7 @@
     gainRange: $("gainRange"), gainVal: $("gainVal"), peakNote: $("peakNote"), gainMax: $("gainMax"),
     tempoRange: $("tempoRange"), tempoVal: $("tempoVal"), tempoNote: $("tempoNote"), ticks: $("tempoTicks"),
     chips: $("opsChips"), undo: $("undoBtn"), redo: $("redoBtn"), resetAll: $("resetAllBtn"),
+    foldVals: $("editFoldVals"),
     out: $("resultPreview"), outWave: $("waveOut"), outDur: $("outDur"),
     outPlay: $("outPlay"), outPlayIcon: $("outPlayIcon"),
     outFoot: $("outFoot"), dlLabel: $("dlBtnLabel"),
@@ -492,6 +516,7 @@
     el.gainVal.textContent = (db > 0 ? "+" : "") + db.toFixed(1) + " dB";
     el.gainMax.hidden = true;
     fill(el.gainRange);
+    syncFoldVals();
     gainLive = true;
     paintPeak();                 // 峰值实时跟着滑块走，不等 debounce 后的 render
     clearTimeout(gainTimer);
@@ -541,6 +566,7 @@
     }
     fill(el.tempoRange);
     el.tempoVal.textContent = rate.toFixed(2) + "×";
+    syncFoldVals();
     syncTicks();
     paintEstimate();
   });
@@ -550,11 +576,19 @@
     ED.state.tempo = Math.abs(rate - 1) < 0.001 ? null : rate;
     el.tempoVal.textContent = (ED.state.tempo || 1).toFixed(2) + "×";
     syncTicks();
+    const histLen = ED.hist.length;                          // 记下压栈前的长度
     pushHistory();
     if (!(await render())) {                                // 失败回滚，别留下一个假的 chip
       ED.state.tempo = prev;
+      // 仅回滚 state 不回滚 hist，栈里会多出一条「幽灵快照」：
+      // 第一次 Ctrl+Z 看不出任何变化，用户以为撤销坏了；
+      // 若之后又做了别的操作，Ctrl+Z 还会把界面拨回那个注定失败的倍速。
+      // 只在确实压过栈时才回滚（pushHistory 遇到相同状态会跳过）
+      if (ED.hist.length > histLen) { ED.hist.pop(); ED.cursor = ED.hist.length - 1; }
       el.tempoRange.value = String(prev || 1);
+      fill(el.tempoRange);                                   // 手柄回到了，渐变也得跟着回
       el.tempoVal.textContent = (prev || 1).toFixed(2) + "×";
+      syncFoldVals();                                        // 折叠态的摘要行也要同步，否则一直显示失败的那个值
       syncTicks();
       syncChips();
       paintEstimate();
@@ -564,6 +598,19 @@
   el.undo.addEventListener("click", undo);
   el.redo.addEventListener("click", redo);
   if (el.resetAll) el.resetAll.addEventListener("click", resetAll);
+
+  /* 折叠状态记在 localStorage：默认收起（多数人不用这两个滑块），
+     但谁展开过就一直保持展开，刷新页面、重启服务都不用再点一次。
+     跟资源库折叠（libFolded）同一套机制：偏好存在浏览器本地，
+     服务重启不动它；只有换端口（换 origin）才会失效。 */
+  const FOLD_KEY = "editFoldOpen";
+  const fold = $("editFold");
+  if (fold) {
+    try { fold.open = localStorage.getItem(FOLD_KEY) === "1"; } catch (e) { /* 隐私模式下忽略 */ }
+    fold.addEventListener("toggle", () => {
+      try { localStorage.setItem(FOLD_KEY, fold.open ? "1" : "0"); } catch (e) { /* 忽略 */ }
+    });
+  }
 
   el.outPlay.addEventListener("click", () => {
     if (!outAudio.src) return;

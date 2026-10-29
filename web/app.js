@@ -3,6 +3,22 @@
 
 const $ = (id) => document.getElementById(id);
 
+/* 让一个纯 <div> 条目能被键盘操作：加 tab 序 + button 语义 + Enter/Space 激活。
+   历史条目、示例条目原本只绑了 click，键盘用户根本到不了，
+   而同一个产品里的预设卡片（.pm-card）早就做了 tabindex + keydown，这里补齐一致性。 */
+function makeActivatable(el, label) {
+  if (!el) return;
+  el.tabIndex = 0;
+  el.setAttribute("role", "button");
+  if (label) el.setAttribute("aria-label", label);
+  el.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    if (ev.target !== el) return;   // 焦点在内部的删除按钮上时交给按钮自己处理
+    ev.preventDefault();
+    el.click();                     // 转发给已注册的 click，不改现有逻辑
+  });
+}
+
 /* ---------------- API base ----------------
    所有 JSON 接口集中在 /api/v1 版本前缀下（旧根路径后端 307 兼容重定向）。
    音频/静态资源（/audio、/assets）不带前缀。 */
@@ -297,14 +313,22 @@ async function restoreJob() {
     if (["queued", "running", "stop_requested", "stopping"].includes(job.state)) {
       applyJobSnapshot(job);
       clearInterval(jobReconnectTimer);
+      // 防重入：单次 /jobs/{id} 卡在慢响应上时，500ms 的间隔会一口气叠出
+      // 七八个并发请求，把服务端线程池占满、连带 /status 的仪表也变卡。
+      // 标志放在定时器闭包里，重建轮询时自然重置。
+      let reconnectBusy = false;
       jobReconnectTimer = setInterval(async () => {
+        if (reconnectBusy) return;
+        reconnectBusy = true;
         try {
           const r2 = await fetch(`${API}/jobs/${encodeURIComponent(curJobId)}`);
           if (!r2.ok) throw new Error("任务状态不可用");
           const j2 = await r2.json();
           const s = j2.job;
           if (!s) throw new Error("任务状态不可用");
-          if (["done", "error", "cancelled"].includes(s.state)) {
+          // 终态必须列全：少了 "stopped" 会让「停止生成后刷新页面」的轮询
+          // 永远走 else 分支，界面卡在「正在停止生成…」直到 job 被服务端清掉。
+          if (["done", "error", "cancelled", "stopped"].includes(s.state)) {
             clearInterval(jobReconnectTimer);
             jobReconnectTimer = null;
             if (s.state === "done" && s.result) {
@@ -330,6 +354,8 @@ async function restoreJob() {
           clearInterval(jobReconnectTimer);
           jobReconnectTimer = null;
           showError("任务状态恢复失败，请稍后在生成历史中查看");
+        } finally {
+          reconnectBusy = false;
         }
       }, 500);
     } else if (job.state === "done" && job.result) {
@@ -370,8 +396,10 @@ async function restoreDraft() {
 }
 themeBtn.addEventListener("click", () => {
   const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-  localStorage.setItem("theme", next);
+  // 先切主题再写偏好：setItem 在隐私模式/配额满时会抛异常，
+  // 写在 applyTheme 之前会让按钮点了完全没反应。
   applyTheme(next);
+  try { localStorage.setItem("theme", next); } catch (e) { /* 存不下就只在本次会话生效 */ }
 });
 
 function sizeCanvas(cv) {
@@ -388,92 +416,41 @@ function sizeCanvas(cv) {
 function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
 /* ---------------- header waveform (signature) ----------------
-   顶栏这条横带不是装饰，是把「一段语音」压成的包络。三条规则决定它长什么样：
-   1. 配色只走品牌红。蓝色在这套系统里是数据色（真波形、进度、数值都用它），
-      顶栏再插一条蓝就变成第二主色，跟暖白底 + 红主操作互相打架。
-   2. 包络由 8 个「音节爆发」拼成，爆发宽窄高低不一、中间留真静音，
-      读起来像一段话；原来那条是两条正弦叠加，只会荡成一条抖动的虚线。
-   3. 1px 列 + 锯齿顶边 + 纯色填充 —— 跟结果卡里的真波形同一套画法（drawSpkWave），
-      只是缩到 24px 高的 chrome 尺度。试过竖向渐变，会把锯齿磨成气刷感的「叶片」，
-      小尺寸下反而失真，所以不用。 */
+   顶栏这条是签名元素，保持 2026-10-28 之前的画法：
+   4px 步进、2.4px 宽的竖条，居中对称。闲置时几乎是一条极淡的横线
+   （0.06~0.11 振幅、50% 透明度），只有生成时才起包络。
+   生成态：sin 半周做整体拱形 + 逐条抖动，已生成的那一段换成品牌红，
+   相当于一条「声音正在被写出来」的进度带。 */
 const hWave = $("waveHeader"), hCtx = hWave.getContext("2d");
 let genAnim = { on: false, level: 0, progress: 0 };
 let waveT = 0;
-/* c 位置 / w 宽度（占整条的比例）/ a 峰值。宽窄、高低都错开，中间留两次真停顿，
-   避免排成一串等距菱形；停顿时长不同，才像「说完一句换口气」而不是节拍器 */
-const HDR_BURST = [
-  { c: .05, w: .048, a: .50 },
-  { c: .17, w: .072, a: .95 },
-  { c: .29, w: .040, a: .68 },
-  { c: .41, w: .032, a: .35 },
-  { c: .53, w: .060, a: 1.00 },
-  { c: .66, w: .044, a: .72 },
-  { c: .79, w: .068, a: .88 },
-  { c: .92, w: .036, a: .55 },
-];
-const hdrNoise = (i) => { const s = Math.sin(i * 12.9898) * 43758.5453; return s - Math.floor(s); };
-/* t 只驱动极慢的整体漂移（约 3s 一个来回）：静止时也有一口气，但看不出在动 */
-function hdrEnv(i, n, t) {
-  const p = n > 1 ? i / (n - 1) : 0;
-  const drift = Math.sin(t / 3000) * .018;
-  let e = 0;
-  for (let k = 0; k < HDR_BURST.length; k++) {
-    const b = HDR_BURST[k];
-    const dd = (p - b.c - drift * (k % 2 ? -1.6 : 1)) / b.w;
-    const g = Math.exp(-dd * dd * 1.6) * b.a;
-    if (g > e) e = g;
-  }
-  // 相邻三格平滑过的噪声：爆发内部也不等高，否则就是一段段等幅的梳子
-  const jit = (hdrNoise(i - 1) + 2 * hdrNoise(i) + hdrNoise(i + 1)) / 4;
-  return e * (.38 + .62 * jit);
-}
-/* 令牌是 6 位 hex，画布要带 alpha 的色值，所以在这里拼 rgba；
-   不直接字符串加 "66"（万一以后换成 rgb()/oklch() 会静默失效） */
-function alphaOf(color, a) {
-  const s = String(color).trim().replace("#", "");
-  const hex = s.length === 3 ? s.split("").map((c) => c + c).join("") : s;
-  if (!/^[0-9a-f]{6}$/i.test(hex)) return color;
-  const v = parseInt(hex, 16);
-  return `rgba(${(v >> 16) & 255}, ${(v >> 8) & 255}, ${v & 255}, ${a})`;
-}
-const HDR_REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)");
 
 function drawHeaderWave(t) {
-  t = t || 0;
+  t = t || waveT || 0;
   const { w, h } = sizeCanvas(hWave);
-  const mid = Math.round(h / 2);
   hCtx.clearRect(0, 0, w, h);
-
-  const primary = cssVar("--primary");
-  const running = genAnim.on;
-  const playedX = running ? genAnim.progress * w : -1;
-  // 闲置 58% 是「暖色底纹」的浓度：看得出是声音，但不跟红点、主按钮抢注意力
-  const quiet = alphaOf(primary, .58), live = alphaOf(primary, .94);
-
-  let isLive = false;
-  hCtx.fillStyle = quiet;
-  for (let x = 0; x < w; x++) {
-    const p = w > 1 ? x / w : 0;
-    let e = hdrEnv(x, w, t);
-    const wantLive = x <= playedX;
-    if (running && wantLive) {
-      // 只让「已经生成的这一段」动：播放头附近鼓一个包（凸起 → 凹陷），
-      // 像声音正被一路写过去。整条一起抖的话，跟真实进度就对不上了。
-      const head = Math.exp(-(p - genAnim.progress) * (p - genAnim.progress) * 160);
-      e = Math.min(1, e * (.8 + .3 * genAnim.level + .55 * head));
+  const accent = cssVar("--accent"), primary = cssVar("--primary");
+  const n = Math.floor(w / 4);
+  const mid = h / 2;
+  for (let i = 0; i < n; i++) {
+    let a;
+    if (genAnim.on) {
+      const env = Math.sin(i / n * Math.PI);
+      a = env * (0.25 + 0.75 * Math.abs(Math.sin(i * 0.7 + t / 130))) * genAnim.level;
+    } else {
+      a = 0.06 + 0.05 * Math.sin(i * 0.5 + t / 900);
     }
-    // 两端渐隐：横带要有明确起止，不能贴到画布边缘被硬切
-    const edge = Math.min(1, Math.min(p, 1 - p) / .06);
-    // 0.6px 下限 = 停顿处只剩一根发丝，整条仍然连成一段音轨
-    const a = Math.max(.6, e * edge * h * .44);
-    if (wantLive !== isLive) { isLive = wantLive; hCtx.fillStyle = isLive ? live : quiet; }
-    hCtx.fillRect(x, mid - a, 1, a * 2);
+    const bh = Math.max(2, a * h);
+    hCtx.fillStyle = genAnim.on && i / n < genAnim.progress ? primary : accent;
+    hCtx.globalAlpha = genAnim.on ? 0.95 : 0.5;
+    hCtx.fillRect(i * 4, mid - bh / 2, 2.4, bh);
   }
+  hCtx.globalAlpha = 1;
 }
 /* 呼吸：4 次/秒重画一次足够，肉眼读到的是「缓慢漂移」，不是动画。
-   系统开了减少动态效果就完全停掉，只留一张静态包络。 */
-if (!HDR_REDUCED.matches) {
-  setInterval(() => { if (!document.hidden) drawHeaderWave(performance.now()); }, 250);
+   系统开了减少动态效果就完全停掉，只留一张静态横条。 */
+if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  setInterval(() => { if (!document.hidden) drawHeaderWave(waveT + 16); }, 250);
 }
 let waveRAF = 0;
 function waveLoop(t) {
@@ -534,23 +511,40 @@ function renderMetrics(m) {
     $("devText").textContent = m.gpu_name.replace(/^NVIDIA\s+/i, "").replace(/^GeForce\s+/i, "");
     devPill.title = "运行设备：" + m.gpu_name;
   } else {
-    $("devText").textContent = "CPU";
-    devPill.title = "运行设备：CPU";
+    /* 读不到就写 "--"。以前这里固定写 "CPU"，会让「有 N 卡但监控没读到」的
+       机器看起来像在跑 CPU 推理，属于谎报。 */
+    $("devText").textContent = "--";
+    devPill.title = "未读到 NVIDIA GPU 信息（驱动过旧 / nvidia-smi 不在 PATH / 本机无 N 卡）";
   }
   if (m.cpu_percent !== undefined) setMeter("mCpu", m.cpu_percent, `${Math.round(m.cpu_percent)}%`);
   if (m.mem_total_gb) setMeter("mMem", (m.mem_used_gb / m.mem_total_gb) * 100, `${m.mem_used_gb.toFixed(1)}/${m.mem_total_gb.toFixed(1)}G`);
+  /* GPU 与显存分开判断：后端现在把两者解耦，可能只给得出其中一项 */
   const hasGpu = m.gpu_percent !== undefined;
+  const hasVram = m.vram_used_mb !== undefined || m.vram_total_mb !== undefined;
   $("mGpu").hidden = !hasGpu;
-  $("mVram").hidden = !hasGpu;
-  if (hasGpu) {
-    setMeter("mGpu", m.gpu_percent, `${m.gpu_percent}%`);
-    setMeter("mVram", (m.vram_used_mb / (m.vram_total_mb || 8192)) * 100, `${(m.vram_used_mb / 1024).toFixed(1)}/${((m.vram_total_mb || 0) / 1024).toFixed(1)}G`);
+  $("mVram").hidden = !hasVram;
+  if (hasGpu) setMeter("mGpu", m.gpu_percent, `${m.gpu_percent}%`);
+  if (hasVram) {
+    $("mVram").title = "";
+    const totalMb = m.vram_total_mb;
+    const usedMb = m.vram_used_mb;
+    if (usedMb !== undefined && totalMb) {
+      setMeter("mVram", (usedMb / totalMb) * 100, `${(usedMb / 1024).toFixed(1)}/${(totalMb / 1024).toFixed(1)}G`);
+    } else if (usedMb !== undefined) {
+      /* 总量没读到就别拿 8192 当分母硬算比例，只老实报已用量 */
+      setMeter("mVram", 0, `${(usedMb / 1024).toFixed(1)}G`);
+      $("mVram").title = "总显存未读到，只显示已用量";
+    } else {
+      setMeter("mVram", 0, `--/${(totalMb / 1024).toFixed(1)}G`);
+      $("mVram").title = "显存占用量未读到";
+    }
   }
   syncModelMetrics(m);
 }
 
-/* 模型页把 header 那四个小仪表放大成指标卡：8G 卡上「显存还剩多少」比任何文案都管用，
-   而旧版这一页恰恰一个数字都没有。数据同源于 header 的 /status 轮询，不新增请求。 */
+/* 模型页只把「显存」放大成一张卡：8G 卡上「显存还剩多少」比任何文案都管用，
+   且下面的精度开关会直接改变它；GPU/内存/CPU 顶栏已常驻，不再重复。
+   数据同源于 header 的 /status 轮询，不新增请求。 */
 function mmMetric(id, pct, label, sub) {
   const el = $(id);
   if (!el) return;
@@ -564,19 +558,21 @@ function mmMetric(id, pct, label, sub) {
   if (em && sub !== undefined) em.textContent = sub;
 }
 function syncModelMetrics(m) {
-  if (m.vram_total_mb) {
+  /* 只更新「显存」卡：CPU/GPU/内存顶栏已常驻，这页保留显存是因为精度开关会直接改变它。 */
+  if (m.vram_total_mb && m.vram_used_mb !== undefined) {
     const total = m.vram_total_mb / 1024;
     const used = (m.vram_used_mb || 0) / 1024;
     mmMetric("mmVram", (used / total) * 100, `${used.toFixed(1)}/${total.toFixed(1)}G`, `余量 ${(total - used).toFixed(1)}G`);
   }
-  if (m.gpu_percent !== undefined) mmMetric("mmGpu", m.gpu_percent, `${Math.round(m.gpu_percent)}%`, "利用率");
-  if (m.mem_total_gb) {
-    const pct = (m.mem_used_gb / m.mem_total_gb) * 100;
-    mmMetric("mmMem", pct, `${m.mem_used_gb.toFixed(1)}/${m.mem_total_gb.toFixed(1)}G`, "系统内存");
-  }
-  if (m.cpu_percent !== undefined) mmMetric("mmCpu", m.cpu_percent, `${Math.round(m.cpu_percent)}%`, "系统");
 }
+/* 防重入：/status 在 nvidia-smi 走兜底通道时单次可达 4s（server.py 里
+   timeout=4），而这里是 2s 一次——不拦就会叠出 2~3 个并发请求，多标签页
+   再翻几倍，全部堵在服务端线程池里排队，界面反而更慢。计时器到点只管
+   跳过本轮，不再堆请求。 */
+let statusInflight = false;
 async function pollStatus() {
+  if (statusInflight) return;
+  statusInflight = true;
   try {
     const s = await (await fetch(`${API}/status`)).json();
     renderModelPill(s);
@@ -585,6 +581,8 @@ async function pollStatus() {
   } catch (e) {
     $("modelPill").dataset.s = "unloaded";
     $("modelPillText").textContent = "服务连接中断…";
+  } finally {
+    statusInflight = false;
   }
 }
 setMetricsPolling(pollStatus);
@@ -631,6 +629,7 @@ $("spkChange").addEventListener("click", () => {
   resetSpkSelection();
   spkFile.click();
 });
+$("spkClip").addEventListener("click", openSpkClip);
 
 /* emo reference audio shares the same pattern */
 const emoDrop = $("emoDrop"), emoFile = $("emoFile");
@@ -656,26 +655,54 @@ function clearEmoFile() {
   setDraftBlob(DRAFT_AUDIO_KEYS.emo, null).catch(() => {});
 }
 
+/* 参考音频声纹：2px 柱 + 2px 空隙的对称柱状条。
+   为什么不做 1px 连续列：这块画布只有 64px 高，1px 列在 chrome 尺度上读成
+   「一条毛边」，看不出是柱阵；2px 柱正好在「柱子还在」和「细密纹理」之间。
+   定位精度不受影响 —— seek 用的是画布内的连续比例，跟柱宽无关。 */
+const SPK_BAR = { pitch: 4, w: 2, r: 1, amp: .78, floor: 2 };
+
 function drawSpkWave() {
   const { w, h } = sizeCanvas(spkWave);
   const data = spkBuffer.getChannelData(0);
-  const step = Math.max(1, Math.floor(data.length / w));
+  const B = SPK_BAR;
   const mid = h / 2;
   const ink = cssVar("--accent"), played = cssVar("--primary"), border = cssVar("--border");
   spkCtx.clearRect(0, 0, w, h);
+  // 零轴：柱状条中间那根淡线，帮眼睛锚住基线
   spkCtx.fillStyle = border;
   spkCtx.fillRect(0, mid - 0.5, w, 1);
+
+  // 柱数由宽度决定，整组居中，避免右边留一截空白
+  const n = Math.max(1, Math.floor(w / B.pitch));
+  const x0 = Math.round((w - n * B.pitch + B.w) / 2);
+  // 每根柱负责一段样本，取该段的峰谷绝对值做高度（上下对称）
+  const step = Math.max(1, Math.floor(data.length / n));
   const pos = spkPlaying || spkAudio.currentTime > 0 ? spkSeekFrac * w : 0;
-  for (let x = 0; x < w; x++) {
-    let min = 1, max = -1;
-    for (let i = 0; i < step; i++) {
-      const v = data[x * step + i] || 0;
-      if (v < min) min = v; if (v > max) max = v;
+  // 未播部分退到背景纹理层，红色成为唯一的进度信号。
+  // 暗色下 --accent 是浅蓝，同样的透明度会偏亮、跟红色抢，所以再压一档。
+  const quiet = document.documentElement.dataset.theme === "dark" ? 0.38 : 0.42;
+
+  for (let i = 0; i < n; i++) {
+    const base = i * step;
+    let peak = 0;
+    for (let k = 0; k < step; k++) {
+      const v = data[base + k] || 0;
+      const a = v < 0 ? -v : v;
+      if (a > peak) peak = a;
     }
-    const y0 = mid - max * mid * 0.9, y1 = mid - min * mid * 0.9;
-    spkCtx.fillStyle = x <= pos ? played : ink;
-    spkCtx.globalAlpha = x <= pos ? 0.95 : 0.55;
-    spkCtx.fillRect(x, y0, 1, Math.max(1, y1 - y0));
+    // 静音段留 2px 地板，否则整条断成一串点
+    const bh = Math.max(B.floor, peak * mid * B.amp);
+    const x = x0 + i * B.pitch;
+    const isPlayed = x <= pos;
+    spkCtx.fillStyle = isPlayed ? played : ink;
+    spkCtx.globalAlpha = isPlayed ? 0.95 : quiet;
+    if (spkCtx.roundRect) {
+      spkCtx.beginPath();
+      spkCtx.roundRect(x, mid - bh, B.w, bh * 2, Math.min(B.r, bh));
+      spkCtx.fill();
+    } else {
+      spkCtx.fillRect(x, mid - bh, B.w, bh * 2);
+    }
   }
   spkCtx.globalAlpha = 1;
 }
@@ -683,7 +710,9 @@ function spkFmt(t) { return `${t.toFixed(2)}s`; }
 function spkTick() {
   if (!spkBuffer) return;
   const d = spkBuffer.duration;
-  if (spkPlaying) spkSeekFrac = Math.min(spkAudio.currentTime / d, 1);
+  // 零长度音频（d=0）会让 currentTime/0 变成 NaN 或 Infinity，
+  // 时间标签显示 NaN，波形的 x <= pos 判定也全为 false。
+  if (spkPlaying && d > 0) spkSeekFrac = Math.min(spkAudio.currentTime / d, 1);
   $("spkTime").textContent = `${spkFmt(spkPlaying ? spkAudio.currentTime : spkSeekFrac * d)} / ${spkFmt(d)}`;
   drawSpkWave();
   if (spkPlaying) requestAnimationFrame(spkTick);
@@ -771,6 +800,15 @@ function decodeNative(ab) {
   return ctx.decodeAudioData(ab);
 }
 
+/* 超长提示放在 #spkWarn（波形下方常驻），不是 #spkSub：
+   后者是 #spkDrop 的子元素，上传后父级 hidden，提示根本看不见。 */
+function showSpkWarn(text) {
+  const box = $("spkWarn");
+  if (!box) return;
+  $("spkWarnText").textContent = text || "";
+  box.hidden = !text;
+}
+
 function resetSpkSelection() {
   spkAudio.pause();
   spkPlaying = false;
@@ -788,6 +826,7 @@ function resetSpkSelection() {
   $("spkSub").textContent = "约 3~10 秒参考音频效果最佳";
   $("spkFileName").textContent = "";
   $("spkFileName").title = "";
+  showSpkWarn("");
 }
 
 function setSpkFile(f, persist = true) {
@@ -811,17 +850,84 @@ function setSpkFile(f, persist = true) {
       spkPlaying = false; spkSeekFrac = 0;
       $("spkTime").textContent = `0.00s / ${spkBuffer.duration.toFixed(2)}s`;
       // 参考音频超过 15 秒时，服务端只取前 15 秒做音色克隆（infer_v2 的
-      // _load_and_cut_audio 硬截断），超出部分白传。这里明确提示，免得用户
-      // 以为整段都用了，或把音色偏归咎于 bug。正常长度则恢复默认提示。
-      $("spkSub").textContent = spkBuffer.duration > 15
-        ? `音频 ${spkBuffer.duration.toFixed(0)} 秒，只会用前 15 秒做音色克隆；建议先截出目标音色段再上传`
-        : "约 3~10 秒参考音频效果最好";
+      // _load_and_cut_audio 硬截断），超出部分白传。明确提示，免得用户
+      // 以为整段都用了，或把音色偏归咎于 bug。
+      // 15.05 是浮点容差：15.000001 秒不该报「只有前 15 秒」。
+      const dur = spkBuffer.duration;
+      $("spkSub").textContent = "约 3~10 秒参考音频效果最好";
+      showSpkWarn(dur > 15.05 ? `${dur.toFixed(1)} 秒 · 只有前 15 秒参与音色克隆` : "");
       spkTick();
     }).catch(() => {
       resetSpkSelection();
       $("spkSub").textContent = "不支持该音频格式，请换一个文件（wav/mp3/flac/ogg）";
     });
   } catch (e) { /* ignore */ }
+}
+
+/* ---------------- 参考音频裁剪 ----------------
+   整段录音里往往只有一小段是干净的目标音色，而服务端硬截断前 15 秒。
+   「先截出来再用」比「传整段让它自己猜」既准又省一次上传。
+   选区 UI 全在 web/clip.js（只管选区），这里负责编码、写回表单、问存预设。 */
+
+const SPK_CLIP_STEM_MAX = 60;   // Windows 文件名上限 255，给后缀和路径留余量
+
+function openSpkClip() {
+  if (!spkBuffer) { showActionError("音频还在读取，请稍候再试"); return; }
+  if (!window.ClipDialog) { showActionError("裁剪组件未加载，请刷新页面"); return; }
+  const src = spkFile.files[0] || null;
+  const srcName = (src && src.name) || "参考音频";
+  window.ClipDialog.open({
+    buffer: spkBuffer,
+    name: srcName,
+    okText: "设为参考音频",
+  }).then((res) => {
+    // 取消 / 关闭返回 null；0 长度选区在弹窗里已被禁用，这里兜一次
+    if (!res || !(res.s1 > res.s0)) return;
+    applySpkClip(srcName, res);
+  });
+}
+
+function applySpkClip(srcName, res) {
+  const d = spkBuffer.duration;
+  // encodeWav 收的是「归一化比例」而不是秒（内部乘 buffer.length）
+  const blob = encodeWav(spkBuffer, res.s0 / d, res.s1 / d);
+  const stem = (srcName.replace(/\.[^.]+$/, "") || "参考音频").slice(0, SPK_CLIP_STEM_MAX);
+  const file = new File([blob], `${stem}_clip_${res.s0.toFixed(2)}-${res.s1.toFixed(2)}.wav`,
+    { type: "audio/wav" });
+  // 走「用户主动换音频」那条路径：清掉预设选中态、同步 input.files、写草稿。
+  // 不同步 input.files 的话，界面显示的是裁剪结果，生成/存预设却仍拿原文件。
+  userPickedSpk(file);
+  showActionHint(`已截取 ${(res.s1 - res.s0).toFixed(2)} 秒`);
+  askSaveClipPreset(stem);
+}
+
+/* 裁完再问一次要不要存预设：不存的话，下次想复用还得重新上传原文件、再裁一遍。 */
+async function askSaveClipPreset(stem) {
+  const yes = await uiConfirm({
+    title: "保存为预设",
+    body: "已把截取的这一段设为参考音频。要不要顺手存成一个预设？下次直接选用，不用再裁一次。",
+    okText: "保存为预设",
+    cancelText: "不用了",
+  });
+  if (!yes) return;
+  const name = await uiPrompt({
+    title: "预设名称",
+    placeholder: "请输入预设名称",
+    value: `${stem.slice(0, 40)}_clip`,
+  });
+  if (name === null || name === false) return;
+  const trimmed = String(name).trim();
+  if (!trimmed) { showActionError("请输入预设名称"); return; }
+  try {
+    // savePresetByName 读的是 #spkFile.files[0]，上面 userPickedSpk 已把它换成裁剪结果
+    if (!await savePresetByName(trimmed)) return;
+    curPresetName = trimmed;
+    showActionHint("预设已保存: " + trimmed);
+    await refreshPresets();
+    renderLib();
+    updateGenSummary();
+    refreshPmList();
+  } catch (e) { showActionError("保存预设失败: " + e.message); }
 }
 
 /* ---------------- emotion mode visibility ---------------- */
@@ -835,6 +941,9 @@ EMO_NAMES.forEach((n, i) => {
   const s = document.createElement("input");
   s.type = "range"; s.min = 0; s.max = 1; s.step = 0.05; s.value = 0;
   s.dataset.i = i; s.title = n;
+  // 只给 title 不够：多数读屏不把 title 当可靠的可访问名，
+  // 于是 8 个滑块全被读成「滑块 0.5」，分不清是「喜」还是「怒」。
+  s.setAttribute("aria-label", "情感向量 " + n);
   const val = document.createElement("span");
   val.className = "vec-val"; val.textContent = "0.00";
   s.addEventListener("input", () => {
@@ -1165,7 +1274,14 @@ async function updateSegments() {
   fd.append("max_text_tokens_per_segment", $("segTokens").value);
   try {
     const r = await fetch(`${API}/segments`, { method: "POST", body: fd });
-    const j = await r.json();
+    // 服务端报错（500 / 分词器加载失败 / 代理返回 HTML）时不判 ok，
+    // 会走到 segs=[] 把列表清空，而上方的「分句 N 段 · M tok」还留着旧值，
+    // 看起来像数据丢了且没有任何错误反馈。
+    if (!r.ok) {
+      if (mine === segSeq) { segList.replaceChildren(); $("segInfo").textContent = "分句失败，请稍后重试"; }
+      return;
+    }
+    const j = await r.json().catch(() => ({}));
     // 期间用户又改过文本、发出了更新的请求：丢掉这次结果，否则慢的旧请求
     // 后到会把新内容盖回旧内容。实测：服务刚启动时第一个 /segments 要走
     // _ensure_light 加载分词器（几秒），第二个请求几十毫秒就回来了——
@@ -1259,12 +1375,13 @@ const emptyHint = $("emptyHint"), loadingBox = $("loadingBox"), resultBody = $("
 let elapsedTimer = null, genStart = 0;
 let hasResult = false;
 let curJobId = "";            // active inference job id (for cancel)
-let curAbort = null;          // AbortController for the SSE fetch
 let curJobState = "";         // queued | running | stopping
 function jobActive() { return genBtn.disabled; }
 
 function setResultVisible(visible) {
-  resultBody.style.display = visible ? "block" : "none";
+  // 结束时清空 inline display，让 CSS 接管（宽屏下 #resultBody 是 flex 纵向容器，
+  // 写死 "block" 会把 CSS 的 display:flex 覆盖掉，编辑面板就压不到底部）
+  resultBody.style.display = visible ? "" : "none";
   emptyHint.style.display = visible ? "none" : "";
 }
 
@@ -1330,7 +1447,6 @@ function stopUi() {
   cancelBtn.hidden = true;
   curJobId = "";
   curJobState = "";
-  curAbort = null;
   drawHeaderWave(0);
 }
 
@@ -1464,7 +1580,6 @@ genBtn.addEventListener("click", async () => {
   genBtn.disabled = true;
   genStart = performance.now();
   curJobId = "";
-  curAbort = new AbortController();
   player.pause();
   bigPlayIcon.innerHTML = PLAY2;
   clearActionError();
@@ -1503,7 +1618,11 @@ genBtn.addEventListener("click", async () => {
   fd.append("file_naming", "title_time");
 
   try {
-    const r = await fetch(`${API}/tts`, { method: "POST", body: fd, signal: curAbort.signal });
+    // 这个 POST 返回的就是 SSE 流（下面手动读 body），整个生成期间连接都开着。
+    // 所以故意不挂 AbortController：取消必须由服务端 /stop 收尾（要停推理、
+    // 重建或卸载模型），本地 abort 只会让我们收不到终态事件、界面卡在
+    // "正在停止生成…"，而服务端的任务还在跑。
+    const r = await fetch(`${API}/tts`, { method: "POST", body: fd });
     if (!r.ok) {
       const j = await r.json().catch(() => ({}));
       throw new Error(j.detail || `请求失败（${r.status}）`);
@@ -1594,7 +1713,6 @@ genBtn.addEventListener("click", async () => {
     }
     if (genBtn.disabled) showError("生成连接中断，请重试");
   } catch (e) {
-    if (e.name === "AbortError") return; // 用户主动放弃等待，提示已在 cancel 里给过
     showError(e.message);
     pollStatus();
   }
@@ -1649,6 +1767,9 @@ async function loadResult(url, elapsed, serverFile, opts) {
   loadingBox.hidden = true;
   setResultVisible(true);
   clearActionError();
+  // 换音频前必须摘掉上一次「播放选中」挂的 timeupdate：
+  // 否则新音频播到上次选区的结束时间就被自动暂停，看起来像播放器坏了。
+  if (selStopTick) { player.removeEventListener("timeupdate", selStopTick); selStopTick = null; }
   player.src = url;
   try {
     const buf = await (await fetch(url)).arrayBuffer();
@@ -1669,8 +1790,16 @@ async function loadResult(url, elapsed, serverFile, opts) {
   hasResult = true;
   $("trimRange").textContent = `全长 ${trim.buffer.duration.toFixed(2)}s`;
   $("genMeta").textContent = `耗时 ${Number(elapsed || 0).toFixed(1)}s`;
+  syncAxis();
   updateDlName();
   drawTrimWave();
+}
+
+// 时间轴两端：随音频总长更新，没有音频时显示占位符
+function syncAxis() {
+  const d = ED.src ? ED.src.duration : 0;
+  $("axisStart").textContent = d ? "0.00s" : "—";
+  $("axisEnd").textContent = d ? d.toFixed(2) + "s" : "—";
 }
 
 bigPlay.addEventListener("click", () => {
@@ -1679,11 +1808,17 @@ bigPlay.addEventListener("click", () => {
 });
 player.addEventListener("ended", () => { bigPlayIcon.innerHTML = PLAY2; });
 
+/* 结果区源波形：跟左边参考音频同一种柱状条（3px 柱 + 2px 空隙）。
+   原来是 1px 连续列，在 104px 这么宽的画布上读成一片密纹；柱状条既能看出
+   「这是一段声音」，又保留了选区可读的边界。拖动定位用的是连续比例，
+   跟柱宽无关，精度一点没丢。 */
+const TRIM_BAR = { pitch: 5, w: 3, r: 1.5, amp: .84, floor: 2 };
+
 function drawTrimWave() {
   if (!ED.src) return;
   const { w, h } = sizeCanvas(tWave);
   const data = ED.src.getChannelData(0);
-  const step = Math.floor(data.length / w) || 1;
+  const B = TRIM_BAR;
   const mid = h / 2;
   const ink = cssVar("--accent"), mut = cssVar("--border"), pri = cssVar("--primary");
   // 波形恒画源音频（编辑台），选区与播放进度都是源时间轴。
@@ -1692,17 +1827,35 @@ function drawTrimWave() {
   const pos = dur ? (player.currentTime / dur) * w : 0;
   const s = ED.getState().trim;
   tCtx.clearRect(0, 0, w, h);
-  for (let x = 0; x < w; x++) {
-    let min = 1, max = -1;
-    for (let i = 0; i < step; i++) {
-      const v = data[x * step + i] || 0;
-      if (v < min) min = v; if (v > max) max = v;
+
+  // 柱数由宽度决定，整组居中，避免右侧留一截空白
+  const n = Math.max(1, Math.floor(w / B.pitch));
+  const x0 = Math.round((w - n * B.pitch + B.w) / 2);
+  const step = Math.max(1, Math.floor(data.length / n));
+
+  for (let i = 0; i < n; i++) {
+    const base = i * step;
+    let peak = 0;
+    for (let k = 0; k < step; k++) {
+      const v = data[base + k] || 0;
+      const a = v < 0 ? -v : v;
+      if (a > peak) peak = a;
     }
-    const y0 = mid - max * mid * 0.92, y1 = mid - min * mid * 0.92;
-    const inSel = !s || (x / w >= s[0] && x / w <= s[1]);
-    tCtx.fillStyle = x <= pos ? pri : (inSel ? ink : mut);
-    tCtx.globalAlpha = x <= pos ? 0.95 : (inSel ? 0.9 : 0.55);
-    tCtx.fillRect(x, y0, 1, Math.max(1, y1 - y0));
+    // 静音段留 2px 地板，否则整条断成一串点
+    const bh = Math.max(B.floor, peak * mid * B.amp);
+    const x = x0 + i * B.pitch;
+    const p = n > 1 ? i / (n - 1) : 0;
+    const inSel = !s || (p >= s[0] && p <= s[1]);
+    const isPlayed = x <= pos;
+    tCtx.fillStyle = isPlayed ? pri : (inSel ? ink : mut);
+    tCtx.globalAlpha = isPlayed ? 0.95 : (inSel ? 0.9 : 0.55);
+    if (tCtx.roundRect) {
+      tCtx.beginPath();
+      tCtx.roundRect(x, mid - bh, B.w, bh * 2, Math.min(B.r, bh));
+      tCtx.fill();
+    } else {
+      tCtx.fillRect(x, mid - bh, B.w, bh * 2);
+    }
   }
   tCtx.globalAlpha = 1;
   if (s) {
@@ -1806,6 +1959,9 @@ function triggerDownload(href, name) {
   document.body.appendChild(a);
   a.click();
   a.remove();
+  // 下面两处下载用的是 createObjectURL 造的 blob URL，不 revoke 的话
+  // 整段 wav（数 MB ~ 数十 MB）会一直驻留到页面关闭。
+  if (href.startsWith("blob:")) setTimeout(() => URL.revokeObjectURL(href), 10000);
 }
 
 // 源音频的"原名"：优先用服务端 outputs/ 里的实际文件名，其次从 URL 推导
@@ -1840,6 +1996,7 @@ window.syncTrimView = function () {
   $("trimRange").textContent = s
     ? `选中 ${(s[0] * d).toFixed(2)}s – ${(s[1] * d).toFixed(2)}s · ${((s[1] - s[0]) * d).toFixed(2)}s`
     : `全长 ${d.toFixed(2)}s`;
+  syncAxis();
   drawTrimWave();
 };
 
@@ -1933,7 +2090,8 @@ function libSetFolded(folded, persist = true) {
   $("libBox").classList.toggle("lib-collapsed", folded);
   $("libFold").title = folded ? "展开资源库" : "收起资源库";
   $("libFold").setAttribute("aria-label", $("libFold").title);
-  if (persist) localStorage.setItem(LIB_FOLD_KEY, folded ? "1" : "0");
+  // 同 themeBtn：写偏好失败不该让折叠动作本身失效
+  if (persist) { try { localStorage.setItem(LIB_FOLD_KEY, folded ? "1" : "0"); } catch (e) { /* 存不下就只在本次会话生效 */ } }
 }
 $("libFold").addEventListener("click", () => {
   libSetFolded(!$("libBox").classList.contains("lib-collapsed"));
@@ -1976,8 +2134,13 @@ function presetDetail(name, force = false) {
   if (!force && presetDetailCache.has(name)) return Promise.resolve(presetDetailCache.get(name));
   const p = fetch(`${API}/presets/` + encodeURIComponent(name))
     .then((r) => (r.ok ? r.json() : null))
-    .then((d) => d)
-    .catch(() => null);
+    .then((d) => {
+      // 失败结果不留在缓存里：一次网络抖动（或服务刚启动）会让这张卡
+      // 永久显示「详情不可用」，只有整页刷新才恢复。
+      if (d == null) presetDetailCache.delete(name);
+      return d;
+    })
+    .catch((e) => { presetDetailCache.delete(name); return null; });
   presetDetailCache.set(name, p);
   return p;
 }
@@ -2001,11 +2164,13 @@ function renderLib() {
       const row = document.createElement("div");
       row.className = "hist-item" + (name === curPresetName ? " cur" : "");
       row.innerHTML = `<span class="htext"></span><span class="hmeta">加载中…</span>
-        <span class="pm-acts">
-          <button class="pm-act" data-act="rename" type="button" title="改名">改</button>
-          <button class="pm-act" data-act="duplicate" type="button" title="复制">复</button>
-        </span>
-        <button class="pm-del" type="button" title="删除此预设">${ICON_CLOSE}</button>`;
+        <span class="pm-bar">
+          <span class="pm-acts">
+            <button class="pm-act" data-act="rename" type="button" title="改名">改</button>
+            <button class="pm-act" data-act="duplicate" type="button" title="复制">复</button>
+          </span>
+          <button class="pm-del" type="button" title="删除此预设">${ICON_CLOSE}</button>
+        </span>`;
       row.querySelector(".htext").textContent = name;
       row.title = "点击应用此预设";
       row.querySelector(".pm-del").setAttribute("aria-label", "删除预设 " + name);
@@ -2024,6 +2189,7 @@ function renderLib() {
         if (e.target.closest(".pm-del") || e.target.closest(".pm-act")) return;
         if (await applyPresetByName(name)) renderLib();
       });
+      makeActivatable(row, "应用预设 " + name);
       row.querySelectorAll(".pm-act").forEach((btn) => {
         btn.addEventListener("click", async (e) => {
           e.stopPropagation();
@@ -2083,6 +2249,7 @@ function renderLib() {
           updateGenSummary();
         } catch (err) { showActionError("加载示例失败: " + err.message); }
       });
+      makeActivatable(row, "加载示例 " + ((ex.text || "").slice(0, 24) || ""));
       box.appendChild(row);
     }
   }
@@ -2110,7 +2277,11 @@ async function savePresetByName(name, onDone) {
     if (overwrite) fd.set("overwrite", "true");
     const r = await fetch(`${API}/presets`, { method: "POST", body: fd });
     if (r.ok) {
+      // 两处缓存都得清：只清 presetDetailCache 的话，切到预设页时
+      // pmEnsureDetails 用 `!pmDetailMap.has(n)` 过滤会把旧详情当成已加载跳过，
+      // 右栏和卡片上的 temp/top_p/beam 仍是覆盖前的旧值。
       presetDetailCache.delete(name);
+      pmDetailMap.delete(name);
       await (onDone || (() => {}));
       return true;
     }
@@ -2167,7 +2338,8 @@ let histCurId = "";
 function histSetCollapsed(collapsed, persist = true) {
   histBar.classList.toggle("collapsed", collapsed);
   genPage.classList.toggle("hist-collapsed", collapsed);
-  if (persist) localStorage.setItem(HIST_KEY, collapsed ? "1" : "0");
+  // 同上：写偏好失败不能中断后面的计数刷新
+  if (persist) { try { localStorage.setItem(HIST_KEY, collapsed ? "1" : "0"); } catch (e) { /* 存不下就只在本次会话生效 */ } }
   $("histRailCount").textContent = histItems.length;
 }
 
@@ -2220,6 +2392,7 @@ function renderHistory() {
         await refreshHistory();
       } catch (err) { showActionError("删除历史失败: " + err.message); }
     });
+    makeActivatable(row, "载入历史记录 " + histFmtTime(it.created_at));
     box.appendChild(row);
   }
 }
@@ -2243,8 +2416,12 @@ $("histAuto").addEventListener("change", async (e) => {
   const fd = new FormData();
   fd.append("auto_clean", e.target.checked);
   try {
-    const r = await (await fetch(`${API}/history/config`, { method: "POST", body: fd })).json();
-    $("histAuto").checked = !!r.auto_clean;
+    const r = await fetch(`${API}/history/config`, { method: "POST", body: fd });
+    // 不判 ok 的话，失败时响应体是 {"detail":...}，r.auto_clean 为 undefined，
+    // 复选框被静默拨回关闭，用户以为关掉了其实没关。
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    $("histAuto").checked = !!j.auto_clean;
   } catch (err) { showActionError("切换自动清理失败"); }
 });
 
@@ -2257,7 +2434,10 @@ $("histClear").addEventListener("click", async () => {
     danger: true,
   })) return;
   try {
-    await fetch(`${API}/history`, { method: "DELETE" });
+    // 不判 ok 的话，删除失败也会走到底下的「清空成功」提示，
+    // 随后 refreshHistory 又把列表拉回来 —— 数据没变却提示已清空。
+    const r = await fetch(`${API}/history`, { method: "DELETE" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
     histCurId = "";
     await refreshHistory();
   } catch (err) { showActionError("清空历史失败"); }
@@ -2408,12 +2588,46 @@ $("glCascade").addEventListener("change", async (e) => {
 /* ---------------- page tabs (gen / presets / model) ---------------- */
 const tabBtns = document.querySelectorAll("#tabs .tab");
 /* 页脚提示按当前页签换文案：三个页面共用一个 <footer>，
-   原来在预设页和模型页也写着「Ctrl+Enter 生成」，与当前能做的事无关。 */
+   原来在预设页和模型页也写着「Ctrl+Enter 生成」，与当前能做的事无关。
+   结构改成 [{ keys: [...], text }] 而不是一整行字符串：键位要单独排成键帽，
+   说明文字才不会被「Ctrl+Enter 生成」这种混排吃掉层次。分隔符也交给 CSS，
+   文案里不再手写「·」。 */
 const FOOT_HINT = {
-  gen: "快捷键 Ctrl+Enter 生成 · Space 播放暂停 · Ctrl+S 存预设 · 主题跟随系统偏好，可点右上角切换",
-  presets: "预设存于服务端，跨会话可用 · 删除不可恢复 · 点卡片在右侧查看音色与采样参数",
-  model: "精度与加速项改动后需点「重启并应用配置」才生效 · 模型懒加载，首次生成约需 30~60 秒",
+  gen: [
+    { keys: ["Ctrl", "Enter"], text: "生成" },
+    { keys: ["Space"], text: "播放暂停" },
+    { keys: ["Ctrl", "S"], text: "存预设" },
+    { keys: [], text: "主题跟随系统偏好，可点右上角切换" },
+  ],
+  presets: [
+    { keys: [], text: "预设存于服务端，跨会话可用" },
+    { keys: [], text: "删除不可恢复" },
+    { keys: [], text: "点卡片在右侧查看音色与采样参数" },
+  ],
+  model: [
+    { keys: [], text: "精度与加速项改动后需点「重启并应用配置」才生效" },
+    { keys: [], text: "模型懒加载，首次生成约需 30~60 秒" },
+  ],
 };
+
+/* 用 DOM 拼而不是拼 innerHTML：文案里含「」，走 textContent 不用担心转义 */
+function renderFootHint(name) {
+  const frag = document.createDocumentFragment();
+  for (const { keys, text } of FOOT_HINT[name] || FOOT_HINT.gen) {
+    const item = document.createElement("span");
+    item.className = "fh-item";
+    for (const k of keys) {
+      const kbd = document.createElement("kbd");
+      kbd.textContent = k;
+      item.appendChild(kbd);
+    }
+    const label = document.createElement("span");
+    label.textContent = text;
+    item.appendChild(label);
+    frag.appendChild(item);
+  }
+  $("footHint").replaceChildren(frag);
+}
 
 function switchPage(name, updateHash = true) {
   tabBtns.forEach((b) => b.classList.toggle("cur", b.dataset.page === name));
@@ -2422,7 +2636,7 @@ function switchPage(name, updateHash = true) {
     p.classList.toggle("cur", on);
     p.hidden = !on;
   });
-  $("footHint").textContent = FOOT_HINT[name] || FOOT_HINT.gen;
+  renderFootHint(name);
   if (name === "model") refreshModelPage();
   if (name === "presets") refreshPmList();
   // hash 路由：刷新/分享链接时停留在当前页签
@@ -2485,8 +2699,12 @@ async function pmEnsureDetails(names) {
   const worker = async () => {
     while (i < todo.length) {
       const n = todo[i++];
-      try { pmDetailMap.set(n, await pmLoadDetail(n)); }
-      catch { pmDetailMap.set(n, null); }
+      try {
+        const d = await pmLoadDetail(n);
+        // 失败就不写进 map：todo 是用 `!pmDetailMap.has(n)` 过滤的，
+        // 写个 null 进去等于把这条永久标记为「已加载」，下次刷新永远跳过它。
+        if (d != null) pmDetailMap.set(n, d);
+      } catch { /* 留空，下次刷新会重试 */ }
     }
   };
   await Promise.all(Array.from({ length: Math.min(6, todo.length) }, worker));
@@ -2601,11 +2819,13 @@ function renderPmCards() {
       <div class="pm-row"><span class="pm-tag pm-flag"></span></div>
       <span class="pm-params"></span>
       <div class="pm-foot"><span class="pm-emo"></span><button class="pm-apply" type="button">应用</button></div>
-      <span class="pm-acts">
-        <button class="pm-act" data-act="rename" type="button" title="改名">改</button>
-        <button class="pm-act" data-act="duplicate" type="button" title="复制">复</button>
-      </span>
-      <button class="pm-del" type="button" title="删除此预设">${ICON_CLOSE}</button>`;
+      <span class="pm-bar">
+        <span class="pm-acts">
+          <button class="pm-act" data-act="rename" type="button" title="改名">改</button>
+          <button class="pm-act" data-act="duplicate" type="button" title="复制">复</button>
+        </span>
+        <button class="pm-del" type="button" title="删除此预设">${ICON_CLOSE}</button>
+      </span>`;
     card.querySelector(".pm-name").textContent = name;
     card.querySelector(".pm-name").title = name;   // 名称让位给操作按钮后会省略，hover 给全名
     card.querySelector(".pm-del").setAttribute("aria-label", "删除预设 " + name);
@@ -2860,7 +3080,8 @@ function renderInspector(name) {
     const box = document.createElement("div");
     box.className = "insp-vec";
     EMO_NAMES8.forEach((label, i) => {
-      const v = Math.max(0, Math.min(1, vec[i] ?? 0));
+      // ?? 挡不住 NaN：Math.min(1, NaN) 仍是 NaN，会渲染成 width:NaN%（无效 CSS，进度条塌成 0）
+      const v = Math.max(0, Math.min(1, Number.isFinite(vec[i]) ? vec[i] : 0));
       const row = document.createElement("div");
       row.innerHTML = `<span>${label}</span><i><b style="width:${(v * 100).toFixed(1)}%"></b></i><em>${v.toFixed(2)}</em>`;
       box.appendChild(row);
@@ -2898,6 +3119,7 @@ function renderInspector(name) {
     ["repetition_penalty", pmNum(adv.repetition_penalty)],
     ["max_mel_tokens", adv.max_mel_tokens ?? "—"],
     ["分句 Token 上限", adv.max_text_tokens_per_segment ?? "—"],
+    ["段间停顿 ms", adv.interval_silence ?? "—"],
   ];
   $("inspParams").replaceChildren(...rows.map(([k, v]) => {
     const row = document.createElement("div");
@@ -3216,8 +3438,10 @@ $("btnCfgSave").addEventListener("click", () => {
    Ctrl+S            保存当前为预设
    Esc               关闭模态框（已由 _modalSetup 注册） */
 document.addEventListener("keydown", (e) => {
-  // 模态框打开时不响应快捷键（Esc 关窗已由 modal 自己处理）
-  if (!$("modalMask").hidden) return;
+  // 模态框打开时不响应快捷键（Esc 关窗已由各自弹窗处理）。
+  // 这里必须查「任意 .modal-mask」而不是只认 modalMask：裁剪弹窗是第二个模态层，
+  // 只盯 id 的话在裁剪窗口里按 Ctrl+Enter 会把背后的表单提交去生成。
+  if (document.querySelector(".modal-mask:not([hidden])")) return;
   // 输入控件里只放行 Ctrl+Enter / Ctrl+S（修饰键组合不与打字冲突）
   const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "");
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
@@ -3230,9 +3454,16 @@ document.addEventListener("keydown", (e) => {
     $("btnLibSave").click();
     return;
   }
-  if (e.key === " " && !typing && trim.buffer) {
+  // 焦点在按钮或 <summary> 上时，空格是它们的标准激活键（WCAG）。
+  // 这里若抢走，Tab 到「生成语音」「保存预设」或任意折叠标题按空格就会
+  // 去播放音频而不是触发该控件 —— 键盘操作直接错乱。
+  const a = document.activeElement;
+  // 历史条目/示例条目是加了 role="button" 的 <div>，空格同样是它们的激活键
+  const spaceOwned = a && (a.tagName === "BUTTON" || a.tagName === "SUMMARY"
+    || a.tagName === "A" || a.getAttribute("role") === "button");
+  if (e.key === " " && !typing && !spaceOwned && trim.buffer) {
     e.preventDefault();
-    if (player.paused) { player.play(); bigPlayIcon.innerHTML = PAUSE2; }
+    if (player.paused) { player.play().catch(() => {}); bigPlayIcon.innerHTML = PAUSE2; }
     else { player.pause(); bigPlayIcon.innerHTML = PLAY2; }
   }
 });

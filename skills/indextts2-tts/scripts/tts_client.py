@@ -50,6 +50,7 @@ import argparse
 import hashlib
 import io
 import json
+import math
 import mimetypes
 import os
 import socket
@@ -380,6 +381,63 @@ TEXT_CHARS_HARD = 10000
 MAX_EMO_TEXT_CHARS = 500
 AUDIO_MAX_BYTES = 20 * 1024 * 1024
 
+# 8 个生成参数的合法区间，与 server.py 的 GEN_PARAMS 一一对应——改一边必须同步改另一边。
+# 服务端对越界值是"静默夹到边界"：temperature=5 不报错、直接按 2 跑。这种静默
+# 对 API 调用方没问题，对命令行用户就很坑——他以为自己调了 5，实际听的是 2。
+# 所以这里在发请求前先夹一遍并告警：值与服务端最终采纳的完全一致，
+# 只是把"你的值被改了、改成了多少"这句话说出来。
+GEN_RANGES = (
+    # (params 键, CLI 参数名, 下界, 上界, 是否整数)
+    ("emo_weight", "--emo-weight", 0.0, 1.0, False),
+    ("temperature", "--temperature", 0.1, 2.0, False),
+    ("top_p", "--top-p", 0.0, 1.0, False),
+    # top_k=0 是"关闭 top_k 过滤"的语义，不是"取 0 个候选"；夹到 1 会把语义拧反
+    ("top_k", "--top-k", 0, 100, True),
+    ("num_beams", "--num-beams", 1, 10, True),
+    ("max_mel_tokens", "--max-mel-tokens", 50, 1815, True),
+    # 下界 1.0：penalty<1 在 HF RepetitionPenaltyLogitsProcessor 里是"鼓励重复"，
+    # 实测 0.5 必然生成不停直到撞 max_mel_tokens，0.1 直接把 CUDA 上下文打死
+    # （device-side assert，之后连默认参数都失败，只能重启服务）。服务端已于同一
+    # 批次把下界抬到 1.0，这里只是把客户端预检和文案对齐。
+    ("repetition_penalty", "--repetition-penalty", 1.0, 20.0, False),
+    ("length_penalty", "--length-penalty", -2.0, 2.0, False),
+)
+
+# 上表 8 个参数的 --help 文案：synth 与 preset-save 两处共用一份，免得同一个参数
+# 在两个子命令里写出两种说法。区间与默认值都照服务端表单（server.py do_tts）填，
+# 改默认值时要一起改；键集合必须与 GEN_RANGES 完全一致。
+GEN_ARG_HELP = {
+    "emo_weight": "emotion weight 0~1 (default 0.65)",
+    "temperature": "sampling temperature 0.1~2 (default 0.8); lower = steadier, higher = more varied",
+    "top_p": "nucleus sampling 0~1 (default 0.8); ignored when sampling is off",
+    "top_k": "candidate count 0~100 (default 30); 0 = disable top-k filtering; ignored when sampling is off",
+    "num_beams": "beam width 1~10 (default 3); higher = slower but steadier",
+    "repetition_penalty": "repetition penalty 1~20 (default 10); higher = fewer repeats; below 1 encourages repetition and can run away",
+    "max_mel_tokens": "per-segment audio cap 50~1815 (default 1500); reaching it truncates the tail",
+    "length_penalty": "length penalty -2~2 (default 0); 0 = no bias, negative = shorter",
+}
+
+# 越界说明只写这一处：8 个 help 各自重复一句会把列表撑得很长。
+GEN_ARG_RANGE_NOTE = ("Sampling/emotion params have server-side ranges; an out-of-range value is "
+                      "clamped to the boundary with a [warn] instead of being rejected.")
+
+# 其余 5 个参数的 --help 文案。它们不进 GEN_ARG_HELP：上表要与 GEN_RANGES 一一对应，
+# 混进来的键会让"键集合必须一致"这条约束失效。语义要点：
+# - seg_tokens 是**唯一越界报 400 的**（不夹取），因为越界会直接让 range() 抛错；
+# - use_random 不是"随机音色"，是情感向量模式下随机挑情感原型（前端叫"情感随机采样"）；
+# - naming 的 default 不是"默认策略"，而是 spk_<时间戳>_<6位> 这种无标题文件名；
+# - text 在 segments / synth 里来源不同（synth 多一条 stdin），拆成两个键。
+MISC_ARG_HELP = {
+    "text": "inline text; --text-file or piped stdin also work (one is required)",
+    "text_segments": "inline text; --text-file is the alternative (one is required)",
+    "use_random": "pick random emotion prototypes instead of the closest match; needs --emo-vector",
+    "seg_tokens": "max tokens per segment 20~600 (default 120); out of range is 400, not clamped",
+    "naming": "output name: title_time = <title>_<timestamp> (default), title = <title>, "
+              "default = spk_<timestamp>_<rand>",
+    "client_id": "tag for this run's job so /jobs/current can find it after a reconnect "
+                 "(default: agent_<8 hex>)",
+}
+
 # 显存余量判据（仅用于 doctor 的告警，不参与任何拦截）。
 # 实测基线（RTX 3060 Ti 8G）：模型加载后整卡占用约 6.7G、余 1.3G 仍能正常合成；
 # 再低就会被 Windows 静默借共享显存 —— 表现为"不报错但慢十倍"，
@@ -655,6 +713,45 @@ def post_tts(params, files, verbose=True):
     return result
 
 
+def _num_text(v):
+    """告警文案里的数字：0.650000 收成 0.65，2.0 收成 2。"""
+    f = float(v)
+    return str(int(f)) if f.is_integer() else ("%g" % f)
+
+
+# 同一次运行里 (参数, 原始值) 只告警一次。batch 动辄上百条，同一个越界值刷上百遍
+# 会把进度输出冲掉，而这条警告想传达的「你的值被改了」看一次就够了。
+_WARNED_RANGE = set()
+
+
+def clamp_gen_params(params):
+    """就地夹取 params 里的 8 个生成参数，越界打 warn，返回 params。
+
+    只处理"能转成有限浮点数"的值：非数字交给服务端回退默认值（那边有
+    logger.warning 兜底），客户端不重复实现一套容错，免得两边规则漂移。
+    """
+    for key, flag, lo, hi, integer in GEN_RANGES:
+        if key not in params:
+            continue
+        try:
+            v = float(params[key])
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(v) or lo <= v <= hi:
+            continue
+        clamped = min(max(v, lo), hi)
+        clamped = int(round(clamped)) if integer else clamped
+        params[key] = clamped          # 夹取本身永远执行，与是否再告警无关
+        if (key, v) in _WARNED_RANGE:
+            continue
+        _WARNED_RANGE.add((key, v))
+        hint = " (0 = no top_k filtering)" if key == "top_k" and clamped == 0 else ""
+        print("[warn] %s %s out of range [%s, %s], server clamps to %s%s"
+              % (flag, _num_text(v), _num_text(lo), _num_text(hi),
+                 _num_text(clamped), hint), file=sys.stderr)
+    return params
+
+
 def prepare_tts_request(ns, text, tmpdir):
     """把命令行参数命名空间组装成 /tts 请求，返回 (params, files, voice_ref, emo_mode)。
 
@@ -730,6 +827,10 @@ def prepare_tts_request(ns, text, tmpdir):
             print("[warn] --interval-silence %d out of range, server clamps to %d ms"
                   % (ns.interval_silence, clamped), file=sys.stderr)
             params["interval_silence"] = clamped
+
+    # 8 个生成参数统一夹一遍：预设里带来的旧值同样会越界，所以放在所有来源
+    # （CLI 覆盖 + 预设回填）都合进 params 之后，而不是只查 CLI 那几项。
+    clamp_gen_params(params)
 
     params["text"] = text
     params["client_id"] = ns.client_id
@@ -3144,14 +3245,16 @@ def build_parser():
     sp.set_defaults(func=cmd_model_restart)
 
     sp = sub.add_parser("presets", help="list presets")
-    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--json", action="store_true",
+                    help="print every preset's full detail as JSON (default: one summary line each)")
     sp.set_defaults(func=cmd_presets)
 
     sp = sub.add_parser("preset", help="show one preset detail")
-    sp.add_argument("name")
+    sp.add_argument("name", help="preset name, as listed by `presets`")
     sp.set_defaults(func=cmd_preset)
 
-    sp = sub.add_parser("preset-save", help="save a reference audio as a named preset voice")
+    sp = sub.add_parser("preset-save", help="save a reference audio as a named preset voice",
+                        description=GEN_ARG_RANGE_NOTE)
     sp.add_argument("--name", required=True, help="preset name (also used as --preset later)")
     sp.add_argument("--audio", required=True,
                     help="reference audio path, or a built-in example name (e.g. voice_01.wav)")
@@ -3162,26 +3265,28 @@ def build_parser():
     sp.add_argument("--emo-text", default=None, help="emotion description (mode 3)")
     sp.add_argument("--emo-vector", default=None,
                     help="8 values: %s (comma or bracket list)" % ",".join(EMO_VEC_NAMES))
-    sp.add_argument("--emo-weight", type=float, default=None)
-    sp.add_argument("--use-random", action="store_true")
-    sp.add_argument("--top-p", type=float, default=None)
-    sp.add_argument("--top-k", type=int, default=None)
-    sp.add_argument("--temperature", type=float, default=None)
-    sp.add_argument("--length-penalty", type=float, default=None)
-    sp.add_argument("--num-beams", type=int, default=None)
-    sp.add_argument("--repetition-penalty", type=float, default=None)
-    sp.add_argument("--max-mel-tokens", type=int, default=None)
-    sp.add_argument("--seg-tokens", type=int, default=None)
+    sp.add_argument("--emo-weight", type=float, default=None, help=GEN_ARG_HELP["emo_weight"])
+    sp.add_argument("--use-random", action="store_true", help=MISC_ARG_HELP["use_random"])
+    sp.add_argument("--top-p", type=float, default=None, help=GEN_ARG_HELP["top_p"])
+    sp.add_argument("--top-k", type=int, default=None, help=GEN_ARG_HELP["top_k"])
+    sp.add_argument("--temperature", type=float, default=None, help=GEN_ARG_HELP["temperature"])
+    sp.add_argument("--length-penalty", type=float, default=None, help=GEN_ARG_HELP["length_penalty"])
+    sp.add_argument("--num-beams", type=int, default=None, help=GEN_ARG_HELP["num_beams"])
+    sp.add_argument("--repetition-penalty", type=float, default=None,
+                    help=GEN_ARG_HELP["repetition_penalty"])
+    sp.add_argument("--max-mel-tokens", type=int, default=None, help=GEN_ARG_HELP["max_mel_tokens"])
+    sp.add_argument("--seg-tokens", type=int, default=None, help=MISC_ARG_HELP["seg_tokens"])
     sp.set_defaults(func=cmd_preset_save)
 
     sp = sub.add_parser("examples", help="list built-in example voices")
-    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--json", action="store_true",
+                    help="print the raw JSON list (default: readable table + a usage hint)")
     sp.set_defaults(func=cmd_examples)
 
     sp = sub.add_parser("segments", help="preview text segmentation (or emit a batch task list)")
-    sp.add_argument("--text", default=None)
+    sp.add_argument("--text", default=None, help=MISC_ARG_HELP["text_segments"])
     sp.add_argument("--text-file", default=None, help="UTF-8 text file (BOM tolerated)")
-    sp.add_argument("--seg-tokens", type=int, default=120)
+    sp.add_argument("--seg-tokens", type=int, default=120, help=MISC_ARG_HELP["seg_tokens"])
     sp.add_argument("--out", default=None, metavar="TASKS.json",
                     help="write a batch task list ({\"defaults\":...,\"items\":[...]}) to this path")
     sp.add_argument("--preset", default=None, help="preset to put into the generated defaults")
@@ -3244,16 +3349,22 @@ def build_parser():
     sp.set_defaults(func=cmd_history)
 
     sp = sub.add_parser("stop", help="stop a queued/running job")
-    sp.add_argument("job_id")
+    sp.add_argument("job_id",
+                    help="job id printed by `synth`/`batch`; 404 = unknown or already finished")
     sp.add_argument("--keep-model", action="store_true",
                     help="keep the model loaded (skip the ~10-20s rebuild; next synth starts immediately)")
     sp.set_defaults(func=cmd_stop)
 
     sp = sub.add_parser("glossary", help="list / add / delete / clear glossary terms")
-    sp.add_argument("--add", default=None, metavar="TERM")
-    sp.add_argument("--zh", default=None, metavar="READING_ZH")
-    sp.add_argument("--en", default=None, metavar="READING_EN")
-    sp.add_argument("--delete", default=None, metavar="TERM")
+    sp.add_argument("--add", default=None, metavar="TERM",
+                    help="term to add or overwrite; also give --zh and/or --en "
+                         "(without a reading the server returns 400)")
+    sp.add_argument("--zh", default=None, metavar="READING_ZH",
+                    help="Chinese reading for the term given by --add")
+    sp.add_argument("--en", default=None, metavar="READING_EN",
+                    help="English reading for the term given by --add")
+    sp.add_argument("--delete", default=None, metavar="TERM",
+                    help="term to delete (exact match)")
     sp.add_argument("--clear", action="store_true", help="delete every term (requires --yes)")
     sp.add_argument("--yes", action="store_true", help="confirm --clear (irreversible)")
     sp.set_defaults(func=cmd_glossary)
@@ -3265,12 +3376,13 @@ def build_parser():
     sp.add_argument("--open", action="store_true", help="open the containing folder in the file manager")
     sp.set_defaults(func=cmd_last)
 
-    sp = sub.add_parser("synth", help="generate speech (blocks until done)")
+    sp = sub.add_parser("synth", help="generate speech (blocks until done)",
+                        description=GEN_ARG_RANGE_NOTE)
     sp.add_argument("--preset", default=None, help="preset name (reference audio + params)")
     sp.add_argument("--voice", default=None,
                     help="reference audio path, or a built-in example name (e.g. voice_01.wav; "
                          "fetched from the server when not present locally)")
-    sp.add_argument("--text", default=None)
+    sp.add_argument("--text", default=None, help=MISC_ARG_HELP["text"])
     sp.add_argument("--text-file", default=None, help="UTF-8 text file (BOM tolerated; alternative to --text)")
     sp.add_argument("--out", default=None,
                     help="output wav path (default: <INDEXTTS_OUT_DIR>/<date>/<server filename>)")
@@ -3282,22 +3394,25 @@ def build_parser():
     sp.add_argument("--emo-text", default=None, help="emotion description (mode 3)")
     sp.add_argument("--emo-vector", default=None,
                     help="8 values: %s (comma or bracket list)" % ",".join(EMO_VEC_NAMES))
-    sp.add_argument("--emo-weight", type=float, default=None)
-    sp.add_argument("--use-random", action="store_true")
-    sp.add_argument("--seg-tokens", type=int, default=None)
+    sp.add_argument("--emo-weight", type=float, default=None, help=GEN_ARG_HELP["emo_weight"])
+    sp.add_argument("--use-random", action="store_true", help=MISC_ARG_HELP["use_random"])
+    sp.add_argument("--seg-tokens", type=int, default=None, help=MISC_ARG_HELP["seg_tokens"])
     sp.add_argument("--sample", action="store_true", default=None, help="force do_sample=true")
     sp.add_argument("--no-sample", action="store_true", help="force do_sample=false")
-    sp.add_argument("--top-p", type=float, default=None)
-    sp.add_argument("--top-k", type=int, default=None)
-    sp.add_argument("--temperature", type=float, default=None)
-    sp.add_argument("--length-penalty", type=float, default=None)
-    sp.add_argument("--num-beams", type=int, default=None)
-    sp.add_argument("--repetition-penalty", type=float, default=None)
-    sp.add_argument("--max-mel-tokens", type=int, default=None)
+    sp.add_argument("--top-p", type=float, default=None, help=GEN_ARG_HELP["top_p"])
+    sp.add_argument("--top-k", type=int, default=None, help=GEN_ARG_HELP["top_k"])
+    sp.add_argument("--temperature", type=float, default=None, help=GEN_ARG_HELP["temperature"])
+    sp.add_argument("--length-penalty", type=float, default=None, help=GEN_ARG_HELP["length_penalty"])
+    sp.add_argument("--num-beams", type=int, default=None, help=GEN_ARG_HELP["num_beams"])
+    sp.add_argument("--repetition-penalty", type=float, default=None,
+                    help=GEN_ARG_HELP["repetition_penalty"])
+    sp.add_argument("--max-mel-tokens", type=int, default=None, help=GEN_ARG_HELP["max_mel_tokens"])
     sp.add_argument("--interval-silence", type=int, default=None, metavar="MS",
                     help="silence inserted between segments, 10-500 ms (default 200); only matters for multi-segment text")
-    sp.add_argument("--naming", default=None, choices=["title_time", "title", "default"])
-    sp.add_argument("--client-id", default="agent_" + uuid.uuid4().hex[:8])
+    sp.add_argument("--naming", default=None, choices=["title_time", "title", "default"],
+                    help=MISC_ARG_HELP["naming"])
+    sp.add_argument("--client-id", default="agent_" + uuid.uuid4().hex[:8],
+                    help=MISC_ARG_HELP["client_id"])
     sp.add_argument("--lock-wait", type=int, default=3600, metavar="SEC",
                     help="max seconds to wait for the global synth lock (default 3600; 0=fail fast if busy)")
     sp.add_argument("--no-start", action="store_true", help="fail instead of spawning server")

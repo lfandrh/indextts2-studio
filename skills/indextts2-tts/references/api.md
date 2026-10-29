@@ -210,7 +210,7 @@ outputs/presets/胡桃/
 | `GET /presets` | `{"presets": ["胡桃", ...]}` |
 | `GET /presets/{name}` | 详情；音频字段换成 `prompt_audio_url` / `emo_audio_url`（**已是 percent-encode 态**） |
 | `GET /presets/{name}/audio/{kind}` | `kind` = `prompt` \| `emo_ref` |
-| `POST /presets` | 创建（同名 **409**） |
+| `POST /presets` | 创建。同名 **409**；音频不是可识别格式 **400**；音频 > 20 MB **413**。`advanced_params` 落盘前按 `/tts` 的参数区间夹取，所以存进去的已经是夹过的值 |
 | `DELETE /presets/{name}` | 删除 |
 | `POST /presets/{name}/rename` | 重命名 |
 | `POST /presets/{name}/duplicate` | 复制 |
@@ -230,7 +230,7 @@ outputs/presets/胡桃/
 | 端点 | 说明 |
 |---|---|
 | `GET /examples?include_experimental=0\|1` | 内置示例音色（来自 `examples/cases.jsonl`），自带推荐情感参数。默认**过滤掉 `emo_mode=3`** 的实验性条目，带 `include_experimental=1` 才全给 |
-| `GET /examples/{name}` | **返回该示例的 wav 文件本体**（`FileResponse`），不是 JSON 详情——名字对不上任何 `cases.jsonl` 条目也能取到 `examples/` 目录下的同名文件 |
+| `GET /examples/{name}` | **返回该示例的音频文件本体**（`FileResponse`），不是 JSON 详情——名字对不上任何 `cases.jsonl` 条目也能取到 `examples/` 目录下的同名音频。**只放行音频扩展名**（`.wav` `.mp3` `.flac` `.ogg` `.m4a`），`cases.jsonl`、`batch/` 子目录、无扩展名一律 **404** |
 | `POST /segments` | `text` + `max_text_tokens_per_segment` → 预览自动分段结果，**不合成** |
 | `GET /history` | 本次服务运行的生成历史（**内存态，重启即清**），最多 20 条 |
 | `POST /history/config` | `auto_clean` 开关：超出 20 条时是否连带删除音频文件 |
