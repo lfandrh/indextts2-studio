@@ -18,7 +18,7 @@
 | 运行库 | Visual C++ 2015–2022 运行库 x64 | 缺了会报 DLL / `VCRUNTIME140.dll` 相关错误 |
 | 可选 | ffmpeg | 有了才能收 m4a / aac / wma，以及直接从视频里抽音轨 |
 
-> 不支持纯 CPU：这是 NVIDIA CUDA 推理，CPU 跑慢到没有实用价值。
+> 没有 N 卡也能跑：程序会自动降级为纯 CPU 推理，但内存占用会明显变大、生成速度极慢，因此不推荐作为日常使用方案。
 
 **本文所有截图都来自下面这台机器**，顶栏四项仪表显示的就是这些实时数字：
 
@@ -87,7 +87,7 @@ uv sync --extra server
 uv run --extra server python server.py
 ```
 
-要求：Windows 10/11、NVIDIA 显卡、[Visual C++ 2015–2022 运行库 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe)、
+要求：Windows 10/11、NVIDIA 显卡（没有 N 卡会自动降级为纯 CPU，速度极慢，不推荐）、[Visual C++ 2015–2022 运行库 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe)、
 `git`、`uv`（Python 3.10–3.11 由 uv 管理）。模型权重放在 `checkpoints/`，缺权重时首次生成会报错。
 
 ### 1.3 日志在哪
@@ -521,7 +521,7 @@ https://aka.ms/vs/17/release/vc_redist.x64.exe 装完重启电脑，再启动服
 装成了 CPU 版 torch。按仓库的 `uv.lock` 重新同步依赖，不要手动 `pip install torch`。
 
 **Q：没有显卡能跑吗？**
-不支持。这是需要 NVIDIA GPU 的本地模型，纯 CPU 慢到没有实用价值。
+能跑，但很慢：没有检测到 NVIDIA 显卡时，程序会自动降级为纯 CPU 推理，内存占用较大、生成速度极慢，只适合验证功能，不适合日常使用。
 
 ### 8.3 声音效果
 

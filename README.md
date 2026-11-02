@@ -262,7 +262,7 @@ index-tts/
 ### 环境要求
 
 - Windows 10 / 11
-- NVIDIA 显卡（CUDA 12.8，≥ 8 GB 显存推荐）
+- NVIDIA 显卡（CUDA 12.8，≥ 8 GB 显存推荐）；没有 N 卡会自动降级为纯 CPU，内存占用较大且生成速度极慢，不推荐
 - [Visual C++ 2015–2022 运行库 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe)
 - [git](https://git-scm.com/downloads)
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)（Python 3.10–3.11 由 uv 自动管理，无需手动安装）
