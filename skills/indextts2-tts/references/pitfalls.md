@@ -471,6 +471,26 @@ python tts_client.py glossary                     # 看当前词表
 
 ---
 
+### 现象：英文缩写 `don't`、`they're` 读成"冬特 / 逐字母"，**加术语表也无效**
+
+**原因**：2.0 的英文词表里没有任何缩写的整词写法，`don't` 一定被拆成 `don` + `'` + `t` 三段。
+缩写展开正又在术语表**之前**执行（`indextts/utils/front.py` 的 `ENGLISH_CONTRACTION_PATTERN`），
+所以 `it's` / `he's` / `that's` 这类 `'s` 缩写是**死条目**——术语表怎么写都不生效。
+官方 issue #380 / #542 / #824 均未修，属模型侧限制。
+
+**处理**：别在服务端词表上浪费时间（还会误伤别人的稿子），**改写入稿文本**：
+
+| 可换成同音整词（读出原音） | 其余只能写完整形式 |
+|---|---|
+| `they're→their`、`you're→your`、`it's→its`、`we'll→well` | `do not`、`cannot`、`will not`、`is not`、`they are`、`let us` |
+
+- 英文稿**必须用半角撇号** `'`。Word / 微信粘出来的弯撇号 `’` 会绕过术语表匹配。
+- 所有格 `the rabbit's fur` 会被读成 "the rabbit **is** fur"（词尾撞上 `it`/`he`/`she`/`that`
+  等关键词）。改写成 `the fur of the rabbit`。
+- 长文里英文缩写很多时，在生成前把替换规则写进文本预处理，别一条条手改。
+
+---
+
 ## 11. 整合包升级后接口漂移
 
 ### 现象：脚本对着新整合包调接口，莫名其妙 404 / 400
