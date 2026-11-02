@@ -69,12 +69,14 @@ async function apiFetch(path, opts) {
    阻塞语义与原生一致：点遮罩/取消都算否定，Esc 等同取消。 */
 const _modal = {
   mask: null, okBtn: null, input: null, resolve: null, prevFocus: null,
+  timer: null, countdownEl: null,
 };
 function _modalSetup() {
   if (_modal.mask) return;
   _modal.mask = $("modalMask");
   _modal.okBtn = $("modalOk");
   _modal.input = $("modalInput");
+  _modal.countdownEl = $("modalCountdown");
   $("modalCancel").addEventListener("click", () => _modalClose(false));
   _modal.okBtn.addEventListener("click", () => {
     if (!_modal.input.hidden && !_modal.input.value.trim()) {
@@ -104,11 +106,37 @@ function _modalOpen(opts) {
   _modal.okBtn.classList.toggle("primary", !opts.danger);
   // danger 确认键红底白字（实底非 ghost），与删除操作的语义一致
   _modal.okBtn.classList.toggle("danger", !!opts.danger);
+  clearInterval(_modal.timer);
+  _modal.timer = null;
+  const cd = _modal.countdownEl;
+  if (cd) {
+    if (opts.countdown) {
+      let left = Math.max(1, Math.ceil(opts.countdown));
+      const label = opts.countdownText || ((n) => `${n} 秒后自动确认`);
+      cd.textContent = label(left);
+      cd.hidden = false;
+      _modal.timer = setInterval(() => {
+        left -= 1;
+        if (left <= 0) {
+          clearInterval(_modal.timer);
+          _modal.timer = null;
+          _modalClose(true);
+          return;
+        }
+        cd.textContent = label(left);
+      }, 1000);
+    } else {
+      cd.hidden = true;
+      cd.textContent = "";
+    }
+  }
   _modal.prevFocus = document.activeElement;
   _modal.mask.hidden = false;
   (_modal.input.hidden ? _modal.okBtn : _modal.input).focus();
 }
 function _modalClose(ok) {
+  clearInterval(_modal.timer);
+  _modal.timer = null;
   if (_modal.mask.hidden) return;
   _modal.mask.hidden = true;
   const res = _modal.resolve;
@@ -1487,10 +1515,12 @@ $("segTokens").addEventListener("input", scheduleSegments);
 const segList = $("segList");
 let segTimer = null;
 let segSeq = 0;          // 请求序号：防止慢的旧请求后到、覆盖新内容
+let segEst = null;       // 最近一次分句预览的耗时估算，长文候选提示复用
 async function updateSegments() {
   const mine = ++segSeq;
   const text = $("text").value;
   if (!text.trim()) {
+    segEst = null;
     segList.replaceChildren();
     $("segInfo").textContent = "分句预览待输入";
     $("estDurEcho").textContent = "输入文本后这里会显示分句预览";
@@ -1539,6 +1569,7 @@ async function updateSegments() {
     // 粗略值只为给长文本用户一个心理预期，不是精确基准）。
     // 注意不含【首次模型加载】（实测冷启动约 30~60 秒），也不含排队等待。
     const estSec = Math.round(segs.length * 4 + totalTok * 0.06);
+    segEst = { text, segTokens: $("segTokens").value, estSec };
     // 只说一次「约」：原来是「预估 约 8 秒」，两个词表达同一件事
     const est = estSec >= 60 ? `${Math.round(estSec / 60)} 分钟` : `${estSec} 秒`;
     $("estDurEcho").textContent =
@@ -2223,6 +2254,17 @@ function setCandN(n) {
   candN = n === 2 || n === 3 ? n : 1;
   syncCandSeg();
 }
+
+/* 单条预计达到 10 分钟就算长文：3 条候选合计 ≈ 30 分钟起，逐条试听也费时。
+   估算优先复用分句预览的真实 token 数；预览还没回来时用同一套经验公式兜底。 */
+const LONG_TEXT_CAND_SEC = 600;
+function estimateGenSeconds(text, segTok) {
+  if (segEst && segEst.text === text && segEst.segTokens === String(segTok)) return segEst.estSec;
+  const chars = textUnits(text);
+  const toks = Math.ceil(chars * 1.9);
+  const segs = Math.max(1, Math.ceil(toks / Math.max(1, Number(segTok) || 120)));
+  return Math.round(segs * 4 + toks * 0.06);
+}
 $("candSeg").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-cand]");
   if (!b) return;
@@ -2729,13 +2771,39 @@ genBtn.addEventListener("click", async () => {
   // 超限值在发送前回夹：服务端也会夹，但界面上留 99、实际用 20 是两码事（BUG-006）
   const clampedParams = clampParamsForSend();
 
-  const N = candN;
+  let N = candN;
+  let candFoldedHint = "";
+  if (N > 1) {
+    const textNow = $("text").value;
+    const estSec = estimateGenSeconds(textNow, $("segTokens").value);
+    if (estSec >= LONG_TEXT_CAND_SEC) {
+      const chars = textUnits(textNow.trim());
+      const oneMin = Math.max(1, Math.ceil(estSec / 60));
+      const allMin = Math.max(oneMin, Math.ceil((estSec * N) / 60));
+      const keepOne = await uiConfirm({
+        title: "长文建议先生成一条",
+        body: `当前文本约 ${chars} 字，单条预计约 ${oneMin} 分钟；${N} 条候选合计约 ${allMin} 分钟，长文逐条试听也更费时间。`,
+        okText: "调整为 1 条",
+        cancelText: `保持 ${N} 条`,
+        countdown: 5,
+        countdownText: (left) => `${left} 秒后自动调整为 1 条候选`,
+      });
+      if (keepOne) {
+        setCandN(1);
+        N = 1;
+        candFoldedHint = "已按长文建议调整为 1 条候选";
+      }
+    }
+  }
   genStart = performance.now();
   curJobId = "";
   player.pause();
   bigPlayIcon.innerHTML = PLAY2;
   clearActionError();
-  if (clampedParams.length) showActionHint(`参数超出可设范围，已按边界执行：${clampedParams.join("、")}`);
+  const genHints = [];
+  if (candFoldedHint) genHints.push(candFoldedHint);
+  if (clampedParams.length) genHints.push(`参数超出可设范围，已按边界执行：${clampedParams.join("、")}`);
+  if (genHints.length) showActionHint(genHints.join("；"));
   setResultVisible(false);
   errBox.classList.remove("on");
   // 新一轮：候选条归零重来（单条时直接隐藏）。组 id 只有 N>1 才生成。

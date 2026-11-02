@@ -2654,6 +2654,7 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
 @keyframes modalIn { from { transform: translateY(6px) scale(.99); opacity: 0; } }
 .modal-title { font-size: var(--fs-15); font-weight: 700; }
 .modal-body { font-size: var(--fs-13); color: var(--muted); line-height: 1.6; overflow-wrap: anywhere; }
+.modal-countdown { font-size: var(--fs-12); color: var(--muted); line-height: 1.5; }
 .modal-error { font-size: var(--fs-12); color: var(--danger); }
 .modal-foot { display: flex; gap: var(--s2); justify-content: flex-end; align-items: center; }
 .modal-foot input[type="text"] { flex: 1; min-width: 0; }
