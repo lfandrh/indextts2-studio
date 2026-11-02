@@ -287,9 +287,19 @@ class ClientTestCase(unittest.TestCase):
         })
         if env_extra:
             env.update(env_extra)
-        return subprocess.run([PY, str(CLIENT)] + [str(a) for a in args],
-                              cwd=str(cwd or self.tmp), env=env, input=stdin,
-                              capture_output=True, text=True, timeout=180)
+        # encoding 必须显式写 utf-8，和上面给子进程的 PYTHONIOENCODING 对齐。
+        # 只写 text=True 时父进程按本机 locale 解码，中文 Windows（cp936）读到
+        # UTF-8 管道会在线程里抛 UnicodeDecodeError，stdout 直接变成 None，
+        # 20 个用例集体报成看不懂的 NoneType 错（BUG-009）。
+        res = subprocess.run([PY, str(CLIENT)] + [str(a) for a in args],
+                             cwd=str(cwd or self.tmp), env=env, input=stdin,
+                             capture_output=True, text=True, timeout=180,
+                             encoding="utf-8", errors="replace")
+        if res.stdout is None:
+            raise AssertionError(
+                "客户端子进程没有返回 stdout（returncode=%s，stderr=%r）"
+                % (res.returncode, (res.stderr or "")[-800:]))
+        return res
 
     @staticmethod
     def json_out(res):

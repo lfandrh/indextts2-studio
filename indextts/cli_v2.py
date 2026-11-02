@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 import tempfile
+import traceback
 import wave
 from pathlib import Path
 
@@ -173,6 +174,11 @@ def _build_parser():
         help="Validate the batch file without loading model weights",
     )
     batch.add_argument("--force", action="store_true", help="Overwrite output if it exists")
+    batch.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Keep generating the remaining tasks when one line fails",
+    )
     batch.add_argument(
         "--output-dir",
         help="Directory for automatically named independent WAV outputs",
@@ -509,6 +515,9 @@ def _run_synth(args, tts_factory=None, stdin=None):
     missing_exit_code = _report_missing_model_resources(model_dir)
     if missing_exit_code is not None:
         return EXIT_MISSING_RESOURCE
+    device_exit_code = _unavailable_device_exit_code(runtime)
+    if device_exit_code is not None:
+        return device_exit_code
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if tts_factory is None:
         try:
@@ -545,6 +554,11 @@ def _run_synth(args, tts_factory=None, stdin=None):
             )
     except Exception as exc:
         print(f"ERROR: inference failed: {exc}", file=sys.stderr)
+        _maybe_print_traceback(args.verbose)
+        return EXIT_INFERENCE_ERROR
+    # 推理的返回值不可靠（generator 零产出时是 None），以产物为准
+    if not output_path.exists():
+        print(f"ERROR: inference produced no output file: {output_path}", file=sys.stderr)
         return EXIT_INFERENCE_ERROR
     print(f"Generated: {output_path}")
     return EXIT_SUCCESS
@@ -570,6 +584,9 @@ def _run_batch(args, tts_factory=None):
     missing_exit_code = _report_missing_model_resources(model_dir)
     if missing_exit_code is not None:
         return EXIT_MISSING_RESOURCE
+    device_exit_code = _unavailable_device_exit_code(runtime)
+    if device_exit_code is not None:
+        return device_exit_code
     if args.dry_run:
         if output_config["mode"] == "concat":
             print(f"Batch concat OK: {len(tasks)} tasks")
@@ -593,11 +610,14 @@ def _run_batch(args, tts_factory=None):
             )
     except Exception as exc:
         print(f"ERROR: inference failed: {exc}", file=sys.stderr)
+        _maybe_print_traceback(verbose)
         return EXIT_INFERENCE_ERROR
 
     if output_config["mode"] == "concat":
         return _run_batch_concat(args, tasks, tts, verbose, output_config["output_path"])
 
+    generated = 0
+    failed = []
     for task in tasks:
         output_path = task["output_path"]
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -613,9 +633,17 @@ def _run_batch(args, tts_factory=None):
                 tts.infer(**infer_kwargs)
         except Exception as exc:
             print(f"ERROR: batch file line {task['line_number']} inference failed: {exc}", file=sys.stderr)
-            return EXIT_INFERENCE_ERROR
+            _maybe_print_traceback(verbose)
+            failed.append(task["line_number"])
+            if not getattr(args, "continue_on_error", False):
+                break
+            continue
         print(f"Generated: {output_path}")
-    print(f"Batch complete: {len(tasks)} tasks generated")
+        generated += 1
+    if failed:
+        print(f"Batch incomplete: {generated} generated, {len(failed)} failed (lines {failed})")
+        return EXIT_INFERENCE_ERROR
+    print(f"Batch complete: {generated} tasks generated")
     return EXIT_SUCCESS
 
 
@@ -641,6 +669,7 @@ def _run_batch_concat(args, tasks, tts, verbose, output_path):
                     tts.infer(**infer_kwargs)
             except Exception as exc:
                 print(f"ERROR: batch file line {task['line_number']} inference failed: {exc}", file=sys.stderr)
+                _maybe_print_traceback(verbose)
                 _handle_batch_concat_temp_dir_after_failure(temp_dir, keep_temp=args.keep_temp)
                 return EXIT_INFERENCE_ERROR
             try:
@@ -682,12 +711,13 @@ def _run_batch_concat(args, tasks, tts, verbose, output_path):
         else:
             cleanup_error = _cleanup_batch_concat_temp_dir(temp_dir)
             if cleanup_error is not None:
-                print(f"ERROR: cleanup failed: {cleanup_error}", file=sys.stderr)
-                return EXIT_INFERENCE_ERROR
+                # 音频已经生成成功，清理临时目录失败不该让调用脚本以为整体失败
+                print(f"WARNING: cleanup failed: {cleanup_error}", file=sys.stderr)
             print(f"Generated: {output_path}")
         return EXIT_SUCCESS
     except Exception as exc:
         print(f"ERROR: batch concat failed: {exc}", file=sys.stderr)
+        _maybe_print_traceback(verbose)
         _handle_batch_concat_temp_dir_after_failure(temp_dir, keep_temp=args.keep_temp)
         return EXIT_INFERENCE_ERROR
 
@@ -765,8 +795,15 @@ def _emotion_conflict_error(args):
 
 def _read_synth_text(args, stdin):
     if args.stdin:
-        source = sys.stdin if stdin is None else stdin
-        return source.read().strip()
+        if stdin is not None:
+            return stdin.read().strip()
+        # 按字节读再显式 UTF-8 解码：GBK 控制台的管道里传 UTF-8 中文时，
+        # sys.stdin.read() 会直接抛未处理的 UnicodeDecodeError。
+        data = sys.stdin.buffer.read()
+        try:
+            return data.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return data.decode(sys.stdin.encoding or "utf-8", errors="replace").strip()
     if args.text_file:
         return Path(args.text_file).read_text(encoding="utf-8").strip()
     return args.text.strip()
@@ -1456,9 +1493,48 @@ def _configure_hf_cache(model_dir):
 
 
 def _synth_stdout_context(verbose):
+    """非 verbose 时压住推理过程的 stdout，但把告警行回显到 stderr。
+
+    以前直接 redirect_stdout(io.StringIO()) 丢弃全部输出，未知 token 警告、
+    文本规范化回退这类关键提示被无声吞掉，StringIO 的内容也从没人看。
+    """
     if verbose:
         return contextlib.nullcontext()
-    return contextlib.redirect_stdout(io.StringIO())
+
+    @contextlib.contextmanager
+    def capture():
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                yield
+        finally:
+            # 推理抛异常时，异常前已捕获的告警也不能丢（stderr 不受 redirect 影响）
+            for line in buf.getvalue().splitlines():
+                if "warn" in line.lower() or "unknown token" in line.lower():
+                    print(line, file=sys.stderr)
+
+    return capture()
+
+
+def _maybe_print_traceback(verbose=False):
+    """失败时默认只给一行错误；需要堆栈时用 --verbose 或 INDEXTTS_TRACEBACK=1。"""
+    if verbose or os.environ.get("INDEXTTS_TRACEBACK"):
+        traceback.print_exc()
+
+
+def _unavailable_device_exit_code(runtime):
+    """--device 写错时在加载模型前就给出可读错误（以前延迟到 .to() 的 torch 异常）。"""
+    if not runtime.device:
+        return None
+    try:
+        import torch
+    except (ImportError, OSError):
+        # 缺 torch 由后续的「runtime unavailable」路径报，别在这里抢答
+        return None
+    if _is_requested_device_available(torch, _detect_devices(torch), runtime.device):
+        return None
+    print(f"ERROR: requested device is not available: {runtime.device}", file=sys.stderr)
+    return EXIT_RUNTIME_UNAVAILABLE
 
 
 def _run_check(args):

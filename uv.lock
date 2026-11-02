@@ -666,6 +666,7 @@ dependencies = [
 [package.optional-dependencies]
 server = [
     { name = "fastapi", marker = "sys_platform == 'win32'" },
+    { name = "markdown", marker = "sys_platform == 'win32'" },
     { name = "psutil", marker = "sys_platform == 'win32'" },
     { name = "python-multipart", marker = "sys_platform == 'win32'" },
     { name = "uvicorn", marker = "sys_platform == 'win32'" },
@@ -693,6 +694,7 @@ requires-dist = [
     { name = "json5", specifier = "==0.10.0" },
     { name = "keras", specifier = "==2.9.0" },
     { name = "librosa", specifier = "==0.10.2.post1" },
+    { name = "markdown", marker = "extra == 'server'", specifier = ">=3.5" },
     { name = "matplotlib", specifier = "==3.10.0" },
     { name = "modelscope", specifier = "==1.27.0" },
     { name = "munch", specifier = "==4.0.0" },

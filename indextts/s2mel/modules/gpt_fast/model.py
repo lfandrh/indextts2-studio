@@ -127,7 +127,9 @@ class Transformer(nn.Module):
         self.norm = AdaptiveLayerNorm(config.dim, RMSNorm(config.dim, eps=config.norm_eps))
 
         self.freqs_cis: Optional[Tensor] = None
-        self.mask_cache: Optional[Tensor] = None
+        # 惰性构造：只有 is_causal 模型（forward 未传 mask）才需要这张表，
+        # 默认 checkpoint 恒传显式 mask，这里省下 8192^2 bool 的常驻显存。
+        self.causal_mask: Optional[Tensor] = None
         self.max_batch_size = -1
         self.max_seq_length = -1
 
@@ -147,7 +149,6 @@ class Transformer(nn.Module):
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.head_dim,
                                               self.config.rope_base, dtype).to(device)
-        self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool)).to(device)
         self.use_kv_cache = use_kv_cache
         self.uvit_skip_connection = self.config.uvit_skip_connection
         if self.uvit_skip_connection:
@@ -168,6 +169,10 @@ class Transformer(nn.Module):
                 ) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
         if mask is None: # in case of non-causal model
+            if self.causal_mask is None:
+                self.causal_mask = torch.tril(
+                    torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool)
+                ).to(x.device)
             if not self.training and self.use_kv_cache:
                 mask = self.causal_mask[None, None, input_pos]
             else:
@@ -298,8 +303,10 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
-        k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+        # n_head == n_local_heads 时 repeat_interleave(1) 只是白拷一份连续张量
+        if self.n_local_heads != self.n_head:
+            k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+            v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.head_dim * self.n_head)

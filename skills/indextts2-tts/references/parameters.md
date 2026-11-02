@@ -7,7 +7,7 @@
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `text` | string | 合成文本。全空白 → 400；> 10000 字 → 413；> 2000 字只警告 |
-| `spk_audio` | file | 音色参考音频。≤ 20 MB，wav/mp3/flac/ogg/m4a，**魔数嗅探**校验真实格式 |
+| `spk_audio` | file | 音色参考音频。≤ 32 MB，wav/mp3/flac/ogg/opus；`/status.ffmpeg` 为 true 时另收 m4a/aac/wma（转成 WAV），**魔数嗅探**校验真实格式。视频不能直接传给 `/tts`——前端会先走 `POST /audio/extract` 抽成 WAV（见 api.md） |
 
 ## 2. 情感控制（四选一，由 `emo_mode` 决定）
 

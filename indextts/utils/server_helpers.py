@@ -5,6 +5,7 @@ file-naming rules without importing torch or FastAPI. server.py imports
 these re-exports; nothing here may depend on the app instance.
 """
 import hashlib
+import math
 import os
 import re
 import tempfile
@@ -218,7 +219,10 @@ def cap_prompt_files(prompts_dir: str, keep: int = PROMPTS_KEEP) -> int:
 # 不是音频的文件，在落盘前给出可读的 4xx。完整解码校验仍由推理侧 librosa
 # 承担（失败经 SSE 报错），这里不做重解码。
 
-AUDIO_MAX_BYTES = 20 * 1024 * 1024
+# 32MB：视频抽出的 10 分钟音轨固定是 22050×2×600 ≈ 25.2MB，上限必须比它大，
+# 否则「支持视频」会在抽完音轨之后被 /tts 的体积极限挡回来。
+# tests/test_server_helpers.py 有断言锁住这个不等式。
+AUDIO_MAX_BYTES = 32 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -258,21 +262,90 @@ def normalize_emo_vec(emo_vector, apply_bias: bool = True):
     return vec
 
 
-def looks_like_audio(data: bytes) -> bool:
-    """Cheap magic-byte sniff: wav / mp3 (ID3 or frame sync) / flac / ogg / m4a."""
+# 参考音频格式白名单：前四种 libsndfile 1.2.x 能直接读（Ogg 里的 Vorbis/Opus
+# 都行）；m4a/aac/wma 只能靠 ffmpeg 转码，服务端没装 ffmpeg 时统一拒收。
+SUPPORTED_AUDIO_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".opus")
+SUPPORTED_AUDIO_TEXT = "wav/mp3/flac/ogg/opus"
+FFMPEG_AUDIO_EXTS = (".m4a", ".aac", ".wma")
+FFMPEG_AUDIO_TEXT = "m4a/aac/wma"
+# 视频只在服务端有 ffmpeg 时接收：入口抽成 22.05kHz 单声道 WAV 再走裁剪。
+VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".flv")
+VIDEO_TEXT = "mp4/mov/m4v/mkv/webm/avi/flv"
+VIDEO_MAX_BYTES = 200 * 1024 * 1024
+# 视频音轨只取前 10 分钟：参考音频最终只用前 15 秒，再长只会让提取和预览白等。
+VIDEO_MAX_SECONDS = 600
+
+_BASE_AUDIO_KINDS = ("wav", "mp3", "flac", "ogg")
+_FFMPEG_AUDIO_KINDS = ("m4a", "aac", "wma")
+_ASF_MAGIC = b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c"
+
+
+def audio_kind(data: bytes) -> str:
+    """按魔数判容器：wav/mp3/flac/ogg/m4a/aac/wma，认不出返回 ""。
+
+    没装 ffmpeg 时只能直接读 _BASE_AUDIO_KINDS，其余要转码才可用。
+    Ogg 容器里可能是 Vorbis 也可能是 Opus，libsndfile 两种都能读，统一记 "ogg"。
+    MP3 同步字和 ADTS AAC 都以 0xFFEx 开头，靠 layer 位区分（ADTS 是 00）：
+    不区分的话 .aac 会被当 MP3 原样放行，推理时才炸成 NoBackendError。
+    """
     if not data or len(data) < 12:
-        return False
+        return ""
     if data[:4] == b"RIFF":
-        return data[8:12] == b"WAVE"
-    if data[:4] == b"OggS" or data[:4] == b"fLaC":
-        return True
+        return "wav" if data[8:12] == b"WAVE" else ""
+    if data[:4] == b"fLaC":
+        return "flac"
+    if data[:4] == b"OggS":
+        return "ogg"
     if data.startswith(b"ID3"):
-        return True  # ID3v2-tagged MP3
+        return "mp3"
     if data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
-        return True  # raw MP3 frame sync (first 11 bits set)
+        if (data[1] & 0x06) == 0:
+            return "aac" if (data[1] & 0xF6) == 0xF0 else ""
+        return "mp3"
     if data[4:8] == b"ftyp":
-        return True  # mp4/m4a
-    return False
+        return "m4a"
+    if data[:16] == _ASF_MAGIC:
+        return "wma"
+    return ""
+
+
+def looks_like_audio(data: bytes) -> bool:
+    """Cheap magic sniff: 解码层能直接读的容器（Ogg 含 Opus）。"""
+    return audio_kind(data) in _BASE_AUDIO_KINDS
+
+
+def video_kind(data: bytes) -> str:
+    """按魔数判视频容器：mp4/mkv/webm/avi/flv，认不出返回 ""。
+
+    ftyp 家族（mp4/mov/m4v/m4a）统一记 "mp4"：抽音轨时都交给 ffmpeg，
+    具体是视频还是纯音频由 ffmpeg 自己判断。webm 与 mkv 同为 EBML。
+    """
+    if not data or len(data) < 4:
+        return ""
+    if data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+        return "avi"
+    if data[:4] == b"\x1a\x45\xdf\xa3":
+        return "mkv"
+    if data[:3] == b"FLV":
+        return "flv"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return "mp4"
+    return ""
+
+
+def audio_ext_from_magic(data: bytes) -> str:
+    """认扩展名用：返回 ".wav" / ".mp3" / ".flac" / ".ogg"，认不出返回 ""。
+
+    与 looks_like_audio 的区别是它区分格式——保存到目录的入口要校验「文件名后缀
+    与内容一致」，只返回 bool 会把「wav 改名成 .mp3」当成合法上传存下去，
+    用户拿到的文件后缀与实际编码对不上。判定顺序不能变：ID3 先于帧同步。
+    """
+    return {
+        "wav": ".wav",
+        "mp3": ".mp3",
+        "flac": ".flac",
+        "ogg": ".ogg",
+    }.get(audio_kind(data), "")
 
 
 # wetext / kaldifst non-ASCII path workaround -----------------------------------
@@ -371,3 +444,35 @@ def ensure_wetext_ascii_path():
 
     importlib.resources.files = _patched_files
     return True
+
+
+# 长文本软提示 ----------------------------------------------------------------
+# 段数优先用真实分词（与 /segments 预览同一套），分词器不可用时才按下面的
+# 经验值兜底。2001 字自然中文实测 3859 token（1.93 token/字）：旧口径 1.31
+# 会把 36 段说成 21 段，用户按这个数估等待时间会误判。
+EST_TOKENS_PER_CHAR = 1.9
+EST_SECONDS_PER_SEGMENT = 8   # 每段都要完整跑 GPT + s2mel + 声码器，保守估计
+
+
+def estimated_minutes(segs):
+    """按保守的每段耗时折算分钟，向上取整（提示写的是「以上」）。"""
+    return max(1, math.ceil(max(1, int(segs)) * EST_SECONDS_PER_SEGMENT / 60))
+
+
+def estimate_long_text(chars, max_text_tokens_per_segment):
+    """没有分词器时的兜底估算：返回 (段数, 分钟)，都向上取整。
+
+    旧实现用整除并把 1.31 当 token/字，两个方向都偏低；这里至少不再少报。
+    """
+    est_tokens = math.ceil(max(0, int(chars)) * EST_TOKENS_PER_CHAR)
+    segs = max(1, math.ceil(est_tokens / max(1, int(max_text_tokens_per_segment))))
+    return segs, estimated_minutes(segs)
+
+
+def format_long_text_warn(chars, segs, minutes):
+    """SSE warn 文案。抽成纯函数，测试可以直接钉住措辞。"""
+    return (
+        f"文本较长（{chars} 字，约切 {segs} 段，预计 {minutes} 分钟以上）。"
+        "生成期间会独占 GPU，其他任务需排队；"
+        "关闭或刷新页面不会中断，服务端会继续跑完。"
+    )

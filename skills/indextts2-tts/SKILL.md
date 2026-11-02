@@ -464,7 +464,8 @@ manifest 落盘、中文在 cp936/cp1252 管道下的输出。改完脚本先跑
 | 并发 | 服务端全局单锁 + 队列串行推理；客户端另加文件锁 |
 | 文本长度 | 软上限 2000 字（只警告）；硬上限 10000 字（服务端 413） |
 | 情感文本 | `emo_text` ≤ 500 字 |
-| 音频上传 | ≤ 20 MB，wav/mp3/flac/ogg/m4a，**魔数嗅探**（改扩展名的假音频会被 400） |
+| 音频上传 | ≤ 32 MB，wav/mp3/flac/ogg/opus；服务端有 ffmpeg（`/status` 的 `ffmpeg` 为 true）时另收 m4a/aac/wma（自动转 WAV）。**魔数嗅探**（改扩展名的假音频会被 400） |
+| 视频提取音轨 | 前端参考音频入口可直接选 mp4/mov/m4v/mkv/webm/avi/flv（≤ 200 MB），走 `POST /audio/extract` 抽成 22.05kHz 单声道 WAV（前 10 分钟）再当参考音频；需要 ffmpeg。命令行没有对应子命令，需要时先自己 `ffmpeg -i in.mp4 -vn -ac 1 -ar 22050 out.wav` |
 | 段间停顿 | `interval_silence` 10~500 ms，默认 200；服务端静默夹取，客户端会提前告警 |
 | 变速 | `POST /audio/tempo`，倍率 0.5~2.0，audiotsm WSOLA 保音高，**不落盘**；客户端对应 `tempo` 子命令 |
 | 输出清理 | `outputs/` 根目录 wav 超 14 天自动删；`agent_tts/` 子目录**不在清理范围**，会累积 |

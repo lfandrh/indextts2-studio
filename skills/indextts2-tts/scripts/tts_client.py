@@ -379,7 +379,7 @@ START_TIMEOUT = int(_env("INDEXTTS_START_TIMEOUT", 120))  # ensure 拉起服务�
 TEXT_CHARS_SOFT = 2000
 TEXT_CHARS_HARD = 10000
 MAX_EMO_TEXT_CHARS = 500
-AUDIO_MAX_BYTES = 20 * 1024 * 1024
+AUDIO_MAX_BYTES = 32 * 1024 * 1024
 
 # 8 个生成参数的合法区间，与 server.py 的 GEN_PARAMS 一一对应——改一边必须同步改另一边。
 # 服务端对越界值是"静默夹到边界"：temperature=5 不报错、直接按 2 跑。这种静默
@@ -449,7 +449,7 @@ VRAM_MODEL_GROWTH_MB = 5500
 # 未加载时是估算值，本身有误差，阈值放宽，宁可少报也不要把能用的机器报成危险。
 VRAM_WARN_ESTIMATE_MB = 800
 # 与服务端 _validate_audio_upload 白名单一致（服务端还会做魔数嗅探，扩展名只是初筛）
-AUDIO_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
+AUDIO_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".opus")
 
 # agent 默认输出目录：<项目根>/outputs/agent_tts/<日期>/<服务端文件名>
 # - 固定可预测，配合 last 子命令随时找回
@@ -3295,7 +3295,7 @@ def build_parser():
     sp.set_defaults(func=cmd_segments)
 
     sp = sub.add_parser("tempo", help="change speed keeping pitch (no re-synthesis, no GPU)")
-    sp.add_argument("--file", required=True, metavar="PATH", help="input audio (wav/mp3/flac/ogg/m4a)")
+    sp.add_argument("--file", required=True, metavar="PATH", help="input audio (wav/mp3/flac/ogg/opus)")
     sp.add_argument("--rate", required=True, type=float, metavar="RATE", help="speed factor 0.5~2.0 (1.2 = 20%% faster)")
     sp.add_argument("--out", default=None, help="output wav path (default: <out dir>/<date>/<name>_tempo<rate>.wav)")
     sp.add_argument("--outdir", default=None, help="default output dir when --out is not given")

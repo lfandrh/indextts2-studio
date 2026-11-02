@@ -679,7 +679,12 @@ class TextTokenizer:
         segments: List[List[str]] = []
         current_segment = []
         current_segment_tokens_len = 0
+        # 下面要把紧跟切分符的 "'" 一并吞掉；for 循环里改 i 不生效（下一轮会重取），
+        # 所以用跳过集合显式表达「这个下标已经处理过了」。
+        skipped: set = set()
         for i in range(len(tokenized_str)):
+            if i in skipped:
+                continue
             token = tokenized_str[i]
             current_segment.append(token)
             current_segment_tokens_len += 1
@@ -699,7 +704,7 @@ class TextTokenizer:
                         if tokenized_str[i + 1] in ["'", "▁'"]:
                             # 后续token是'，则不切分
                             current_segment.append(tokenized_str[i + 1])
-                            i += 1
+                            skipped.add(i + 1)
                     segments.append(current_segment)
                     current_segment = []
                     current_segment_tokens_len = 0

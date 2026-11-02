@@ -278,9 +278,11 @@ python tts_client.py stop <job_id> --keep-model   # 确实要掐掉
 
 ### 现象：音频上传返回 400
 
-**原因**：三种可能 —— 超过 20 MB；格式不在 wav/mp3/flac/ogg/m4a 白名单；**改了扩展名的假音频**（服务端做魔数嗅探，不看扩展名）。
+**原因**：三种可能 —— 超过 32 MB；格式不在白名单；**改了扩展名的假音频**（服务端做魔数嗅探，不看扩展名）。白名单是 wav/mp3/flac/ogg/opus，服务端装了 ffmpeg（`/status.ffmpeg`）时才额外收 m4a/aac/wma。
 
-**处理**：确认文件真实格式。`.m4a` 改名为 `.wav` 一定会被拒。
+**处理**：确认文件真实格式。服务端没有 ffmpeg 时，m4a/aac/wma 先用 ffmpeg 转成 wav 或 mp3 再传；`.m4a` 改名成 `.wav` 照样会被拒。
+
+**视频**：`/tts` 的 `spk_audio` 仍只收音频。要把视频当参考音频，前端会在选文件时调用 `POST /audio/extract`（mp4/mov/m4v/mkv/webm/avi/flv，≤ 200 MB，取前 10 分钟，输出 22.05kHz 单声道 WAV）；命令行等价操作是 `ffmpeg -i in.mp4 -vn -ac 1 -ar 22050 out.wav`。没有 ffmpeg 时视频提取不可用（400）。
 
 ### 现象：生成的音频过几天找不到了
 

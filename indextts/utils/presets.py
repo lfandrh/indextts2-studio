@@ -7,6 +7,7 @@ Each preset lives in its own directory under ``outputs/presets/<name>/``.
 """
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -16,6 +17,8 @@ from typing import Dict, List, Optional
 
 PRESET_VERSION = "1.0"
 PRESETS_DIRNAME = "outputs/presets"
+
+logger = logging.getLogger("indextts.presets")
 
 
 def _project_root() -> Path:
@@ -127,24 +130,42 @@ def save_preset(
         "emo_audio": emo_rel or "",
     }
 
+    # 先写临时文件再原子替换：进程被中断时留下的是旧文件或完整的临时文件，
+    # 而不是半截 JSON（半截 JSON 会让这个预设从此打不开）。
     preset_file = preset_dir / "preset.json"
-    with open(preset_file, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    tmp_file = preset_dir / "preset.json.tmp"
+    try:
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, preset_file)
+    except BaseException:
+        try:
+            tmp_file.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def load_preset(name: str) -> Optional[Dict]:
     """
     Load a preset from disk.
 
-    Returns None if the preset does not exist.
+    Returns None if the preset does not exist. Raises ValueError with a
+    readable message if the file exists but is corrupt or unreadable.
     """
     preset_dir = _preset_dir(name)
     preset_file = preset_dir / "preset.json"
     if not preset_file.exists():
         return None
 
-    with open(preset_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(preset_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        logger.warning("预设「%s」读取失败: %s", name, exc)
+        raise ValueError(f"预设「{name}」文件损坏或无法读取: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"预设「{name}」文件内容不是对象（{type(data).__name__}）")
 
     # Convert relative audio paths to absolute paths.
     if data.get("prompt_audio"):

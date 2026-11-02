@@ -48,6 +48,8 @@ desktop.ini
 /_audit tmp/
 /_audit_tmp/
 /.review_tmp_names.py
+# 混沌测试/审查跑批的落盘目录
+/test-run/
 
 # Example audio files (downloaded on demand, not stored in git)
 /examples/*.wav
@@ -83,3 +85,6 @@ desktop.ini
 /indextts/cli.py
 /indextts/gpt/model.py
 /indextts/vqvae/
+
+# 本地打包资源：随便携包分发的 ffmpeg 二进制（约 84MB，不进 git）
+/tools/ffmpeg/

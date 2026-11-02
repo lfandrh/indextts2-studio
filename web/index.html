@@ -43,8 +43,14 @@
       <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/>
       <path d="M12 9v4"/><path d="M12 17h.01"/>
     </symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>
+    </symbol>
     <symbol id="i-play" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></symbol>
     <symbol id="i-pause" viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="m4.5 12.5 5 5 10-11"/>
+    </symbol>
     <!-- 外链图标：GitHub 用官方 mark（实心，识别度最高）；
          B 站官方 mark 的实心路径过长且易失真，这里按其核心形态（电视 + 天线 + 双眼）
          自绘为描边版，与 sprite 里其它图标的笔画风格一致，17px 下仍可辨认。 -->
@@ -76,6 +82,7 @@
       <button class="tab cur" data-page="gen" type="button">语音合成</button>
       <button class="tab" data-page="presets" type="button">预设管理</button>
       <button class="tab" data-page="model" type="button">模型管理</button>
+      <button class="tab" data-page="guide" type="button">使用指南</button>
     </nav>
     <div class="hdr-tools">
       <div class="hdr-links">
@@ -100,9 +107,21 @@
   <!-- ===== left: operation panel with step flow ===== -->
   <section class="card ops">
     <div class="opstep" data-step="1">
-      <label class="oplabel" for="text">合成文本</label>
-      <div class="grow"><textarea id="text" rows="4" maxlength="10000" placeholder="输入要合成的文本…">欢迎使用 IndexTTS2 语音合成工作台！上传参考音频，即刻克隆你想要的声音</textarea></div>
+      <!-- 标签与导入按钮是兄弟节点：按钮若放进 <label for="text"> 里，点按钮会顺带
+           聚焦文本框（label 的默认行为），而且读屏会把按钮念成标签的一部分。 -->
+      <div class="text-head">
+        <label class="oplabel" for="text">合成文本</label>
+        <button class="btn ghost mini text-import" id="textImportBtn" type="button" title="导入 .txt / .md 文本文件，也可以直接把文件拖到文本框">
+          <svg class="ico" aria-hidden="true"><use href="#i-upload"></use></svg>导入文本
+        </button>
+        <input type="file" id="textFile" accept=".txt,.md,.markdown,text/plain,text/markdown" hidden>
+      </div>
+      <div class="grow text-wrap" id="textWrap">
+        <textarea id="text" rows="4" placeholder="输入要合成的文本…">欢迎使用 IndexTTS2 语音合成工作台！上传参考音频，即刻克隆你想要的声音</textarea>
+        <div class="text-drop" id="textDropOverlay" hidden><span>松开以导入文本（.txt / .md，≤2MB）</span></div>
+      </div>
       <div class="opfoot mono"><span id="charCount">0 字</span><span id="segInfo">分句预览待输入</span></div>
+      <div class="text-import-note" id="textImportNote" role="status" aria-live="polite" hidden></div>
       <details class="fold seg-fold" id="segFold" open>
         <summary>分句预览 <span class="q" title="输入文本后实时更新；拖动下方滑块可调整每段的 Token 上限"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></span></summary>
         <div class="seg-scroll"><div class="seg-list" id="segList"></div></div>
@@ -114,10 +133,10 @@
     <div class="opstep" data-step="2">
       <label class="oplabel" for="spkFile">音色参考音频</label>
       <label class="drop" id="spkDrop">
-        <input type="file" id="spkFile" accept="audio/*,.wav,.mp3,.flac,.ogg">
+        <input type="file" id="spkFile" accept=".wav,.mp3,.flac,.ogg,.opus,audio/wav,audio/x-wav,audio/wave,audio/mpeg,audio/mp3,audio/flac,audio/x-flac,audio/ogg,application/ogg,audio/x-opus+ogg">
         <svg class="drop-ic" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
         <span class="drop-main" id="spkName">点击选择或拖入音频文件</span>
-        <span class="drop-sub" id="spkSub">约 3~10 秒参考音频效果最佳</span>
+        <span class="drop-sub" id="spkSub">支持 wav/mp3/flac/ogg/opus · 约 3~10 秒最佳</span>
       </label>
       <div id="spkPlayerBox" hidden>
         <canvas id="spkWave" aria-label="参考音频声纹，拖动定位播放位置"></canvas>
@@ -152,9 +171,9 @@
 
       <div id="emoAudioBox" class="emo-box" hidden>
         <label class="drop slim" id="emoDrop">
-          <input type="file" id="emoFile" accept="audio/*,.wav,.mp3,.flac,.ogg">
+          <input type="file" id="emoFile" accept=".wav,.mp3,.flac,.ogg,.opus,audio/wav,audio/x-wav,audio/wave,audio/mpeg,audio/mp3,audio/flac,audio/x-flac,audio/ogg,application/ogg,audio/x-opus+ogg">
           <span class="drop-main" id="emoName">点击选择情感参考音频</span>
-          <span class="drop-sub">表达目标情绪的音频片段</span>
+          <span class="drop-sub" id="emoSub">支持 wav/mp3/flac/ogg/opus · 表达目标情绪的音频片段</span>
         </label>
       </div>
 
@@ -266,7 +285,10 @@
     </details>
 
     <details class="fold">
-      <summary>术语读音 <span class="q" title="自定义个别专业术语的读音，如 IndexTTS2"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></span></summary>
+      <summary>术语读音 <span class="q" title="生成前把文本里的这个词整体替换成你写的读音。
+中文读法必须填同音汉字（银行→银杭、重庆→虫庆），填拼音不生效；
+英文读法填英文拼写，只对纯英文句子生效，中英混排建议两列都填。
+例：IndexTTS2 → 中文「Index T T S 二」/ 英文「Index T T S two」"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></span></summary>
       <label class="switch gl-cascade"><input type="checkbox" id="glCascade"><span class="tk"></span>级联替换读音
         <b class="qinfo" title="关闭（默认）：每条术语只作用于你输入的原文，读音里如果含有其它术语，不会被再次改写。
 打开：替换结果会留在文本里，后面的术语会继续改写它——适合把读音拆成多条来组合，比如「集团」读作「控股」、「控股」读作「母公司」。
@@ -286,6 +308,17 @@
     <!-- main CTA pinned at panel bottom -->
     <div class="cta">
       <div class="gen-summary mono" id="genSummary"></div>
+      <!-- 候选数：每次生成都会看一眼的旋钮，放在 CTA 正上方而不是高级参数里。
+           刻意不持久化（决策 8B）：刷新后固定回 1，避免「上次点了 3 条、这次
+           忘了」悄悄把生成时间翻三倍。 -->
+      <div class="cand-row">
+        <span class="cand-row-label">候选数</span>
+        <div class="fmtseg" id="candSeg" role="group" aria-label="候选数">
+          <button type="button" data-cand="1" aria-pressed="true" title="生成一条，与以前完全一样">1</button>
+          <button type="button" data-cand="2" aria-pressed="false" title="串行生成两条，挑最像的那条">2</button>
+          <button type="button" data-cand="3" aria-pressed="false" title="串行生成三条，挑最像的那条">3</button>
+        </div>
+      </div>
       <button class="btn primary big" id="genBtn" type="button">
         <svg width="21" height="21" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
         生成语音
@@ -307,6 +340,23 @@
       <div class="ph-est mono" id="estDurEcho">输入文本后这里会显示分句预览</div>
     </div>
 
+    <!-- 候选条：必须是 #resultBody 的兄弟节点。生成开始时 setResultVisible(false)，
+         而且每个 progress 事件都会 showLoading() 再藏一次 #resultBody——挂在里面
+         的话，候选卡要等整轮结束、采用第 1 条之后才第一次可见（PLAN §4.2）。
+         位置钉在进度面板上方：生成中（卡片逐条填进来）和生成后（采用的那条
+         进入下方剪辑台）候选条都停在同一处，不会上下跳。 -->
+    <div class="candstrip" id="candStrip" hidden>
+      <div class="candstrip-head">
+        <span class="candstrip-title" id="candTitle"></span>
+        <label class="cand-chain" title="按顺序播放全部候选，方便 A/B 对比；播完自动停">
+          <input type="checkbox" id="candChain">
+          <span>逐条连播</span>
+        </label>
+      </div>
+      <div class="candgrid" id="candGrid"></div>
+      <div class="candstrip-foot" id="candFoot"></div>
+    </div>
+
     <!-- loading -->
     <div class="sc-loading" id="loadingBox" hidden>
       <div class="spinner"></div>
@@ -325,6 +375,8 @@
       </div>
     </div>
     <div class="err" id="errBox"></div>
+    <!-- 候选试听：与主播放器 #player、编辑结果 #outAudio 互相互斥 -->
+    <audio id="candAudio" hidden></audio>
 
     <!-- result -->
     <div id="resultBody" style="display:none">
@@ -357,15 +409,28 @@
         <!-- 只写「下载」，拿到的是未经剪辑的源文件；完整说明放 title -->
         <button class="btn primary mini" id="dlSrcBtn" type="button" title="下载未经剪辑的生成音频">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-          下载
+          <span id="dlSrcBtnLabel">下载</span>
         </button>
+        <!-- 保存到指定目录：点下载才会走这套；目录未设置时点击先弹选择框 -->
+        <span class="save-split">
+          <button class="btn ghost mini" id="saveSrcBtn" type="button" title="把未剪辑的生成音频另存到指定目录">保存到目录</button>
+          <button class="btn ghost mini save-caret" id="saveMenuSrc" type="button" aria-label="保存目录设置" aria-haspopup="menu" aria-expanded="false">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+          </button>
+        </span>
       </div>
-      <!-- 源文件名另起一行，右对齐，正好在「下载」按钮下方 -->
+      <!-- 源文件名另起一行，右对齐，正好在「下载」按钮下方；
+           格式开关放这一行左侧：它是结果卡级别的设置，同时作用于「下载」「保存到目录」
+           两个出口，放按钮里会被误读成"只影响这一个按钮" -->
       <div class="dl-row">
+        <div class="fmtseg" id="fmtSeg" role="group" aria-label="下载格式">
+          <button type="button" data-fmt="wav" aria-pressed="true" title="无损 WAV，体积大">WAV</button>
+          <button type="button" data-fmt="mp3" aria-pressed="false" title="MP3 160kbps，首次使用会加载编码组件">MP3</button>
+        </div>
         <span class="dl-name mono" id="dlSrcName"></span>
       </div>
       <div class="capnote" id="melCapNote" hidden>⚠ 文本超过单段生成长度上限，结尾被截断——请减少每段 Token（分句上限）或调高「最大 mel tokens」后重新生成</div>
-      <!-- 文本规范化退化的提示。第一���完整展开；提示过一次之后再发生就降级成
+      <!-- 文本规范化退化的提示。第一次完整展开；提示过一次之后再发生就降级成
            右上角的小铃铛，点击可随时展开——不重复打扰，但不丢信息。
            完整记录始终在 logs/server.log 里。 -->
       <div class="capnote capnote-soft" id="normCapNote" hidden>
@@ -442,6 +507,12 @@
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
           <span id="dlBtnLabel">下载编辑结果</span>
         </button>
+        <span class="save-split">
+          <button class="btn ghost" id="saveEditBtn" type="button" title="把编辑结果另存到指定目录">保存到目录</button>
+          <button class="btn ghost save-caret" id="saveMenuEdit" type="button" aria-label="保存目录设置" aria-haspopup="menu" aria-expanded="false">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+          </button>
+        </span>
         <span class="dl-name" id="dlName"></span>
       </div>
     </div>
@@ -484,7 +555,7 @@
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>
         </button>
       </div>
-      <div class="hb-note" id="histNote">本次运行生成 · 自动清理保留最近 20 条</div>
+      <div class="hb-note"><span id="histNote">跨重启保留 · 最长 14 天 · 自动清理保留最近 20 条</span><span class="q hb-note-q" id="histNoteQ" title="历史列表存于 data/history.json，重启后仍在；outputs/ 里超过 14 天的音频文件会在启动时清理，对应记录同时移除"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></span></div>
       <div class="hb-list" id="histList"></div>
       <div class="hb-foot">
         <label class="switch hb-switch"><input type="checkbox" id="histAuto" checked><span class="tk"></span>自动清理</label>
@@ -592,7 +663,6 @@
         <div class="mm-state" id="mmStateBox">
           <span class="mm-tile-label">模型状态</span>
           <div class="mm-state-top">
-            <span class="mm-led" id="mmLed"></span>
             <b class="mono" id="mmState">–</b>
           </div>
           <span class="mm-state-sub" id="mmStateSub">等待状态</span>
@@ -648,6 +718,22 @@
 
           <div class="cfg-group-h">性能 <span>保存即生效</span></div>
           <div class="cfg-item">
+            <div class="cfg-head">
+              <span class="cfg-name">分段批处理<b class="qinfo" title="把多段文本拼成一批同时解码。只在非流式、且文本被切成 ≥2 段时生效；单句请求完全不受影响。开启后每次输出会有极细微差异（本来就是随机采样）。「自动」按 CUDA 可分配显存估算；任务管理器 / nvidia-smi 显示的空闲通常更大，差额是被进程保留、不能分给新批次的块"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></b></span>
+              <span class="cfg-live mono" id="cfgBatchLive">–</span>
+            </div>
+            <div class="segctl" id="cfgBatchSeg" role="radiogroup" aria-label="分段批处理">
+              <button type="button" role="radio" aria-checked="true" data-mode="off" title="不拼批：最省显存，输出与旧版完全一致">逐段生成</button>
+              <button type="button" role="radio" aria-checked="false" data-mode="auto" title="按当前空闲显存自动决定每批几段，尽量吃满显卡">自动提速</button>
+              <button type="button" role="radio" aria-checked="false" data-mode="manual" title="自己定每批段数（2~12）；想稍快又不吃满显存就选 2">自己定段数</button>
+            </div>
+            <div class="srow batch-rows" id="cfgBatchRowsRow" hidden>
+              <input type="range" id="cfgBatchRows" min="2" max="12" step="1" value="3">
+              <output id="cfgBatchRowsOut">3</output>
+            </div>
+            <p class="cfg-desc">多段文本拼成一批解码：每批 2 段约快 1.5×，每多一段约 +0.5 GiB 显存；仅非流式、≥2 段生效。</p>
+          </div>
+          <div class="cfg-item">
             <label class="switch"><input type="checkbox" id="cfgCudnnBench"><span class="tk"></span>cuDNN 自动调优<span class="qzb warn">⚠ 实测更慢</span><b class="qinfo" title="实测负优化：cuDNN 会为每个新的输入长度重新搜索卷积算法。BigVGAN 单步 3.35s → 97s，整段 38s → 141s（RTF 6.1 → 20.8）。除非音频长度固定不变，否则保持关闭；保存即生效"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></b></label>
             <p class="cfg-desc">负优化：BigVGAN 单步 3.35s → 97s，整段 38s → 141s。保持关闭</p>
           </div>
@@ -686,6 +772,23 @@
     </section>
   </div><!-- /page model -->
 
+  <!-- ============ 页面 4：使用指南 ============
+       正文由服务端把 web/guide/guide.md 渲染成 HTML（/api/v1/guide），
+       这里只留骨架：左目录 + 右正文。目录锚点与高亮由 app.js 接管。 -->
+  <div class="page" data-page="guide" hidden>
+    <div class="guide-layout">
+      <aside class="guide-toc" id="guideTocBox">
+        <div class="guide-toc-h">本页目录</div>
+        <nav class="guide-toc-nav" id="guideToc" aria-label="使用指南目录">
+          <p class="guide-state">正在加载…</p>
+        </nav>
+      </aside>
+      <article class="card guide-body" id="guideBody">
+        <p class="guide-state">正在加载使用指南…</p>
+      </article>
+    </div>
+  </div><!-- /page guide -->
+
 </main>
 
 <!-- 脚标：静态写的是「语音合成」页那一组，切页签时由 renderFootHint() 重绘 -->
@@ -708,6 +811,17 @@
       <button class="btn primary" id="modalOk" type="button">确定</button>
     </div>
   </div>
+</div>
+
+<!-- 指南配图放大：点图开灯箱，Esc / 点空白 / 右上角关闭 -->
+<div class="modal-mask guide-lightbox" id="guideLightbox" hidden>
+  <figure class="guide-lightbox-box" role="dialog" aria-modal="true" aria-label="图片预览">
+    <img id="guideLightboxImg" src="" alt="">
+    <figcaption id="guideLightboxCap"></figcaption>
+    <button class="iconbtn guide-lightbox-close" id="guideLightboxClose" type="button" aria-label="关闭预览" title="关闭预览">
+      <svg class="ico" aria-hidden="true"><use href="#i-close"></use></svg>
+    </button>
+  </figure>
 </div>
 
 <!-- 参考音频裁剪：从整段录音里截出目标片段。
@@ -756,11 +870,26 @@
     </div>
 
     <div class="modal-foot">
-      <button class="btn ghost" id="clipCancel" type="button">取消</button>
-      <button class="btn primary" id="clipApply" type="button">设为参考音频</button>
+      <div class="clip-dl" id="clipDl">
+        <button class="btn ghost mini" id="clipDlFull" type="button">下载完整</button>
+        <button class="btn ghost mini" id="clipDlRange" type="button" disabled>下载选区</button>
+      </div>
+      <div class="clip-foot-actions">
+        <button class="btn ghost" id="clipCancel" type="button">取消</button>
+        <button class="btn primary" id="clipApply" type="button">设为参考音频</button>
+      </div>
     </div>
   </div>
 </div>
+
+<div class="save-menu" id="saveMenu" role="menu" hidden>
+  <div class="save-menu-dir mono" id="saveMenuDir"></div>
+  <button class="save-menu-item" role="menuitem" id="saveMenuPick" type="button">选择文件夹…</button>
+  <button class="save-menu-item" role="menuitem" id="saveMenuInput" type="button">手动输入路径…</button>
+  <button class="save-menu-item" role="menuitem" id="saveMenuOpen" type="button">打开目录</button>
+  <button class="save-menu-item danger" role="menuitem" id="saveMenuForget" type="button">忘记目录</button>
+</div>
+<div class="save-toast" id="saveToast" hidden></div>
 
 <script src="/assets/app.js?v={app.js}"></script>
 <script src="/assets/edit.js?v={edit.js}"></script>

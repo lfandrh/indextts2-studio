@@ -8,6 +8,7 @@
    职责边界（重要）：
      本文件不认识 encodeWav / setSpkFile / 预设，也不知道后端。
      编码、写回表单、问「要不要存预设」全由调用方（app.js）处理。
+     下载同理：弹窗只把区间交给 opts.onDownload，怎么编码、叫什么名字由调用方定。
      这样它既能给参考音频用，将来预设页要复用也只是传另一个 buffer 进来。
 
    为什么在前端切而不是后端：
@@ -20,6 +21,8 @@
      - 把手吸附 10ms，不会出现 12.397s 这种数
      - 默认选区：超过 15 秒就选前 15 秒（与服务端截断行为一致，
        用户什么都不动直接点确定 == 确认「就用前 15 秒」），否则全选
+     - 下载：底部「下载完整」拿整段，「下载选区」拿当前选区；选区就是整段
+       （或已清空）时选区按钮禁用。编码与命名都交给 opts.onDownload
    ========================================================================== */
 window.ClipDialog = (function () {
   "use strict";
@@ -48,6 +51,8 @@ window.ClipDialog = (function () {
   const BAR = { pitch: 4, w: 2, r: 1, amp: 0.78, floor: 2 };
   /* 服务端 infer_v2 的 _load_and_cut_audio 硬截断在 15 秒 */
   const SERVER_CAP = 15;
+  /* 选区两端与整段的差都在 10ms 以内 = 没框（与 app.js 的 SPK_CLIP_EPS 同口径） */
+  const FULL_EPS = 0.01;
 
   const dom = {};
   let buffer = null;
@@ -62,6 +67,7 @@ window.ClipDialog = (function () {
   let hint = null;        // { tone, text } 临时顶替状态条的提示（拖动引导 / 一次性的说明）
   let hintTimer = 0;      // 一次性提示的到期清场，close 时必须清掉
   let undo = null;        // { s0, s1 } 重框前的选区：状态条上「恢复上一个选区」用它
+  let onDownload = null;  // opts.onDownload({ s0, s1, full })：返回提示文案，抛错则报失败
 
   const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
   const dur = () => (buffer && buffer.duration) || 0;
@@ -92,7 +98,7 @@ window.ClipDialog = (function () {
       "clipHandleL", "clipHandleR", "clipAxisL", "clipAxisR", "clipRange",
       "clipStatus", "clipStatusText", "clipStatusFix", "clipPreview",
       "clipPreviewLabel", "clipApply", "clipCancel", "clipClose",
-      "clipAll", "clipFirst15", "clipNone"];
+      "clipAll", "clipFirst15", "clipNone", "clipDl", "clipDlFull", "clipDlRange"];
     for (const id of ids) {
       dom[id] = document.getElementById(id);
       if (!dom[id]) return false;   // HTML 没同步更新时别让整页跟着炸
@@ -110,6 +116,8 @@ window.ClipDialog = (function () {
     dom.clipAll.addEventListener("click", () => setSel(0, dur()));
     dom.clipFirst15.addEventListener("click", () => setSel(0, Math.min(SERVER_CAP, dur())));
     dom.clipNone.addEventListener("click", () => setSel(0, 0));
+    dom.clipDlFull.addEventListener("click", () => download("full"));
+    dom.clipDlRange.addEventListener("click", () => download("range"));
     // 状态条右侧那个按钮一个位置两种用途：正常情况下是「截到 15 秒」，
     // 误框变短时变成「恢复上一个选区」。按 dataset.act 分流，避免两个按钮抢位置。
     dom.clipStatusFix.addEventListener("click", () => {
@@ -220,6 +228,21 @@ window.ClipDialog = (function () {
     }
     // 0.5 秒以下不产出：切出来的是个提取不出音色的空壳，不如直接拦住
     dom.clipApply.disabled = busy || real.tone === "danger";
+
+    // 下载：完整永远可用；「选区」在没框或框的就是整段时没有独立意义，
+    // 禁用并说明原因，避免用户下到两份一模一样的文件。
+    const len = sel.s1 - sel.s0;
+    const fullSel = d > 0 && sel.s0 <= FULL_EPS && sel.s1 >= d - FULL_EPS;
+    const rangeBtn = dom.clipDlRange;
+    rangeBtn.disabled = busy || len < MIN_LEN || fullSel;
+    const rangeTip = fullSel ? "当前选区就是整段音频，请用左边的「下载完整」"
+      : len < MIN_LEN ? "先框选一段再下载选区"
+      : `下载选区（${fmt(sel.s0)} – ${fmt(sel.s1)}，${len.toFixed(2)} 秒）`;
+    if (rangeBtn.title !== rangeTip) {
+      rangeBtn.title = rangeTip;
+      rangeBtn.setAttribute("aria-label", rangeTip);
+    }
+    dom.clipDlFull.disabled = busy;
     paint();
   }
 
@@ -524,10 +547,35 @@ window.ClipDialog = (function () {
 
   /* ---------------- 打开 / 关闭 / 提交 ---------------- */
 
+  /* 下载交给调用方（本文件不编码）：只把区间递出去，full=true 表示整段。
+     结果走状态条，不再弹新对话框——下载本来就是低干扰操作。 */
+  async function download(which) {
+    if (busy || typeof onDownload !== "function") return;
+    const d = dur();
+    if (!d) return;
+    const full = which === "full";
+    const s0 = full ? 0 : sel.s0;
+    const s1 = full ? d : sel.s1;
+    if (s1 - s0 < MIN_LEN) return;
+    let msg;
+    try {
+      msg = await onDownload({ s0, s1, full });
+    } catch (e) {
+      setHint({ tone: "danger", text: `下载失败：${e.message || e}`, ms: HINT_MS });
+      return;
+    }
+    // 编码期间用户可能已经关了弹窗，别往已隐藏的状态条里写提示
+    if (dom.clipMask && !dom.clipMask.hidden) {
+      setHint({ tone: "ok", text: msg || "已开始下载", ms: HINT_MS });
+    }
+  }
+
   function commit() {
     if (busy || dom.clipApply.disabled) return;
     busy = true;
     dom.clipApply.disabled = true;
+    dom.clipDlFull.disabled = true;
+    dom.clipDlRange.disabled = true;
     dom.clipApply.textContent = "处理中…";
     const out = { s0: sel.s0, s1: sel.s1 };
     // 切片是同步的（几十秒音频约 100~200ms）。先让浏览器把「处理中」画出来，
@@ -543,6 +591,7 @@ window.ClipDialog = (function () {
     hintTimer = 0;
     hint = null;
     undo = null;
+    onDownload = null;
     dom.clipMask.hidden = true;
     dom.clipStage.classList.remove("dragging");
     delete dom.clipStage.dataset.drag;
@@ -563,6 +612,7 @@ window.ClipDialog = (function () {
   function open(opts) {
     if (!ensure()) {
       console.warn("[ClipDialog] 弹窗 DOM 缺失，裁剪功能不可用");
+      if (typeof showActionError === "function") showActionError("裁剪弹窗不可用，请刷新页面重试");
       return Promise.resolve(null);
     }
     const buf = opts && opts.buffer;
@@ -584,6 +634,9 @@ window.ClipDialog = (function () {
     dom.clipHandleL.classList.remove("is-drag");
     dom.clipHandleR.classList.remove("is-drag");
     dom.clipStatusText.setAttribute("aria-live", "polite");
+    onDownload = typeof opts.onDownload === "function" ? opts.onDownload : null;
+    // 没传下载回调（未来其它调用方）就把整组藏掉，别留两个点了没反应的按钮
+    dom.clipDl.hidden = !onDownload;
     const d = buf.duration;
     // 超过服务端上限就默认前 15 秒（不动的用户得到的结果 == 现在服务端的实际行为）
     sel = { s0: 0, s1: Math.min(SERVER_CAP, d) };

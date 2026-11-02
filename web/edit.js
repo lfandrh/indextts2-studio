@@ -1,6 +1,6 @@
 /* IndexTTS2 Studio — 音频剪辑：裁剪 / 音量增益 / 变速 + 撤销重做
  *
- * 设计要点（详见 docs/AUDIO_EDITING_PLAN_zh.md）：
+ * 设计要点（详见 docs/NOTES_zh.md）：
  *  1. 三槽位状态 {trim, tempo, gain}，每个功能至多一条；撤销/重做用快照栈，
  *     不是"操作数组"——语义清晰，不会出现"撤销后速率变成别的值"。
  *  2. 固定处理顺序 trim → tempo → gain。trim 必须在源时间轴上（否则一改变速
@@ -319,6 +319,8 @@
   function setBusy(on) {
     ED.busy = on;
     el.tempoRange.disabled = on;
+    el.gainRange.disabled = on;                 // 变速在飞时拖增益会再发一次 /audio/tempo
+    if (el.gainMax) el.gainMax.disabled = on;
     for (const b of el.ticks.children) b.disabled = on;
     el.tempoNote.classList.toggle("busy", on);
     if (on) el.tempoNote.textContent = "变速计算中…";
@@ -438,6 +440,9 @@
     setBusy(false);
     el.out.hidden = true;
     el.outFoot.hidden = true;
+    // 结果区此刻是藏着的，但读数要跟着走：paintResult 只在有编辑动作时才被调用，
+    // 新音频一进来不写这里，DOM 上就长期停在 HTML 的占位符「—」（BUG-016）。
+    el.outDur.textContent = buffer ? buffer.duration.toFixed(2) + "s" : "—";
     syncControls();
     syncChips();
     paintPeak();
@@ -520,9 +525,15 @@
     gainLive = true;
     paintPeak();                 // 峰值实时跟着滑块走，不等 debounce 后的 render
     clearTimeout(gainTimer);
-    gainTimer = setTimeout(render, GAIN_DEBOUNCE);
+    // 忙碌时不能直接 render（会和还没返回的变速请求重叠，先返回者提前清 busy），
+    // 挂起重试，等变速算完再按最新增益重渲染
+    gainTimer = setTimeout(function retry() {
+      if (ED.busy) { gainTimer = setTimeout(retry, GAIN_DEBOUNCE); return; }
+      render();
+    }, GAIN_DEBOUNCE);
   });
   el.gainRange.addEventListener("change", () => {
+    if (ED.busy) return;      // 与刻度按钮/撤销同款：disabled 挡不住程序化 dispatchEvent
     clearTimeout(gainTimer);
     gainLive = false;
     pushHistory();
@@ -614,7 +625,7 @@
 
   el.outPlay.addEventListener("click", () => {
     if (!outAudio.src) return;
-    if (outAudio.paused) outAudio.play(); else outAudio.pause();
+    if (outAudio.paused) outAudio.play().catch(() => {}); else outAudio.pause();
   });
   outAudio.addEventListener("play", () => { if (el.outPlayIcon) el.outPlayIcon.innerHTML = PAUSE2; });
   outAudio.addEventListener("pause", () => { if (el.outPlayIcon) el.outPlayIcon.innerHTML = PLAY2; });

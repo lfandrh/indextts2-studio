@@ -76,6 +76,8 @@ server = [
   "uvicorn>=0.30",
   "psutil>=5.9",
   "python-multipart>=0.0.9",
+  # 使用指南页：服务端把 web/guide/guide.md 渲染成 HTML（前端不加第三方脚本）
+  "markdown>=3.5",
 ]
 test = [
   "pytest>=7.0",

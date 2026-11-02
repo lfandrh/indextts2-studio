@@ -6,6 +6,8 @@ boots fast and idle VRAM stays at zero.
 """
 import argparse
 import asyncio
+import contextlib
+import errno
 import gc
 import hashlib
 import io
@@ -14,6 +16,8 @@ import math
 import os
 import queue
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -65,10 +69,24 @@ from indextts.utils.server_helpers import (
     prompt_file as _prompt_file_impl,
     clean_legacy_prompts as _clean_legacy_prompts_impl,
     looks_like_audio as _looks_like_audio,
+    audio_kind as _audio_kind,
+    video_kind as _video_kind,
+    audio_ext_from_magic as _audio_ext_from_magic,
     cap_prompt_files as _cap_prompt_files,
     normalize_emo_vec as _normalize_emo_vec,
     ensure_wetext_ascii_path,
+    estimate_long_text as _estimate_long_text,
+    estimated_minutes as _estimated_minutes,
+    format_long_text_warn as _format_long_text_warn,
     AUDIO_MAX_BYTES,
+    SUPPORTED_AUDIO_EXTS,
+    SUPPORTED_AUDIO_TEXT,
+    FFMPEG_AUDIO_EXTS,
+    FFMPEG_AUDIO_TEXT,
+    VIDEO_EXTS,
+    VIDEO_TEXT,
+    VIDEO_MAX_BYTES,
+    VIDEO_MAX_SECONDS,
 )
 # 中文路径分发包兼容：kaldifst 走 ANSI C API 打开 .fst，wetext 装在非 ASCII
 # 路径下 import 即炸。必须在任何 wetext 触达之前装好重定向（ASCII 路径下为空操作）。
@@ -78,8 +96,10 @@ ensure_wetext_ascii_path()
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+except Exception as e:
+    # logger 还没建（97 行才配置），只能直接打 stderr。这里静默吞掉的后果是：
+    # GBK 控制台上 emoji 崩溃将无从排查，而这段代码存在的唯一目的就是防止它。
+    print(f"[warn] failed to reconfigure std streams to utf-8: {e}", file=sys.stderr)
 
 # ---- logging --------------------------------------------------------------------
 # 持久日志写 logs/server.log（按天轮转、保留 7 天），控制台同步输出。
@@ -138,6 +158,11 @@ parser.add_argument("--cudnn_benchmark", action="store_true", default=False,
                     help="Enable cuDNN autotuning. MEASURED SLOWDOWN on this model: cuDNN "
                          "re-tunes for every new input length, so BigVGAN goes 3.35s -> 97s "
                          "and a whole run 38s -> 141s. Leave off unless the input shape is fixed.")
+parser.add_argument("--gpt_batch", type=int, default=0,
+                    help="Segment batching for non-streaming multi-segment text: 0/1 = off, "
+                         "-1 = auto by free VRAM, 2-12 = fixed rows. Only applies when the text "
+                         "is split into >=2 segments. Measured ~1.5x end-to-end at 2 rows "
+                         "(+0.5GiB); see docs/PERFORMANCE_zh.md section 6.3/6.4.")
 cmd_args = parser.parse_args()
 
 app = FastAPI(
@@ -201,6 +226,8 @@ class LazyTTS:
         self.model_version = None
         self._phase = "unloaded"
         self._phase_lock = threading.Lock()
+        # (测量时刻, 预览结果)：empty_cache 是全局同步操作，不值得每次 /model 轮询都做一遍
+        self._preview_cache = (0.0, None)
 
     @property
     def phase(self):
@@ -238,16 +265,18 @@ class LazyTTS:
                 try:
                     normalizer.load_glossary_from_yaml(self.glossary_path)
                 except Exception as e:
-                    logger.warning("Failed to load glossary: %s", e)
+                    logger.warning("Failed to load glossary: %s", e, exc_info=True)
             try:
                 normalizer.load_glossary_settings(self.glossary_settings_path)
             except Exception as e:
-                logger.warning("Failed to load glossary settings: %s", e)
-            # 全部就绪后才发布，中途不暴露半成品
-            self.cfg = cfg
+                logger.warning("Failed to load glossary settings: %s", e, exc_info=True)
+            # 全部就绪后才发布，中途不暴露半成品。cfg 是 235 行无锁快路径的
+            # 发布标志位，必须最后赋——先赋它等于在 tokenizer 还空着时就挂了
+            # 「已就绪」的牌子。
             self.normalizer = normalizer
             self.tokenizer = tokenizer
             self.model_version = getattr(cfg, "version", None)
+            self.cfg = cfg
             logger.info("Light components ready in %.2fs", time.perf_counter() - t0)
         return self.cfg
 
@@ -272,6 +301,7 @@ class LazyTTS:
                             use_s2mel_fp16=self.init_kwargs.get("use_s2mel_fp16", False),
                             use_w2v_fp16=self.init_kwargs.get("use_w2v_fp16", True),
                             use_qwen_fp16=self.init_kwargs.get("use_qwen_fp16", True),
+                            gpt_batch_size=self.init_kwargs.get("gpt_batch_size", 0),
                         )
                         t.normalizer = self.normalizer
                         t.tokenizer = self.tokenizer
@@ -279,6 +309,7 @@ class LazyTTS:
                         t.inference_cfg_rate = self.init_kwargs.get("inference_cfg_rate", 0.7)
                         self.cfg = t.cfg
                         self._tts = t
+                        self._preview_cache = (0.0, None)
                         self._set_phase("ready")
                         logger.info("IndexTTS2 main model loaded.")
                     except Exception:
@@ -326,7 +357,39 @@ class LazyTTS:
             "cudnn_benchmark": bool(k.get("cudnn_benchmark", False)),
             "diffusion_steps": int(k.get("diffusion_steps", 25)),
             "inference_cfg_rate": float(k.get("inference_cfg_rate", 0.7)),
+            "gpt_batch_size": int(k.get("gpt_batch_size", 0)),
         }
+
+    def gpt_batch_state(self):
+        """批处理开关的 UI 状态：本机自动行数（不生成也能看到）+ 上次实际运行信息。
+
+        预览要模型已加载才有意义（显存占用此时才是真实值），未加载返回 None，
+        前端据此显示"加载后显示本机行数"而不是编一个数。
+        """
+        t = self._tts
+        if t is None:
+            self._preview_cache = (0.0, None)
+            return {"preview": None, "last": None}
+        cached_at, cached = self._preview_cache
+        if _INFER_LOCK.locked():
+            # 生成中读到的空闲显存没有参考价值（KV cache 正在吃满），沿用上次空闲时的结果
+            preview = cached
+        elif cached is None or time.time() - cached_at > 4.0:
+            preview = cached
+            # 非阻塞拿锁 = 此刻必无推理。多标签页 2s 轮询会同时进来，
+            # 拿不到锁的那几个直接沿用旧值，不再并发跑 empty_cache +
+            # 重复测显存（会反复 cudaMalloc，造成分配器抖动）。
+            if _INFER_LOCK.acquire(blocking=False):
+                try:
+                    preview = t.gpt_batch_preview(refresh=True)
+                except Exception:
+                    preview = None
+                finally:
+                    _INFER_LOCK.release()
+                self._preview_cache = (time.time(), preview)
+        else:
+            preview = cached
+        return {"preview": preview, "last": getattr(t, "gpt_batch_last", None)}
 
     def set_runtime(self, **kw):
         """Apply a config dict. fp16 / s2mel_fp16 take effect on the next
@@ -351,6 +414,10 @@ class LazyTTS:
                     val = int(max(1, min(50, val)))
                 elif key == "inference_cfg_rate":
                     val = float(max(0.0, min(1.0, val)))
+                elif key == "gpt_batch_size":
+                    # 0/1 = 关闭；-1 = 按空闲显存自动；2~12 = 固定行数（超出范围钳制）
+                    val = int(val)
+                    val = -1 if val < 0 else (0 if val <= 1 else min(12, val))
                 self.init_kwargs[real] = val
             # cuDNN benchmark is a process-global torch flag: apply immediately,
             # no model reload needed.
@@ -358,6 +425,8 @@ class LazyTTS:
             if self._tts is not None:
                 self._tts.diffusion_steps = int(self.init_kwargs.get("diffusion_steps", 25))
                 self._tts.inference_cfg_rate = float(self.init_kwargs.get("inference_cfg_rate", 0.7))
+                # 批处理行数是每次生成开头读的标量，改完下一次生成就用新值，无需重启
+                self._tts.gpt_batch_size = int(self.init_kwargs.get("gpt_batch_size", 0))
 
     def unload(self):
         """Drop the loaded TTS model. Only call while no inference is running."""
@@ -415,12 +484,17 @@ tts = LazyTTS(
     diffusion_steps=cmd_args.diffusion_steps,
     inference_cfg_rate=cmd_args.inference_cfg_rate,
     cudnn_benchmark=cmd_args.cudnn_benchmark,
+    gpt_batch_size=cmd_args.gpt_batch,
 )
 
 # 全部数据目录锚定到 server.py 所在的项目根，与 presets（_project_root）一致；
 # 不用 CWD 相对路径，避免从别的目录启动 `python server.py` 时文件落错位置
 OUTPUTS_DIR = os.path.join(current_dir, "outputs")
 PROMPTS_DIR = os.path.join(current_dir, "prompts")
+# 用户偏好与生成历史的落盘目录。刻意不放 outputs/：那是产物目录，启动时会被
+# 保留期清理（OUTPUTS_RETENTION_DAYS），把配置/历史放进去会跟着一起没。
+# 定义在模块前部，是因为历史模块（~2071 行）也要用，避免同一常量两处定义。
+DATA_DIR = os.path.join(current_dir, "data")
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 
@@ -543,21 +617,201 @@ def _clamp_gen_params(values: dict) -> dict:
     return out
 
 
-def _validate_audio_upload(data: bytes, label: str) -> None:
-    """上传校验：大小上限 + 常见音频容器的魔数嗅探，在落盘前给出可读的 4xx。
+# ---- 参考音频解码能力 -------------------------------------------------------
+# libsndfile 只认 wav/mp3/flac/ogg（含 Ogg 里的 Opus），AAC/M4A/WMA 这类容器
+# 需要一个 ffmpeg 才能读。ffmpeg 是可选件：装了就多支持几种格式，没装就只收
+# 那四种，行为自动降级（前端 accept 也跟着变，见 /status 的 ffmpeg 字段）。
+_FFMPEG_CANDIDATES_REL = (
+    os.path.join("bin", "ffmpeg.exe"),
+    os.path.join("bin", "ffmpeg"),
+    os.path.join("tools", "ffmpeg", "bin", "ffmpeg.exe"),
+    os.path.join("tools", "ffmpeg", "bin", "ffmpeg"),
+)
+_ffmpeg_state = {"checked": False, "path": None}
 
-    完整解码校验仍由推理侧 librosa 承担（失败经 SSE 报错）；这里只拦截
-    明显不是音频的文件（改名的文本/图片等），不做重解码。
+
+def _ffmpeg_bin():
+    """定位 ffmpeg：包内 bin/ → tools/ffmpeg/bin → 系统 PATH。
+
+    只做存在性判断（/status 每 2 秒轮询，探测必须便宜）；exe 能不能真跑由第一次
+    转码的返回码决定。结果进程内缓存，换了 ffmpeg 重启服务即可生效。
     """
+    if _ffmpeg_state["checked"]:
+        return _ffmpeg_state["path"]
+    cands = []
+    cands.extend(os.path.join(current_dir, rel) for rel in _FFMPEG_CANDIDATES_REL)
+    which = shutil.which("ffmpeg")
+    if which:
+        cands.append(which)
+    found = next((p for p in cands if p and os.path.isfile(p)), None)
+    _ffmpeg_state.update(checked=True, path=found)
+    return found
+
+
+def _supported_audio_exts() -> list[str]:
+    """本机实际能收的扩展名：基础白名单 +（有 ffmpeg 时的）转码格式。"""
+    return list(SUPPORTED_AUDIO_EXTS) + (list(FFMPEG_AUDIO_EXTS) if _ffmpeg_bin() else [])
+
+
+def _audio_reject_detail(label: str) -> str:
+    if _ffmpeg_bin():
+        return f"{label}不是可识别的音频文件（支持 {SUPPORTED_AUDIO_TEXT}/{FFMPEG_AUDIO_TEXT}）"
+    return (
+        f"{label}不是可识别的音频文件（支持 {SUPPORTED_AUDIO_TEXT}；"
+        f"{FFMPEG_AUDIO_TEXT} 请先转成 wav 或 mp3 再上传）"
+    )
+
+
+def _transcode_to_wav(
+    data: bytes,
+    label: str,
+    *,
+    max_seconds: int | None = None,
+    mono: bool = False,
+    sample_rate: int | None = None,
+) -> bytes:
+    """用 ffmpeg 把任意容器解成 16bit PCM WAV。
+
+    默认保持原采样率/声道（音频参考用）；视频提取会传 mono + 22050，
+    因为推理侧 librosa 最终也是按 22.05kHz 单声道读的。
+
+    输入先落一个临时文件再交给 ffmpeg：mp4/m4a 的 moov 可能在整个文件末尾，
+    纯管道不可回退，大文件会直接「moov atom not found」。临时文件用完即删。
+    """
+    ff = _ffmpeg_bin()
+    if not ff:
+        raise HTTPException(400, _audio_reject_detail(label))
+    fd, src = tempfile.mkstemp(prefix="indextts_media_")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        cmd = [ff, "-v", "error", "-nostdin", "-i", src, "-vn"]
+        if max_seconds:
+            cmd += ["-t", str(int(max_seconds))]
+        if mono:
+            cmd += ["-ac", "1"]
+        if sample_rate:
+            cmd += ["-ar", str(int(sample_rate))]
+        cmd += ["-c:a", "pcm_s16le", "-f", "wav", "pipe:1"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=600)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise HTTPException(500, f"调用 ffmpeg 解码{label}失败: {e}")
+    finally:
+        try:
+            os.remove(src)
+        except OSError:
+            pass
+    if proc.returncode != 0 or not proc.stdout:
+        tail = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        blob = "\n".join(tail)
+        # ffmpeg 的原话是 "Output file does not contain any stream" / "matches no
+        # streams"：录屏、动画这类纯画面视频很常见。直接把最后一行 "Invalid
+        # argument" 甩给用户等于没说，这里翻成人话。
+        if "does not contain any stream" in blob or "matches no streams" in blob:
+            raise HTTPException(
+                400, f"{label}里没有音轨（可能是静音录屏），请换一个带声音的文件"
+            )
+        if "moov atom not found" in blob or "Invalid data found when processing input" in blob:
+            raise HTTPException(400, f"{label}已损坏或不是完整的音视频文件，无法解码")
+        raise HTTPException(
+            400,
+            f"{label}无法解码成音频" + (f"（{tail[-1][:120]}）" if tail else ""),
+        )
+    return proc.stdout
+
+
+def _video_reject_detail() -> str:
+    if not _ffmpeg_bin():
+        return (
+            f"服务端没有 ffmpeg，无法从视频提取音轨（支持 {VIDEO_TEXT}；"
+            "没有 ffmpeg 时请先把视频转成 wav 或 mp3）"
+        )
+    return f"不是可识别的音视频文件（视频支持 {VIDEO_TEXT}）"
+
+
+def _extract_video_wav(data: bytes, label: str = "视频") -> bytes:
+    """视频 → 22.05kHz 单声道 WAV（前 10 分钟），中间临时文件由转码函数清理。"""
+    if not data:
+        raise HTTPException(400, f"{label}是空文件")
+    if len(data) > VIDEO_MAX_BYTES:
+        raise HTTPException(
+            413,
+            f"{label}过大（{len(data) / 1048576:.1f} MB，上限 {VIDEO_MAX_BYTES // 1048576} MB）",
+        )
+    if not (_audio_kind(data) or _video_kind(data)):
+        raise HTTPException(400, _video_reject_detail())
+    if not _ffmpeg_bin():
+        raise HTTPException(400, _video_reject_detail())
+    return _transcode_to_wav(
+        data, label,
+        max_seconds=VIDEO_MAX_SECONDS, mono=True, sample_rate=22050,
+    )
+
+
+def _check_audio_upload_size(data: bytes, label: str) -> None:
     if not data:
         raise HTTPException(400, f"{label}是空文件")
     if len(data) > AUDIO_MAX_BYTES:
         raise HTTPException(
             413,
-            f"{label}过大（{len(data) / 1048576:.0f} MB，上限 {AUDIO_MAX_BYTES // 1048576} MB）",
+            f"{label}过大（{len(data) / 1048576:.1f} MB，上限 {AUDIO_MAX_BYTES // 1048576} MB）",
         )
+
+
+def _validate_audio_upload(data: bytes, label: str, *, allow_ffmpeg: bool = True) -> None:
+    """上传校验：大小上限 + 常见音频容器的魔数嗅探，在落盘前给出可读的 4xx。
+
+    完整解码校验仍由推理侧 librosa 承担（失败经 SSE 报错）；这里只拦截
+    明显不是音频的文件（改名的文本/图片等），不做重解码。
+    allow_ffmpeg=False 用于只吃「浏览器已经解码成功」的入口（如 /audio/tempo）：
+    这些请求的源文件本来就只可能是基础白名单，文案里不该再提 m4a/aac/wma。
+    """
+    _check_audio_upload_size(data, label)
     if not _looks_like_audio(data):
-        raise HTTPException(400, f"{label}不是可识别的音频文件（支持 wav/mp3/flac/ogg/m4a）")
+        if allow_ffmpeg:
+            raise HTTPException(400, _audio_reject_detail(label))
+        raise HTTPException(
+            400, f"{label}不是可识别的音频文件（支持 {SUPPORTED_AUDIO_TEXT}）"
+        )
+
+
+def _prepare_ref_audio(data: bytes, label: str) -> bytes:
+    """参考音频落盘前的统一处理：能直接读的保持原字节，读不了的容器交给 ffmpeg 转 WAV。
+
+    只放行白名单里的容器（见 server_helpers.audio_kind）：webm/mp4 视频/amr 这类
+    即使 ffmpeg 能解也不收，保证「界面上能选的 = 后端能收的」。
+    返回的总是一个 libsndfile 能读的文件，所以 prompts/ 里不会再有「上传成功、
+    推理时才炸」的缓存文件；同一段 m4a 重复上传转出的 WAV 字节一致，内容哈希
+    仍然命中同一个缓存路径。
+    """
+    _check_audio_upload_size(data, label)
+    kind = _audio_kind(data)
+    if kind in ("wav", "mp3", "flac", "ogg"):
+        return data
+    if kind in ("m4a", "aac", "wma") and _ffmpeg_bin():
+        return _transcode_to_wav(data, label)
+    raise HTTPException(400, _audio_reject_detail(label))
+
+
+def _read_upload_capped(f: UploadFile, label: str) -> bytes:
+    """分段限长读取上传文件，超限立刻 413，不把整个文件先吃进内存。
+
+    UploadFile.size 是 Starlette 在接收阶段记下的（有 Content-Length 时最准），
+    先拿它做零成本预检；read(N+1) 兜住 chunked 传输——最坏也只读上限+1 字节。
+    以前四处上传都是 file.read() 全量进内存之后才查上限，--host 0.0.0.0 时
+    一个超大上传就能把内存打满。
+    """
+    limit = AUDIO_MAX_BYTES
+    if getattr(f, "size", None) is not None and f.size > limit:
+        raise HTTPException(413, f"{label}过大（上限 {limit // 1048576} MB）")
+    try:
+        data = f.file.read(limit + 1)
+    except Exception as e:
+        raise HTTPException(400, f"读取{label}失败: {e}")
+    if len(data) > limit:
+        raise HTTPException(413, f"{label}过大（上限 {limit // 1048576} MB）")
+    return data
 
 
 # outputs/ 保留策略：历史自动清理只覆盖"本次运行"生成过的文件，服务器重启后
@@ -589,15 +843,21 @@ def _clean_stale_outputs(retention_days: int = OUTPUTS_RETENTION_DAYS) -> int:
     return removed
 
 
+# 与 _clean_legacy_prompts() 同理放在 import 期：以前只在 __main__ 分支跑，
+# `uvicorn server:app` 启动时孤儿 wav 清理永不执行，outputs/ 会无限膨胀。
+_removed_outputs = _clean_stale_outputs()
+if _removed_outputs:
+    logger.info("Cleaned %d output file(s) older than %d days.",
+                _removed_outputs, OUTPUTS_RETENTION_DAYS)
+
+
 @api.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": tts.loaded}
+    return {"status": "ok", "model_loaded": tts.loaded, "ffmpeg": bool(_ffmpeg_bin())}
 
 
 # ---- system metrics (v2 UI header gauges) ----
 import ctypes
-import shutil
-import subprocess as _sp
 
 
 # NVIDIA 在 Windows 上有两个安装位置：
@@ -638,7 +898,7 @@ def _nvidia_smi(query: str):
     if not exe:
         return None
     try:
-        out = _sp.run(
+        out = subprocess.run(
             [exe, f"--query-gpu={query}", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=4,
         )
@@ -783,33 +1043,40 @@ def _nvml_reads():
 # 旧实现只在 import 时读一次，驱动短暂抖动就会让 GPU 指标整场消失。
 _GPU_INFO_RETRY_SEC = 15.0
 _gpu_info_cache = {"t": 0.0, "info": None}
+# 多标签页每 2s 轮询 /status，几个刷新分支会在无锁 dict 上并发读写：
+# GIL 下不会崩，但会重复 fork nvidia-smi（每个子进程 ~200ms）。
+_GPU_LOCK = threading.Lock()
 
 
 def _gpu_static_info():
     """返回 {"name", "vram_total_mb"}；无 GPU 或暂时读不到返回 None。"""
     if _gpu_info_cache["info"] is not None:
         return _gpu_info_cache["info"]
-    now = time.time()
-    if _gpu_info_cache["t"] and now - _gpu_info_cache["t"] < _GPU_INFO_RETRY_SEC:
-        return None
-    _gpu_info_cache["t"] = now
-
-    r = _nvml_reads()
-    if r is not None and (r[3] or r[2]):
-        # 个别驱动版本读不到型号名；退化成 "GPU" 也强过整块指标消失
-        info = {"name": r[3] or "GPU", "vram_total_mb": r[2] or None}
-    else:
-        name = _nvidia_smi("name")
-        if not name:
+    with _GPU_LOCK:
+        # 双检：等锁期间别的轮询线程可能已经刷新完
+        if _gpu_info_cache["info"] is not None:
+            return _gpu_info_cache["info"]
+        now = time.time()
+        if _gpu_info_cache["t"] and now - _gpu_info_cache["t"] < _GPU_INFO_RETRY_SEC:
             return None
-        total = _nvidia_smi("memory.total")
-        try:
-            total_mb = int(total) if total else None
-        except ValueError:
-            total_mb = None  # nvidia-smi 偶发返回 "N/A" 之类，不能让服务起不来
-        info = {"name": name, "vram_total_mb": total_mb}
-    _gpu_info_cache["info"] = info
-    return info
+        _gpu_info_cache["t"] = now
+
+        r = _nvml_reads()
+        if r is not None and (r[3] or r[2]):
+            # 个别驱动版本读不到型号名；退化成 "GPU" 也强过整块指标消失
+            info = {"name": r[3] or "GPU", "vram_total_mb": r[2] or None}
+        else:
+            name = _nvidia_smi("name")
+            if not name:
+                return None
+            total = _nvidia_smi("memory.total")
+            try:
+                total_mb = int(total) if total else None
+            except ValueError:
+                total_mb = None  # nvidia-smi 偶发返回 "N/A" 之类，不能让服务起不来
+            info = {"name": name, "vram_total_mb": total_mb}
+        _gpu_info_cache["info"] = info
+        return info
 
 
 # 多标签页每 2s 轮询一次 /status；1s 缓存避免重复读（NVML 很快，smi 要 fork）。
@@ -818,14 +1085,18 @@ _smi_cache = {"t": 0.0, "util": None, "used": None}
 
 def _gpu_readings():
     now = time.time()
-    if now - _smi_cache["t"] > 1.0:
-        _smi_cache["t"] = now
-        r = _nvml_reads()
-        if r is not None:
-            _smi_cache["util"], _smi_cache["used"] = r[0], r[1]
-        else:
-            _smi_cache["util"] = _nvidia_smi("utilization.gpu")
-            _smi_cache["used"] = _nvidia_smi("memory.used")
+    if now - _smi_cache["t"] <= 1.0:
+        return _smi_cache["util"], _smi_cache["used"]
+    with _GPU_LOCK:
+        now = time.time()
+        if now - _smi_cache["t"] > 1.0:      # 双检：等锁期间可能已被别人刷新
+            _smi_cache["t"] = now
+            r = _nvml_reads()
+            if r is not None:
+                _smi_cache["util"], _smi_cache["used"] = r[0], r[1]
+            else:
+                _smi_cache["util"] = _nvidia_smi("utilization.gpu")
+                _smi_cache["used"] = _nvidia_smi("memory.used")
     return _smi_cache["util"], _smi_cache["used"]
 
 
@@ -923,17 +1194,17 @@ def _asset_response(name: str):
     """
     fname = os.path.basename(name)
     if "/" in name or "\\" in name:
-        # 只放行 fonts/ 开头的子目录（fonts/noto/xxx.woff2、fonts/inter/xxx.woff2），
-        # 且必须仍在 fonts/ 内 —— 其余一律拒绝，防目录穿越。
+        # 只放行 fonts/ 与 guide/ 开头的子目录（字体分片、使用指南插图），
+        # 且必须仍在各自目录内 —— 其余一律拒绝，防目录穿越。
         parts = [p for p in name.replace("\\", "/").split("/") if p]
-        if len(parts) < 2 or parts[0] != "fonts":
+        if len(parts) < 2 or parts[0] not in ("fonts", "guide"):
             raise HTTPException(404, "Not found")
         if any(p in (".", "..") for p in parts):
             raise HTTPException(404, "Not found")
         rel = os.path.join(*parts)
         path = os.path.normpath(os.path.join(_WEB_DIR, rel))
-        fonts_root = os.path.join(_WEB_DIR, "fonts")
-        if not path.startswith(fonts_root + os.sep):
+        root = os.path.join(_WEB_DIR, parts[0])
+        if not path.startswith(root + os.sep):
             raise HTTPException(404, "Not found")
         fname = os.path.basename(path)
     else:
@@ -977,13 +1248,22 @@ def asset(name: str):
 
 @api.get("/status")
 def status():
-    """合并端点：模型状态 + 系统仪表一次往返。
+    """合并端点：模型状态 + 系统仪表 + 批处理档位，一次往返。
 
     前端 Header 每 2s 轮询一次这里即可（此前 /model 与 /metrics 各发一次，
     多标签页叠加时请求数翻倍）。
     """
     data = {"ok": True, "generating": _INFER_LOCK.locked(), **tts.state()}
     data.update(metrics())
+    # 模型页的「本机实际档位」也搭这趟车：前端 2 秒轮询要顺带刷新模型页状态，
+    # 单独再发一次 /model 等于把请求数翻倍，正是这个合并端点要避免的。
+    data["gpt_batch"] = tts.gpt_batch_state()
+    # 参考音频能收哪些容器取决于有没有 ffmpeg，前端据此切换 accept 与预检
+    data["ffmpeg"] = bool(_ffmpeg_bin())
+    data["audio_exts"] = _supported_audio_exts()
+    data["audio_max_mb"] = AUDIO_MAX_BYTES // 1048576
+    data["video_exts"] = list(VIDEO_EXTS) if _ffmpeg_bin() else []
+    data["video_max_mb"] = VIDEO_MAX_BYTES // 1048576
     return data
 
 
@@ -991,7 +1271,10 @@ def status():
 def model_state():
     # generating 让模型页在用户点之前就知道「现在动模型会被打断」，
     # 从而把不可用的按钮置灰、并给「卸载」换上会说明后果的确认框。
-    return {"ok": True, "generating": _INFER_LOCK.locked(), **tts.state()}
+    data = {"ok": True, "generating": _INFER_LOCK.locked(), **tts.state()}
+    # 批处理档位的「本机实际值」：自动模式现在能拼几行、上次生成实际拼了几段。
+    data["gpt_batch"] = tts.gpt_batch_state()
+    return data
 
 
 def _generation_elapsed():
@@ -1032,8 +1315,103 @@ def _reject_if_generating():
 # unknown keys are typos and must 400 instead of being silently dropped.
 _MODEL_CONFIG_KEYS = frozenset({
     "fp16", "s2mel_fp16", "w2v_fp16", "qwen_fp16", "cudnn_benchmark",
-    "diffusion_steps", "inference_cfg_rate",
+    "diffusion_steps", "inference_cfg_rate", "gpt_batch_size",
 })
+# 每个字段的类型与生效区间（与模型页滑轨、set_runtime 的兜底取同一档位）。
+_MODEL_CONFIG_BOOL = ("fp16", "s2mel_fp16", "w2v_fp16", "qwen_fp16", "cudnn_benchmark")
+_MODEL_CONFIG_INT = {"diffusion_steps": (1, 50), "gpt_batch_size": (-1, 12)}
+_MODEL_CONFIG_FLOAT = {"inference_cfg_rate": (0.0, 1.0)}
+
+# ---- 模型加速配置的落盘持久化 -------------------------------------------
+# 「保存配置」之前只写进内存（set_runtime 仅改标量），重启服务全部丢回命令行
+# 默认值——用户反馈过这个问题。现在 /model/config 与 /model/restart 改动后
+# 会写 model_config.json；启动时在这里读回来套用，保证设置跨重启生效。
+_MODEL_CFG_PATH = os.path.join(current_dir, "model_config.json")
+
+
+def _model_cfg_save():
+    """把当前生效的模型配置写进 model_config.json（写失败只记日志，不影响生成）。"""
+    try:
+        state = {k: v for k, v in tts.state().items() if k in _MODEL_CONFIG_KEYS}
+        with open(_MODEL_CFG_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        logger.info("Model config saved to %s", _MODEL_CFG_PATH)
+    except Exception as e:
+        logger.warning("Failed to save model config: %s", e, exc_info=True)
+
+
+def _model_cfg_load():
+    """启动时把上次保存的模型配置套用回 init_kwargs（坏文件/缺文件直接跳过）。"""
+    try:
+        with open(_MODEL_CFG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        logger.warning("Ignored unreadable model config %s: %s", _MODEL_CFG_PATH, e)
+        return
+    if not isinstance(data, dict):
+        return
+    # JSON 合法但值类型错的配置（如 "diffusion_steps": "abc"、"fp16": null）
+    # 以前会直接进 set_runtime，在 import 期抛 TypeError —— 服务根本起不来，
+    # 与「坏文件直接跳过」的承诺相反。逐键校验，坏的那一个跳过并留痕。
+    kw = {}
+    for key, val in data.items():
+        if key not in _MODEL_CONFIG_KEYS:
+            continue
+        try:
+            kw[key] = _model_config_value(key, val)
+        except HTTPException as e:
+            logger.warning("Ignored invalid model config %s=%r: %s", key, val, e.detail)
+    if not kw:
+        return
+    tts.set_runtime(**kw)
+    logger.info("Model config restored from %s: %s", _MODEL_CFG_PATH, kw)
+
+
+# _model_cfg_load() 的调用放在 _model_config_value 定义之后（见下方），
+# 否则启动期校验会撞上「函数还没定义」。
+
+
+def _model_config_number(key: str, val):
+    """数值字段的类型校验：None / 布尔 / 非数字字符串一律 400 并点名参数。
+
+    以前这些值直接进 set_runtime，None 会抛 TypeError → 接口 500，前端的 toast
+    只剩一句「保存失败」，看不出是哪个字段坏了（BUG-003）。
+    """
+    if val is None:
+        raise HTTPException(400, f"参数 {key} 不能为空（需要数字）")
+    if isinstance(val, bool):
+        raise HTTPException(400, f"参数 {key} 需要数字，不能是 true/false")
+    if isinstance(val, (int, float)):
+        if isinstance(val, float) and (val != val or val in (float("inf"), float("-inf"))):
+            raise HTTPException(400, f"参数 {key} 不是有效数字")
+        return val
+    if isinstance(val, str):
+        try:
+            return float(val)
+        except ValueError:
+            raise HTTPException(400, f"参数 {key} 需要数字，当前是字符串 {val[:32]!r}")
+    raise HTTPException(400, f"参数 {key} 需要数字，当前是 {type(val).__name__}")
+
+
+def _model_config_value(key: str, val):
+    """把 /model/config 的一个字段收敛成 set_runtime 需要的类型，并按界面区间夹取。"""
+    if key in _MODEL_CONFIG_BOOL:
+        if not isinstance(val, bool):
+            raise HTTPException(400, f"参数 {key} 需要 true/false，当前是 {type(val).__name__}")
+        return val
+    if key in _MODEL_CONFIG_INT:
+        lo, hi = _MODEL_CONFIG_INT[key]
+        return int(max(lo, min(hi, _model_config_number(key, val))))
+    if key in _MODEL_CONFIG_FLOAT:
+        lo, hi = _MODEL_CONFIG_FLOAT[key]
+        return float(max(lo, min(hi, _model_config_number(key, val))))
+    raise HTTPException(400, f"参数 {key} 不受支持")
+
+
+# 启动恢复：放在 _model_config_value 之后，见 _model_cfg_load 处的说明。
+_model_cfg_load()
 
 
 @api.post("/model/config")
@@ -1042,8 +1420,11 @@ def model_config(req: dict = Body(...)):
     unknown = [k for k in req if k not in _MODEL_CONFIG_KEYS]
     if unknown:
         raise HTTPException(400, f"Unknown config keys: {', '.join(sorted(unknown))}")
-    for key, val in req.items():
-        tts.set_runtime(**{key: val})
+    clean = {key: _model_config_value(key, val) for key, val in req.items()}
+    # 一次调用：set_runtime 内部整段持有 _cfg_lock，逐键调用会让两个并发保存
+    # 在键与键之间交错，恰好制造它声明要避免的「一半新一半旧」。
+    tts.set_runtime(**clean)
+    _model_cfg_save()
     cfg = tts.state()
     logger.info("Runtime config updated: steps=%s cfg_rate=%s s2mel_fp16=%s fp16=%s",
                 cfg["diffusion_steps"], cfg["inference_cfg_rate"], cfg["s2mel_fp16"], cfg["fp16"])
@@ -1113,9 +1494,14 @@ def model_restart(req: dict | None = Body(None)):
         unknown = [k for k in req if k not in _MODEL_CONFIG_KEYS]
         if unknown:
             raise HTTPException(400, f"Unknown config keys: {', '.join(sorted(unknown))}")
+        # 和 /model/config 用同一个校验器：以前这里只看键名不看值，
+        # {"diffusion_steps": null} 会 500，{"fp16": null} 会 bool(None)=False
+        # 静默关掉 fp16，并且被 _model_cfg_save() 持久化到 model_config.json，
+        # 跨重启生效。
+        clean = {key: _model_config_value(key, val) for key, val in req.items()}
         # 和 /model/config 一致：写配置不占推理锁，只有 rebuild 才需要
-        for key, val in req.items():
-            tts.set_runtime(**{key: val})
+        tts.set_runtime(**clean)
+        _model_cfg_save()
     cfg = json.dumps(tts.state(), ensure_ascii=False)
     with _INFER_LOCK:
         try:
@@ -1140,6 +1526,9 @@ _INFER_LOCK = threading.Lock()
 _JOBS_LOCK = threading.Lock()
 _JOBS = {}  # job_id -> {"state": ..., "stop_event": threading.Event}
 JOB_RETENTION_SECONDS = 300
+# 排队上限：每个 /tts 无条件起一个线程 + 一条 SSE 连接，没有上界时多标签页
+# 连续提交会把线程和内存堆到服务不可用。超限直接 429，让用户等现有任务。
+TTS_QUEUE_MAX = 16
 
 
 class _InferenceStop(Exception):
@@ -1278,6 +1667,19 @@ def tts_stop(job_id: str, keep_model: bool = False):
             state = "stop_requested"
     return {"ok": True, "state": state}
 
+def _err_detail(e: Exception, cap: int = 300) -> str:
+    """把异常收成一条可读的客户端错误文本。
+
+    有些异常 str() 为空（如裸 RuntimeError()），直接插值会让前端只看到
+    「Inference failed: 」后面一片空白；超长异常文本则可能把服务端绝对路径
+    整段透给客户端。完整信息进服务端日志，这里只截 cap 个字符。
+    """
+    msg = str(e).strip()
+    if not msg or msg == "None":
+        msg = f"{type(e).__name__}（无错误信息，详见服务端日志）"
+    return msg[:cap]
+
+
 @api.post("/tts")
 def do_tts(
     text: str = Form(...),
@@ -1296,6 +1698,7 @@ def do_tts(
     vec8: float = Form(0.0),
     emo_text: str = Form(""),
     use_random: bool = Form(False),
+    seed: int | None = Form(None),       # 可选复现种子：同时喂 use_random 的 random 与 torch 采样
     max_text_tokens_per_segment: int = Form(120),
     do_sample: bool = Form(True),
     top_p: float = Form(0.8),
@@ -1307,9 +1710,26 @@ def do_tts(
     max_mel_tokens: int = Form(1500),
     interval_silence: int = Form(200),      # 段间停顿（毫秒）
     file_naming: str = Form("title_time"),   # title_time / title / default
+    # 多候选（F3）：同一轮生成的几条各自是一次普通 /tts，靠这三个字段互相关联。
+    # 旧前端不传 → 空组、单条，行为与改动前逐字节一致。
+    cand_group: str = Form(""),
+    cand_index: int = Form(-1),
+    cand_total: int = Form(1),
 ):
     if file_naming not in ("title_time", "title", "default"):
         file_naming = "title_time"
+    # 组 id 只用来「同组互相找回」，不参与文件名/落盘，截断即可；
+    # index/total 越界按边界夹取而不是 400——它们只影响展示，不影响合成结果。
+    cand_group = (cand_group or "").strip()[:32]
+    if cand_index < -1 or cand_index > 2:
+        logger.warning("cand_index 越界（%s），已夹到 0..2", cand_index)
+    cand_index = max(-1, min(2, cand_index))
+    cand_total = max(1, min(3, cand_total))
+    if cand_group and cand_index < 0:
+        cand_index = 0
+    if not cand_group:
+        cand_index = -1
+        cand_total = 1
     # 文本可能在到达 HTTP 之前就已乱码（见 _fix_mojibake），先还原再用于合成与命名
     text = _fix_mojibake(text)
     emo_text = _fix_mojibake(emo_text)
@@ -1351,30 +1771,28 @@ def do_tts(
     max_mel_tokens = _gen["max_mel_tokens"]
     repetition_penalty = _gen["repetition_penalty"]
     length_penalty = _gen["length_penalty"]
+    # 夹取要放在 warn 之前：提示里的段数必须和 /segments 预览用同一个上限，
+    # 否则用户会看到「预览 36 段、提示 21 段」这种自相矛盾的数字。
+    max_text_tokens_per_segment = _clamp_seg_tokens(max_text_tokens_per_segment)
     text_warn = None
     if len(text) > TEXT_CHARS_SOFT:
-        # 只警告不拦。段数估算按中文约 1.31 token/字、默认每段 120 token
-        # 折算（实测 2000 字 -> 2628 token -> 28 段）。这里只给量级，
-        # 前端有更准的分段预览可看。
-        est_tokens = int(len(text) * 1.31)
-        est_segs = max(1, est_tokens // max(1, max_text_tokens_per_segment))
-        est_min = round(est_segs * 8 / 60)          # 每段约 8s 的保守估计
-        text_warn = (
-            f"文本较长（{len(text)} 字，约切 {est_segs} 段，预计 {est_min} 分钟以上）。"
-            "生成期间会独占 GPU，其他任务需排队；"
-            "关闭或刷新页面不会中断，服务端会继续跑完。"
-        )
-    if emo_text and len(emo_text) > MAX_EMO_TEXT_CHARS:
-        raise HTTPException(
-            413,
-            f"情感描述文本过长（{len(emo_text)} 字，上限 {MAX_EMO_TEXT_CHARS} 字）",
-        )
-    max_text_tokens_per_segment = _clamp_seg_tokens(max_text_tokens_per_segment)
-    try:
-        spk_data = spk_audio.file.read()
-    except Exception as e:
-        raise HTTPException(400, f"Failed to read speaker audio: {e}")
-    _validate_audio_upload(spk_data, "音色参考音频")
+        # 只警告不拦。段数用和 /segments 同一套分词算真实值；分词器起不来
+        # （首次加载失败等）才退回经验公式。tokenizer 一旦建好就常驻，
+        # 这里只在超长文本上多一次几十毫秒的分词。
+        est_segs = None
+        try:
+            tts._ensure_light()
+            _tokens = tts.tokenizer.tokenize(text)
+            est_segs = len(tts.tokenizer.split_segments(
+                _tokens, max_text_tokens_per_segment=max_text_tokens_per_segment))
+        except Exception as e:
+            logger.warning("long-text warn: tokenizer unavailable (%s)", e)
+        if est_segs:
+            est_min = _estimated_minutes(est_segs)
+        else:
+            est_segs, est_min = _estimate_long_text(len(text), max_text_tokens_per_segment)
+        text_warn = _format_long_text_warn(len(text), est_segs, est_min)
+    spk_data = _prepare_ref_audio(_read_upload_capped(spk_audio, "音色参考音频"), "音色参考音频")
     spk_path = _prompt_file("spk", spk_data)
     try:
         if os.path.exists(spk_path):
@@ -1384,16 +1802,38 @@ def do_tts(
             with open(spk_path, "wb") as f:
                 f.write(spk_data)
             _cap_prompt_files(PROMPTS_DIR)
+    except OSError as e:
+        # 服务端写盘失败（磁盘满/权限/目录没了）不是客户端的错，不能回 400
+        raise _save_oserror(e, spk_path) from e
     except Exception as e:
-        raise HTTPException(400, f"Failed to save speaker audio: {e}")
+        logger.error("Failed to save speaker audio: %s", e, exc_info=True)
+        raise HTTPException(500, "服务端保存参考音频失败，请查看服务日志")
+
+    # emo_mode 来自表单是字符串；非数字用 400 明确拒绝，而不是在 int() 上
+    # 抛未捕获异常变成 500。越界值（只允许 0~3）同样拒绝——此前 9 之类会
+    # 静默落进 else 当成 0 处理。
+    # 解析放在情感音频落盘之前：mode≠1 时推理端根本不用这份音频，先写盘
+    # 再校验等于「副作用先于校验」。
+    try:
+        mode = int(emo_mode)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "情感模式参数无效（应为 0~3 的整数）")
+    if mode not in (0, 1, 2, 3):
+        raise HTTPException(400, "情感模式参数无效（应为 0~3 的整数）")
+
+    # 描述文本只在模式 3 生效；其它模式下前端可能仍留着隐藏的旧文本，
+    # 不能让它把一次与它无关的生成拦下来。
+    if mode != 3:
+        emo_text = ""
+    elif len(emo_text) > MAX_EMO_TEXT_CHARS:
+        raise HTTPException(
+            413,
+            f"情感描述文本过长（{len(emo_text)} 字，上限 {MAX_EMO_TEXT_CHARS} 字）",
+        )
 
     emo_ref_path = None
-    if emo_audio is not None:
-        try:
-            emo_data = emo_audio.file.read()
-        except Exception as e:
-            raise HTTPException(400, f"Failed to read emo audio: {e}")
-        _validate_audio_upload(emo_data, "情感参考音频")
+    if emo_audio is not None and mode == 1:
+        emo_data = _prepare_ref_audio(_read_upload_capped(emo_audio, "情感参考音频"), "情感参考音频")
         emo_ref_path = _prompt_file("emo", emo_data)
         try:
             if os.path.exists(emo_ref_path):
@@ -1402,29 +1842,37 @@ def do_tts(
                 with open(emo_ref_path, "wb") as f:
                     f.write(emo_data)
                 _cap_prompt_files(PROMPTS_DIR)
+        except OSError as e:
+            raise _save_oserror(e, emo_ref_path) from e
         except Exception as e:
-            raise HTTPException(400, f"Failed to save emo audio: {e}")
+            logger.error("Failed to save emo audio: %s", e, exc_info=True)
+            raise HTTPException(500, "服务端保存情感参考音频失败，请查看服务日志")
 
-    # emo_mode 来自表单是字符串；非数字用 400 明确拒绝，而不是在 int() 上
-    # 抛未捕获异常变成 500。越界值（只允许 0~3）同样拒绝——此前 9 之类会
-    # 静默落进 else 当成 0 处理。
-    try:
-        mode = int(emo_mode)
-    except (TypeError, ValueError):
-        raise HTTPException(400, "情感模式参数无效（应为 0~3 的整数）")
-    if mode not in (0, 1, 2, 3):
-        raise HTTPException(400, "情感模式参数无效（应为 0~3 的整数）")
     if mode == 0:
-        emo_ref_path = None
         vec = None
     elif mode == 1:
+        # 忘传音频时 infer_v2 会静默回退用 spk 音频做情感参考并强制
+        # emo_alpha=1.0：用户以为在用情感参考，实际拿到 mode 0 的效果，
+        # emo_weight 也被无视，全程无提示。入口直接拒绝更干净。
+        if emo_ref_path is None:
+            raise HTTPException(400, "情感模式 1（参考音频）需要上传情感参考音频")
         vec = None
     elif mode == 2:
+        # 只钳位置不动 server_helpers：NormalizeEmoVec 要对齐 infer_v2 的逐位结果。
+        # NaN 能通过 float("nan") 解析，而 normalize_emo_vec 的 total > 上限
+        # 对 NaN 恒 False，NaN 向量会原样进模型（GEN_PARAMS 注释里说过 NaN 会整段
+        # 静音或崩在 CUDA kernel 里）。
+        raw_vec = [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
+        if not all(math.isfinite(v) for v in raw_vec):
+            raise HTTPException(400, "情感向量含 NaN/inf，请检查输入")
         # 纯数学，不加载模型（见 _normalize_emo_vec 的注释）
-        vec = _normalize_emo_vec(
-            [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8], apply_bias=True
-        )
-    else:
+        vec = _normalize_emo_vec(raw_vec, apply_bias=True)
+    else:  # mode == 3
+        # 前端与 CLI 都把 emo_text 当必填。infer_v2 在它为 None 时会静默拿
+        # 正文当情感描述（emo_text = text），用户以为设了情绪，实际拿到的是
+        # 正文自带的情绪，全程无提示——入口直接拒绝更干净。
+        if not emo_text.strip():
+            raise HTTPException(400, "情感模式 3（描述文本）需要填写情感描述文本")
         vec = None
 
     if emo_text == "":
@@ -1433,6 +1881,13 @@ def do_tts(
     t0 = time.time()
     out_path = None  # 在拿到推理锁后由 run_infer 计算（见下）
     progress_q = queue.Queue()
+    with _JOBS_LOCK:
+        inflight = sum(
+            1 for j in _JOBS.values()
+            if j["state"] in ("queued", "running", "stop_requested", "stopping")
+        )
+    if inflight >= TTS_QUEUE_MAX:
+        raise HTTPException(429, f"排队任务已达上限（{TTS_QUEUE_MAX}），请等待现有任务完成")
     job_id, jobs_ahead = _register_job(client_id)
     with _JOBS_LOCK:
         stop_event = _JOBS[job_id]["stop_event"]
@@ -1467,6 +1922,11 @@ def do_tts(
                     "history_id": ev.get("history_id"),
                     "mel_capped": ev.get("mel_capped", False),
                     "normalize_fallback": ev.get("normalize_fallback"),
+                    # /jobs/current 的恢复路径读的就是这个字典：漏写会让刷新后
+                    # 候选条退化成单条（见 PLAN §4.5）
+                    "cand_group": ev.get("cand_group", ""),
+                    "cand_index": ev.get("cand_index", -1),
+                    "cand_total": ev.get("cand_total", 1),
                 }
                 logger.info("TTS job %s done: file=%s elapsed=%ss mel_capped=%s",
                             job_id, ev.get("file"), ev.get("elapsed"), ev.get("mel_capped", False))
@@ -1543,15 +2003,10 @@ def do_tts(
             finally:
                 _INFER_LOCK.release()
         except Exception as e:
-            logger.error("TTS worker crashed: %s", e, exc_info=True)
+            logger.error("TTS job %s worker crashed: %s", job_id, e, exc_info=True)
             # 兜底:任何未捕获异常都必须以终止事件收尾,否则 SSE 会永久挂起。
-            # 有些异常 str() 为空(如裸 RuntimeError()),直接插值会让前端只看到
-            # 「Inference failed: 」后面一片空白,用户无从判断。此处退回异常类名。
-            _msg = str(e).strip()
-            if not _msg or _msg == "None":
-                _msg = f"{type(e).__name__}（无错误信息，详见服务端日志）"
             try:
-                record_event({"type": "error", "detail": f"Inference failed: {_msg[:300]}"})
+                record_event({"type": "error", "detail": f"Inference failed: {_err_detail(e)}"})
             except Exception:
                 progress_q.put({"type": "error", "detail": "Inference failed"})
 
@@ -1570,6 +2025,14 @@ def do_tts(
             model = tts.ensure_loaded()
             prev_progress = model.gr_progress
             model.gr_progress = report_progress
+            if seed is not None:
+                # 种子在推理锁内、infer 之前设置：use_random 的 random.randint 与
+                # do_sample 的 torch 采样都在 infer 内部取数，锁保证不被其它任务穿插。
+                # 复现仅在同 torch 版本/同硬件下成立。
+                import random as _random
+                import torch as _torch
+                _torch.manual_seed(seed)
+                _random.seed(seed)
             result = model.infer(
                 spk_audio_prompt=spk_path,
                 text=text,
@@ -1597,7 +2060,10 @@ def do_tts(
             else:
                 elapsed = round(time.time() - t0, 2)
                 wav_name = Path(out_path).name
-                entry = _history_add(wav_name, text, elapsed, mode)
+                entry = _history_add(
+                    wav_name, text, elapsed, mode,
+                    cand_group=cand_group, cand_index=cand_index, cand_total=cand_total,
+                )
                 # 触到 max_mel_tokens 上限的生成是静默截断，前端必须提示
                 mel_capped = bool(getattr(model, "mel_tokens_capped", False))
                 # 文本规范化失败并退回原文同样是无声的（读音不标准但音频出来了），
@@ -1611,6 +2077,9 @@ def do_tts(
                     "history_id": entry["id"],
                     "mel_capped": mel_capped,
                     "normalize_fallback": normalize_fallback,
+                    "cand_group": cand_group,
+                    "cand_index": cand_index,
+                    "cand_total": cand_total,
                 })
         except _InferenceStop:
             # 用户在模型页点「卸载模型」时会带上 stop_unload：这时不要重建，
@@ -1672,7 +2141,7 @@ def do_tts(
             record_event({"type": "stopped", "detail": detail})
         except Exception as e:
             logger.error("TTS job %s inference error: %s", job_id, e, exc_info=True)
-            record_event({"type": "error", "detail": f"Inference failed: {e}"})
+            record_event({"type": "error", "detail": f"Inference failed: {_err_detail(e)}"})
         finally:
             if model is not None:
                 model.gr_progress = prev_progress
@@ -1681,7 +2150,19 @@ def do_tts(
 
     def gen():
         while True:
-            ev = progress_q.get()
+            try:
+                ev = progress_q.get(timeout=30)
+            except queue.Empty:
+                # 排队/加载可能静默数分钟，没有心跳时代理或浏览器会掐断连接。
+                # SSE 注释行浏览器自动忽略，app.js 也按 data: 前缀过滤。
+                yield ": keepalive\n\n"
+                with _JOBS_LOCK:
+                    job = _JOBS.get(job_id)
+                # worker 极端情况下（未发终止事件就退出）不再永久挂起占线程
+                if job is None or job["state"] in ("done", "error", "cancelled", "stopped"):
+                    yield f"data: {json.dumps({'type': 'error', 'detail': '任务已结束但未收到终止事件'})}\n\n"
+                    return
+                continue
             yield f"data: {json.dumps(ev)}\n\n"
             if ev["type"] in ("done", "error", "stopped"):
                 return
@@ -1755,6 +2236,15 @@ def _stretch_wav(in_path: str, rate: float) -> bytes:
     return buf.getvalue()
 
 
+def _stretch_from_bytes(data: bytes, rate: float) -> bytes:
+    """写临时文件 + WSOLA 整段放进 executor，事件循环不碰磁盘 I/O。"""
+    with tempfile.TemporaryDirectory() as td:
+        in_path = os.path.join(td, "in.wav")
+        with open(in_path, "wb") as f:
+            f.write(data)
+        return _stretch_wav(in_path, rate)
+
+
 def _warmup_tempo():
     """Pay the audiotsm import cost off the request path.
 
@@ -1778,8 +2268,15 @@ def _warmup_tempo():
 @api.post("/audio/tempo")
 async def audio_tempo(file: UploadFile = File(...), rate: float = Form(...)):
     """Pitch-preserving speed change. Returns a new wav (not persisted)."""
-    data = await file.read()
-    _validate_audio_upload(data, "音频")
+    # 先按元数据挡，再限量读取：以前是全量 read() 进内存之后才查上限
+    if getattr(file, "size", None) is not None and file.size > AUDIO_MAX_BYTES:
+        raise HTTPException(413, f"音频过大（上限 {AUDIO_MAX_BYTES // 1048576} MB）")
+    data = await file.read(AUDIO_MAX_BYTES + 1)
+    if len(data) > AUDIO_MAX_BYTES:
+        raise HTTPException(413, f"音频过大（上限 {AUDIO_MAX_BYTES // 1048576} MB）")
+    # 这个接口的调用方只有裁剪弹窗的「变速」，源文件必然已经过浏览器解码；
+    # 文案里只列基础格式，不提需要 ffmpeg 的 m4a/aac/wma。
+    _validate_audio_upload(data, "音频", allow_ffmpeg=False)
     if not (_TEMPO_MIN <= rate <= _TEMPO_MAX):
         raise HTTPException(
             400, f"变速倍率超出范围（{rate}，允许 {_TEMPO_MIN}–{_TEMPO_MAX}）"
@@ -1789,11 +2286,9 @@ async def audio_tempo(file: UploadFile = File(...), rate: float = Form(...)):
     # 这里取到的本来就是同一个循环，换成不会告警的写法。
     loop = asyncio.get_running_loop()
     try:
-        with tempfile.TemporaryDirectory() as td:
-            in_path = os.path.join(td, "in.wav")
-            with open(in_path, "wb") as f:
-                f.write(data)
-            wav = await loop.run_in_executor(None, _stretch_wav, in_path, rate)
+        # 写临时文件也挪进 executor：同步写最大 32MB 会卡住整个事件循环，
+        # 写盘期间所有并发请求（含 2s 轮询的 /status）一起停摆。
+        wav = await loop.run_in_executor(None, _stretch_from_bytes, data, rate)
     except HTTPException:
         raise
     except Exception as e:
@@ -1802,13 +2297,43 @@ async def audio_tempo(file: UploadFile = File(...), rate: float = Form(...)):
     return Response(content=wav, media_type="audio/wav", headers={"Cache-Control": "no-cache"})
 
 
+@api.post("/audio/extract")
+async def audio_extract(file: UploadFile = File(...)):
+    """从视频（或任意受支持的音频容器）抽出音轨，返回 22.05kHz 单声道 WAV。
+
+    前端选到视频时立刻调用，拿到的 WAV 就是普通参考音频，后续播放、裁剪、
+    /tts 上传全走原路径，不额外引入一套「视频参考」状态。
+    """
+    if not _ffmpeg_bin():
+        raise HTTPException(400, _video_reject_detail())
+    if getattr(file, "size", None) is not None and file.size > VIDEO_MAX_BYTES:
+        raise HTTPException(413, f"视频过大（上限 {VIDEO_MAX_BYTES // 1048576} MB）")
+    data = await file.read(VIDEO_MAX_BYTES + 1)
+    loop = asyncio.get_running_loop()
+    # 同一个端点也承担「浏览器解不了的音频容器」的转码，文案里的名字按实际内容取
+    label = "视频" if _video_kind(data) else "音频"
+    try:
+        # 200MB 视频的 ffmpeg 解码是同步阻塞的，放进线程池，别卡住 /status 轮询
+        wav = await loop.run_in_executor(None, _extract_video_wav, data, label)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("video extract failed")
+        raise HTTPException(500, f"提取音轨失败：{e}")
+    return Response(content=wav, media_type="audio/wav", headers={"Cache-Control": "no-cache"})
+
+
 # ---- generation history -------------------------------------------------------
-# Scope: this server run only (in-memory, nothing persisted).
+# 列表落盘到 data/history.json，重启后仍在（上限仍是 HISTORY_LIMIT）。
+# 注意「最长 14 天」：outputs/ 里的产物会在启动时被保留期清理，被清掉的文件对应
+# 的历史条目在载入时直接丢弃，所以这个文件保证的是「列表不丢」，不是「文件永久保留」。
 # 列表不再只由推理线程写：HTTP 线程会清空/单条删除，因此有自己的锁。
 # 音频文件的删除一律丢到后台线程——删除在网络盘、杀软扫描、文件被占用时会长时间
 # 阻塞，以前它发生在推理线程里、且在 done 事件之前，一阻塞用户就永久卡在
 # 「saving audio...」，整个服务排队。
 HISTORY_LIMIT = 20          # auto-clean keeps the newest N; older entries drop off
+
+_HISTORY_PATH = os.path.join(DATA_DIR, "history.json")
 
 _history = []               # newest first
 _history_auto_clean = True
@@ -1835,18 +2360,81 @@ def _delete_audio_async(file_names) -> None:
     threading.Thread(target=run, name="history-delete", daemon=True).start()
 
 
-def _history_trim():
-    """Drop entries past HISTORY_LIMIT; their files go on a background thread."""
-    victims = []
-    with _HISTORY_LOCK:
-        while len(_history) > HISTORY_LIMIT:
-            victims.append(_history.pop())
-    # 条目该丢还是要丢（不论 auto_clean 开关），只有删文件受开关控制
-    if _history_auto_clean:
-        _delete_audio_async([e["file"] for e in victims])
+def _load_history(path: str | None = None) -> None:
+    """启动时载入历史；损坏则备份后空启动；产物已不存在的条目直接丢弃。
+
+    path 只为测试注入（与 _persist_history_locked 同口径）：不传时用 _HISTORY_PATH。
+    这样测试不必 reload 整个 server 模块——import 期还带着保留期清理、资源指纹等副作用。
+    """
+    path = path or _HISTORY_PATH
+    global _history, _history_auto_clean
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        logger.warning("history.json 无法解析，已备份并从空历史启动", exc_info=True)
+        try:
+            os.replace(path, f"{path}.bad-{int(time.time())}")
+        except OSError:
+            pass
+        return
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return
+    clean = []
+    for e in items[:HISTORY_LIMIT]:
+        if not isinstance(e, dict):
+            continue
+        file_name = os.path.basename(str(e.get("file") or ""))
+        if not e.get("id") or not file_name:
+            continue
+        if not os.path.isfile(os.path.join(OUTPUTS_DIR, file_name)):
+            continue          # 已手工删除 / 被 14 天保留期清掉：条目没有意义
+        e["file"] = file_name
+        # url 由文件名单一来源重建：手改过的 JSON 不会把播放链接指到别处
+        e["url"] = f"{API_V1}/audio/{quote(file_name)}"
+        clean.append(e)
+    _history = clean
+    _history_auto_clean = bool(data.get("auto_clean", True))
+    logger.info("载入生成历史 %d 条（上限 %d）", len(clean), HISTORY_LIMIT)
 
 
-def _history_add(file_name: str, text: str, elapsed: float, emo_mode: int) -> dict:
+def _persist_history_locked(path: str | None = None) -> bool:
+    """调用方必须已持有 _HISTORY_LOCK。tmp + os.replace，永不半写。
+
+    只 flush 不 fsync：这个写发生在推理线程、done 事件之前，而项目里历史文件的
+    删除之所以丢到后台线程，就是因为慢盘（U 盘/网络盘，便携包常见）会卡住推理线程。
+    断电最多丢最后一次改动，附属功能可以接受。
+
+    返回值表示是否真的落盘：只读盘 / 磁盘满时前端要能提示「仅本次运行有效」。
+    """
+    path = path or _HISTORY_PATH
+    payload = {"version": 1, "auto_clean": _history_auto_clean, "items": _history}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        # 历史是附属功能：写盘失败只记日志，绝不让生成/删除请求 500
+        logger.warning("history.json 写入失败，本次改动仅内存生效", exc_info=True)
+        return False
+
+
+def _history_add(
+    file_name: str,
+    text: str,
+    elapsed: float,
+    emo_mode: int,
+    cand_group: str = "",
+    cand_index: int = -1,
+    cand_total: int = 1,
+) -> dict:
     """Record one successful generation and return the new entry."""
     try:
         size = os.path.getsize(os.path.join(OUTPUTS_DIR, file_name))
@@ -1855,7 +2443,7 @@ def _history_add(file_name: str, text: str, elapsed: float, emo_mode: int) -> di
     entry = {
         "id": uuid.uuid4().hex[:8],
         "file": file_name,
-        "url": f"{API_V1}/audio/{file_name}",
+        "url": f"{API_V1}/audio/{quote(file_name)}",
         "text": _safe_title(text, 60),
         "chars": len(str(text or "")),
         "elapsed": round(float(elapsed), 2),
@@ -1863,11 +2451,28 @@ def _history_add(file_name: str, text: str, elapsed: float, emo_mode: int) -> di
         "size": size,
         "created_at": time.time(),
     }
+    # 只在真有候选组时写这三个键：旧条目没有它们 → 前端按单条处理，
+    # 也不会让 history.json 因为一个空字段整体多出一份噪音。
+    if cand_group:
+        entry["cand_group"] = cand_group
+        entry["cand_index"] = int(cand_index)
+        entry["cand_total"] = int(cand_total)
     with _HISTORY_LOCK:
         _history.insert(0, entry)
-    # trim 只做"从列表里摘掉"，文件删除已丢后台，所以这里不会阻塞推理线程
-    _history_trim()
+        victims = []
+        while len(_history) > HISTORY_LIMIT:
+            victims.append(_history.pop())
+        _persist_history_locked()
+    # 条目该丢还是要丢（不论 auto_clean 开关），只有删文件受开关控制；
+    # 文件删除丢后台，所以这里不会阻塞推理线程
+    if _history_auto_clean:
+        _delete_audio_async([e["file"] for e in victims])
     return entry
+
+
+# 必须在 _clean_stale_outputs()（import 期，~668 行）之后：被 14 天保留期清掉的
+# 产物，载入时直接丢弃，不留死条目。
+_load_history()
 
 
 @api.get("/history")
@@ -1888,7 +2493,12 @@ def history_config(auto_clean: bool = Form(...)):
     _history_auto_clean = bool(auto_clean)
     with _HISTORY_LOCK:
         count = len(_history)
-    return JSONResponse({"auto_clean": _history_auto_clean, "count": count})
+        persisted = _persist_history_locked()
+    return JSONResponse({
+        "auto_clean": _history_auto_clean,
+        "count": count,
+        "persisted": persisted,     # 只读盘下前端据此回滚开关并提示
+    })
 
 
 @api.delete("/history")
@@ -1898,6 +2508,7 @@ def history_clear():
         removed = len(_history)
         victims = [e["file"] for e in _history]
         _history.clear()
+        _persist_history_locked()
     # 列表立刻清空（用户视角已生效），文件删除丢后台，删除慢了也不拖住这个请求
     if _history_auto_clean:
         _delete_audio_async(victims)
@@ -1916,6 +2527,7 @@ def history_remove(item_id: str):
         # 新列表，并发插入会落到被丢弃的旧列表上（条目和自动清理都丢）。
         if hit is not None:
             _history.remove(hit)
+            _persist_history_locked()
         count = len(_history)
     if hit is None:
         raise HTTPException(404, "History entry not found")
@@ -1983,11 +2595,15 @@ def presets_create(
         if not overwrite:
             raise HTTPException(409, f"预设「{name}」已存在")
         delete_preset(name)
+    raw_vec = [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
+    # NaN/inf 不能进预设 JSON（JSON 本身也不合法），且应用时会原样进模型
+    if not all(math.isfinite(float(v)) for v in raw_vec):
+        raise HTTPException(400, "情感向量含 NaN/inf，请检查输入")
     data = {
         "emo_control_method": int(emo_control_method),
         "emo_weight": _gen["emo_weight"],
-        "emo_vector": [float(v) for v in (vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8)],
-        "emo_text": emo_text or "",
+        "emo_vector": [float(v) for v in raw_vec],
+        "emo_text": (emo_text or "") if emo_control_method == 3 else "",
         "emo_random": bool(use_random),
         "advanced_params": {
             "do_sample": bool(do_sample),
@@ -1998,7 +2614,8 @@ def presets_create(
             "num_beams": _gen["num_beams"],
             "repetition_penalty": _gen["repetition_penalty"],
             "max_mel_tokens": _gen["max_mel_tokens"],
-            "max_text_tokens_per_segment": int(max_text_tokens_per_segment),
+            # 与 do_tts 同款校验：以前只 int() 不查范围，越界值照样入库
+            "max_text_tokens_per_segment": _clamp_seg_tokens(max_text_tokens_per_segment),
             "interval_silence": max(10, min(500, int(interval_silence))),
         },
     }
@@ -2007,25 +2624,26 @@ def presets_create(
     emo_tmp = None
     try:
         if prompt_audio is not None:
-            prompt_data = prompt_audio.file.read()
-            _validate_audio_upload(prompt_data, "预设音色音频")
+            prompt_data = _prepare_ref_audio(_read_upload_capped(prompt_audio, "预设音色音频"), "预设音色音频")
             prompt_tmp = os.path.join(PROMPTS_DIR, f"preset_prompt_{uuid.uuid4().hex}.wav")
             with open(prompt_tmp, "wb") as f:
                 f.write(prompt_data)
+            data["prompt_audio_name"] = os.path.basename(prompt_audio.filename or "")[:200]
         if emo_audio is not None:
-            emo_data = emo_audio.file.read()
-            _validate_audio_upload(emo_data, "预设情感音频")
+            emo_data = _prepare_ref_audio(_read_upload_capped(emo_audio, "预设情感音频"), "预设情感音频")
             emo_tmp = os.path.join(PROMPTS_DIR, f"preset_emo_{uuid.uuid4().hex}.wav")
             with open(emo_tmp, "wb") as f:
                 f.write(emo_data)
+            data["emo_audio_name"] = os.path.basename(emo_audio.filename or "")[:200]
         save_preset(name, data, prompt_audio=prompt_tmp, emo_audio=emo_tmp)
     except HTTPException:
-        # _validate_audio_upload 抛的 400/413 已经带着可读原因，必须原样上抛。
+        # _prepare_ref_audio 抛的 400/413 已经带着可读原因，必须原样上抛。
         # 落进下面的 except Exception 会被重包成 500，用户只看到
         # "Failed to save preset: 400: 预设音色音频不是可识别的音频文件"——
         # 一条既说 500 又夹着 400 的报错（/audio/tempo 早就是这么写的，这里漏了）。
         raise
     except Exception as e:
+        logger.exception("保存预设「%s」失败", name)
         raise HTTPException(500, f"Failed to save preset: {e}")
     finally:
         for p in (prompt_tmp, emo_tmp):
@@ -2039,7 +2657,11 @@ def presets_create(
 
 @api.get("/presets/{name}")
 def presets_detail(name: str, legacy: bool = False):
-    data = load_preset(name)
+    try:
+        data = load_preset(name)
+    except ValueError as e:
+        # 单个预设文件损坏不该让整个预设页 500，也不该把 traceback 甩给客户端
+        raise HTTPException(422, str(e))
     if data is None:
         raise HTTPException(404, "Preset not found")
     # 兼容老客户端：带 ?legacy=1 时退回不含 interval_silence 的旧结构。
@@ -2115,8 +2737,8 @@ def presets_duplicate(name: str, req: dict | None = Body(None)):
 
 # ---- UI 偏好：参数锁定 ---------------------------------------------------------
 # 存磁盘而不是浏览器 localStorage：用户清缓存后锁定的参数不该丢。
-# 文件放在项目根的 data/ 下，不放 outputs/ —— 那是生成产物目录，会被保留期清理。
-_UI_STATE_DIR = os.path.join(current_dir, "data")
+# 文件放在项目根的 data/ 下（DATA_DIR，见 OUTPUTS_DIR 附近的说明）。
+_UI_STATE_DIR = DATA_DIR
 _UI_STATE_PATH = os.path.join(_UI_STATE_DIR, "ui_state.json")
 _UI_STATE_LOCK = threading.Lock()
 # 锁定的参数白名单：与前端「高级参数」折叠里的 9 项一致。
@@ -2149,6 +2771,24 @@ def _write_ui_state(state: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, _UI_STATE_PATH)
+
+
+def _ui_state_write(key: str, value) -> None:
+    """在锁里写一个偏好键（value 为 None 表示删除该键）。
+
+    直接让 OSError 冒出去会变成 500 + 堆栈，用户看不出是磁盘写不了。
+    """
+    with _UI_STATE_LOCK:
+        state = _read_ui_state()
+        if value is None:
+            state.pop(key, None)
+        else:
+            state[key] = value
+        try:
+            _write_ui_state(state)
+        except OSError as e:
+            logger.exception("写入 ui_state.json 失败，本次修改未保存")
+            raise HTTPException(503, f"界面偏好写入失败（{e.strerror or e.__class__.__name__}），请稍后重试") from e
 
 
 @api.get("/prefs/param-lock")
@@ -2188,11 +2828,497 @@ def prefs_param_lock_put(req: dict = Body(...)):
             raise HTTPException(400, f"参数 {key} 不是有效数字")
         values[key] = str(val).strip()
     payload = {"locked": locked, "values": values, "updated_at": int(time.time())}
-    with _UI_STATE_LOCK:
-        state = _read_ui_state()
-        state["paramLock"] = payload
-        _write_ui_state(state)
+    _ui_state_write("paramLock", payload)
     return JSONResponse(payload)
+
+
+# ---- UI 偏好：音频保存目录 ----------------------------------------------------
+# 目录存在服务端 data/ui_state.json 而不是浏览器：换浏览器、清缓存、换端口都不丢。
+# 落盘由服务端完成（复制/接收上传），所以任何浏览器都能用；代价是从别的设备访问时，
+# 文件会写到运行服务的这台电脑上，而不是当前设备的磁盘。
+_SAVE_DIR_KEY = "saveDir"
+_PICK_LOCK = threading.Lock()
+_LOCAL_CLIENTS = ("127.0.0.1", "::1", "localhost")
+
+
+def _is_local_client(request: Request) -> bool:
+    return bool(request.client) and request.client.host in _LOCAL_CLIENTS
+
+
+def _save_dir_get() -> str:
+    with _UI_STATE_LOCK:
+        d = _read_ui_state().get(_SAVE_DIR_KEY)
+    return d if isinstance(d, str) else ""
+
+
+# ---- 目录写探针（BUG-001 的护栏）------------------------------------------------
+# 探针必须真写一个文件：Windows 上 os.access(W_OK) 对只读目录也会返回 True。
+# 但受保护的目录（如 C:\Windows\System32）上创建文件可能长时间不返回——权限重定向
+# 或安全软件拦在那里。这些端点是同步 def，跑在 anyio 的默认线程池（40 个线程）里，
+# 挂住的线程不会释放；实测 45 次请求后线程池耗尽，连 /health、/status 都排队超时。
+# 所以三层护栏：探针跑在自己的一次性 daemon 线程里、单次限时 2s、结果按目录缓存 15s。
+#   - 超时：判"不可写"并返回，调用方最多等 2s，永远不会把请求吊死；
+#   - 卡死的探针线程是 daemon、不占共享池，池不存在"耗尽"这回事
+#     （旧的 2-worker 私有池会：cancel() 对已执行的 future 无效，两次挂死后
+#     后续每次 probe 都要在串行锁下等满 2s）；
+#   - 缓存让同一目录的并发/连续请求只探一次，重复点击不再叠加开销。
+_PROBE_TIMEOUT_S = 2.0
+_PROBE_CACHE_TTL_S = 15.0
+_PROBE_SERIAL_LOCK = threading.Lock()
+_PROBE_CACHE_LOCK = threading.Lock()
+# path -> (是目录, 可写, 原因, 采样时刻)
+_PROBE_CACHE: dict[str, tuple[bool, bool, str, float]] = {}
+
+
+def _write_probe(path: str) -> tuple[bool, str]:
+    """真的建一个临时文件再删掉。返回 (是否可写, 不可写的原因)。"""
+    probe = os.path.join(path, f".indextts-probe-{os.getpid()}-{threading.get_ident()}.tmp")
+    fd = -1
+    created = False
+    try:
+        fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        created = True
+        os.write(fd, b"")
+        return True, ""
+    except FileNotFoundError:
+        return False, "目录已不存在"
+    except PermissionError:
+        return False, "没有写入权限"
+    except OSError as e:
+        return False, f"无法创建文件（{e.strerror or e.__class__.__name__}）"
+    finally:
+        # 探针文件用完就删，绝不在用户目录里留垃圾；删不掉也不影响判定结果。
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if created:
+            try:
+                os.remove(probe)
+            except OSError as e:
+                logger.warning("探针临时文件未能删除：%s -> %s", probe, e)
+
+
+def _dir_probe(path: str) -> tuple[bool, bool, str]:
+    """在线程里一次问齐：是不是目录 / 可写 / 原因。
+
+    `os.path.isdir` 和 `os.path.exists` 也不是免费的——指向断掉的网卡路径
+    （\\\\10.255.255.1\\share）时实测阻塞 26.7 秒才返回。所以存在性检查和写
+    探针必须待在同一个限时线程里，只把写探针挪进池子等于没修完。
+    """
+    if not os.path.isdir(path):
+        if os.path.exists(path):
+            return False, False, "这是一个文件，不是目录"
+        return False, False, "目录不存在"
+    writable, reason = _write_probe(path)
+    return True, writable, reason
+
+
+def _probe_cached(path: str) -> tuple[bool, bool, str] | None:
+    with _PROBE_CACHE_LOCK:
+        hit = _PROBE_CACHE.get(path)
+        if hit and time.monotonic() - hit[3] < _PROBE_CACHE_TTL_S:
+            return hit[0], hit[1], hit[2]
+    return None
+
+
+def _probe_dir(path: str, use_cache: bool = True) -> tuple[bool, bool, str]:
+    """带超时与缓存的目录探针，返回 (是目录, 可写, 原因)。
+
+    并发时全局串行，后来的请求先命中缓存；超时按「不可用」返回。
+    探针放在一次性 daemon 线程里：卡死的线程不会拖住共享的 anyio 线程池，
+    也不存在固定小池被永久占满后「后续每次保存都慢 2s」的问题。
+
+    use_cache=False 给真正要写文件的路径用：缓存最长 15 秒，目录在这期间被删掉
+    时不能再拿旧判定说它「可用」，否则错误会推迟到写盘那一刻才以另一种面目出现。
+    不走缓存也不等于回到裸调用——探测照样丢进限时线程，卡死的目录不会把请求拖住。
+    """
+    if use_cache:
+        cached = _probe_cached(path)
+        if cached is not None:
+            return cached
+    with _PROBE_SERIAL_LOCK:
+        if use_cache:
+            cached = _probe_cached(path)          # 双检：等锁期间别人可能已经探完
+            if cached is not None:
+                return cached
+        res_q: queue.Queue = queue.Queue(maxsize=1)
+        threading.Thread(
+            target=lambda: res_q.put(_dir_probe(path)),
+            name="savedir-probe",
+            daemon=True,
+        ).start()
+        try:
+            is_dir, writable, reason = res_q.get(timeout=_PROBE_TIMEOUT_S)
+        except queue.Empty:
+            is_dir, writable = False, False
+            reason = f"目录检查超过 {_PROBE_TIMEOUT_S:g}s 未返回，按不可用处理"
+            logger.warning("保存目录探针超时：%s", path)
+        except Exception as e:                # 探针自身的意外不能让端点 500
+            is_dir, writable = False, False
+            reason = f"目录检查异常（{e.__class__.__name__}）"
+            logger.warning("保存目录探针异常：%s -> %s", path, e)
+        if use_cache:
+            with _PROBE_CACHE_LOCK:
+                _PROBE_CACHE[path] = (is_dir, writable, reason, time.monotonic())
+        return is_dir, writable, reason
+
+
+def _save_dir_info(path: str, use_cache: bool = True) -> dict:
+    """目录状态。不可用时给出具体原因（BUG-005），路径只在日志里出现。"""
+    if not path:
+        return {"dir": "", "exists": False, "writable": False}
+    exists, writable, reason = _probe_dir(path, use_cache=use_cache)
+    info = {"dir": path, "exists": exists, "writable": writable}
+    if reason:
+        info["reason"] = reason
+    return info
+
+
+_INVALID_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED_WIN_STEMS = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10)),
+}
+
+# 文件名长度预算。Windows 单个名字上限 255，但真正会撞的是整条路径的 MAX_PATH(260)；
+# 未限长时 300 字的名字直接让 open 抛 [Errno 22]，接口回 500 并把服务端绝对路径
+# 原样吐给前端（BUG-002）。这里提前把名字截短，让超长变成一个可读的 400 之外的事——
+# 根本不报错，只是自动截。
+_NAME_UNITS_MAX = 100      # 单个文件名（含 .wav）允许的 UTF-16 单元数
+_SUFFIX_RESERVE = 12       # 给 ".wav" 和可能追加的 " (9999)" 留出来的余量
+_PATH_UNITS_MAX = 250      # 整条路径（目录 + 文件名）预算，MAX_PATH 260 留 10 单元
+
+
+def _win_units(text: str) -> int:
+    """Windows 认为这个字符串有多长：UTF-16 单元数（补充平面字符算 2 个）。"""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _stem_budget(folder: str) -> int:
+    """stem 还能用多少单元：既看名字上限，也看目录本身占了多长的路。"""
+    budget = _NAME_UNITS_MAX - _SUFFIX_RESERVE
+    if folder:
+        left = _PATH_UNITS_MAX - _win_units(os.path.abspath(folder)) - 1 - _SUFFIX_RESERVE
+        budget = min(budget, left)
+    return max(8, budget)
+
+
+def _truncate_to_units(text: str, units: int) -> str:
+    out = []
+    used = 0
+    for ch in text:
+        w = _win_units(ch)
+        if used + w > units:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out)
+
+
+# 保存目录只接受这两种扩展名，且必须与内容嗅探结果一致（见 save_dir_upload）
+_SAVE_AUDIO_EXTS = (".wav", ".mp3")
+
+
+def _safe_audio_name(
+    name: str, fallback: str = "audio.wav", folder: str = "", allowed_exts: tuple[str, ...] = (".wav",)
+) -> str:
+    """收敛成"目录名 + 一个文件名"：去路径、去非法字符、补扩展名、按预算截断。
+
+    allowed_exts 默认只有 .wav，旧的复制/保存路径行为逐字节不变；
+    只有 save_dir_upload（浏览器算出的 WAV/MP3）会传 (".wav", ".mp3")。
+    """
+    base = os.path.basename((name or "").strip().replace("\\", "/"))
+    base = _INVALID_NAME_CHARS.sub("_", base).strip(" .")
+    if not base:
+        base = fallback
+    stem, ext = os.path.splitext(base)
+    if ext.lower() not in allowed_exts:
+        # 不认识的后缀当成名字的一部分：a.foo → a.foo.wav，不吞掉用户的名字
+        stem = base
+        ext = allowed_exts[0]
+    stem = stem.strip(" .")
+    if not stem:
+        stem = "audio"
+    if stem.upper() in _RESERVED_WIN_STEMS:
+        stem = "_" + stem
+    stem = _truncate_to_units(stem, _stem_budget(folder)).rstrip(" .")
+    if not stem:
+        stem = "audio"
+    return stem + ext.lower()
+
+
+def _claim_unique_dest(folder: str, name: str) -> tuple[int, str]:
+    """原子占名：用 O_CREAT|O_EXCL 抢一个还没被占用的文件名，返回 (已打开的 fd, 路径)。
+
+    旧写法是 os.path.exists 判空后再 open(dest, "wb")——两个请求同时判"不 exists"，
+    就会同时打开同一个路径，后写入的那份把前一份静默覆盖掉，而两次请求都回 200、
+    界面弹两次"已保存"，用户以为存了两份（BUG-007，实测 20 并发只剩 18 个文件）。
+    占名与创建合并成一次系统调用后，抢不到就往后换名，同名文件不可能互相覆盖。
+    调用方负责写完 close（异常路径里会顺手删掉半成品）。
+    """
+    stem, ext = os.path.splitext(name)
+    last_err: OSError | None = None
+    for n in range(0, 10000):
+        cand_name = f"{stem}{ext}" if n == 0 else f"{stem} ({n}){ext}"
+        cand = os.path.join(folder, cand_name)
+        try:
+            return os.open(cand, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666), cand
+        except FileExistsError:
+            continue                      # 名字被占，试下一个
+        except OSError as e:
+            # 目录整个没了/没权限：换名字也不会成功，立刻停下报可读错误
+            last_err = e
+            break
+    if last_err is not None:
+        raise _save_oserror(last_err, os.path.join(folder, name)) from last_err
+    raise HTTPException(409, "目标目录里同名文件过多（已超过 9999 个），无法生成新文件名")
+
+
+def _save_oserror(e: OSError, dest: str = "") -> HTTPException:
+    """把落盘的 OSError 翻译成可读、且不泄露服务端绝对路径的 HTTP 错误。
+
+    路径只写进日志（运维要看），不给前端（用户看了没用，还多露一层内部结构）。
+    """
+    logger.warning("保存到目录失败：%s -> %r", dest or "(未确定)", e)
+    err = getattr(e, "errno", None)
+    if isinstance(e, FileNotFoundError) or err == errno.ENOENT:
+        return HTTPException(409, "已设置的保存目录不存在，请重新选择目录")
+    if isinstance(e, NotADirectoryError) or err == errno.ENOTDIR:
+        return HTTPException(409, "已设置的保存路径不是目录，请重新选择")
+    if isinstance(e, PermissionError) or err in (errno.EACCES, errno.EPERM):
+        return HTTPException(403, "保存目录不可写，请换一个目录")
+    if err == errno.ENAMETOOLONG:
+        return HTTPException(400, "文件名过长，请缩短后再保存")
+    if err == errno.ENOSPC:
+        return HTTPException(507, "磁盘空间不足，无法写入保存目录")
+    return HTTPException(500, f"保存失败：{e.strerror or e.__class__.__name__}")
+
+
+def _discard_partial(dest: str) -> None:
+    """写入失败时清掉占名产生的半成品，别在用户目录里留 0 字节的坏文件。"""
+    try:
+        os.remove(dest)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning("清理未写完的保存文件失败：%s -> %s", dest, e)
+
+
+@contextlib.contextmanager
+def _save_writer(folder: str, name: str, allowed_exts: tuple[str, ...] = (".wav",)):
+    """占一个不覆盖别人的文件名，并打开写入流。yield (dest, fh)。
+
+    失败路径一律：关流 → 删半成品 → 翻译成可读 HTTP 错误。成功路径只 flush，
+    不做 fsync——保存端点是同步 handler，任何无上限的阻塞都会吃线程（BUG-001）。
+    """
+    fd, dest = _claim_unique_dest(
+        folder, _safe_audio_name(name, folder=folder, allowed_exts=allowed_exts)
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            yield dest, fh
+    except HTTPException:
+        _discard_partial(dest)
+        raise
+    except OSError as e:
+        _discard_partial(dest)
+        raise _save_oserror(e, dest) from e
+    except Exception as e:
+        _discard_partial(dest)
+        logger.exception("写入保存目录失败：%s", dest)
+        raise HTTPException(500, f"保存失败：{e.__class__.__name__}") from e
+
+
+@api.get("/prefs/save-dir")
+def prefs_save_dir_get(request: Request = None):
+    info = _save_dir_info(_save_dir_get())
+    # 直接调用（测试）时没有 request：按本机处理，与真实本机请求同口径
+    if info.get("dir") and request is not None and not _is_local_client(request):
+        # 局域网客户端只需要知道「设过、能不能写」，不必看到这台电脑的绝对路径
+        info.pop("reason", None)   # reason 里可能夹着完整路径
+        info["dir"] = "（运行服务的这台电脑上的目录）"
+        info["masked"] = True
+    return JSONResponse(info)
+
+
+@api.put("/prefs/save-dir")
+def prefs_save_dir_put(request: Request, req: dict = Body(...)):
+    if not _is_local_client(request):
+        raise HTTPException(403, "只有运行服务的这台电脑可以修改保存目录")
+    if "dir" not in req or not isinstance(req["dir"], str):
+        raise HTTPException(400, "dir 必须是字符串（传空字符串表示清除）")
+    raw = req["dir"].strip().strip('"')
+    if not raw:
+        _ui_state_write(_SAVE_DIR_KEY, None)
+        logger.info("保存目录已清除")
+        return JSONResponse({"ok": True, **_save_dir_info("")})
+    # 相对路径按服务进程的工作目录解析——用户手输时很可能不是这个意思，
+    # 所以把解析后的绝对路径与 relative 标记一起回给前端显示（BUG-005）。
+    expanded = os.path.expanduser(raw)
+    relative = not os.path.isabs(expanded)
+    path = os.path.abspath(expanded)
+    info = _save_dir_info(path)
+    if not info["exists"]:
+        # reason 已经区分"这是一个文件，不是目录"和"目录不存在"
+        logger.warning("设置保存目录被拒（%s）：%s", info.get("reason", "目录不可用"), path)
+        raise HTTPException(400, f"{info.get('reason') or '目录不存在'}：{path}")
+    if not info["writable"]:
+        logger.warning("设置保存目录被拒（不可写：%s）：%s", info.get("reason", ""), path)
+        raise HTTPException(400, f"目录不可写（{info.get('reason') or '没有写入权限'}）：{path}")
+    _ui_state_write(_SAVE_DIR_KEY, path)
+    logger.info("保存目录已设置：%s%s", path, "（由相对路径解析）" if relative else "")
+    return JSONResponse({"ok": True, "relative": relative, **info})
+
+
+@api.post("/prefs/save-dir/pick")
+def prefs_save_dir_pick(request: Request):
+    """弹系统文件夹选择框。只能在本机弹——框出现在服务端这台电脑的桌面上。"""
+    if not _is_local_client(request):
+        raise HTTPException(403, "只有运行服务的这台电脑可以弹出文件夹选择框")
+    if not _PICK_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "文件夹选择框已经打开，请先完成或取消它")
+    try:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except Exception as e:
+            raise HTTPException(501, f"当前环境无法弹出文件夹选择框（{e}），请手动输入路径")
+        root = None
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = filedialog.askdirectory(title="选择音频保存目录", mustexist=True)
+        except Exception as e:
+            raise HTTPException(501, f"文件夹选择框打开失败（{e}），请手动输入路径")
+        finally:
+            if root is not None:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+    finally:
+        _PICK_LOCK.release()
+    if not path:
+        return JSONResponse({"cancelled": True})
+    return JSONResponse({"cancelled": False, "dir": os.path.abspath(path)})
+
+
+@api.post("/prefs/save-dir/open")
+def prefs_save_dir_open(request: Request):
+    if not _is_local_client(request):
+        raise HTTPException(403, "只有运行服务的这台电脑可以打开文件夹")
+    folder = _save_dir_get()
+    if not folder:
+        raise HTTPException(409, "还没有设置保存目录")
+    info = _save_dir_info(folder)
+    if not info["exists"]:
+        raise HTTPException(409, f"已设置的保存目录不可用（{info.get('reason') or '目录不存在'}），请重新选择")
+    if not hasattr(os, "startfile"):
+        raise HTTPException(501, "当前系统不支持打开文件夹")
+    try:
+        os.startfile(folder)
+    except OSError as e:
+        logger.warning("打开保存目录失败：%s -> %s", folder, e)
+        raise HTTPException(500, f"打开文件夹失败：{e.strerror or e.__class__.__name__}") from e
+    return {"ok": True, "dir": folder}
+
+
+def _save_target_dir() -> str:
+    """取当前可用的保存目录。失效原因分三种报，不再共用一句"尚未设置"（BUG-005）。"""
+    folder = _save_dir_get()
+    if not folder:
+        raise HTTPException(409, "还没有设置保存目录，请先在偏好里选择目录")
+    # 真要落盘的场合不吃 15 秒缓存：目录刚被删掉/改名的瞬间不能还说它「可用」
+    info = _save_dir_info(folder, use_cache=False)
+    if not info["exists"]:
+        raise HTTPException(409, f"已设置的保存目录不可用（{info.get('reason') or '目录不存在'}），请重新选择")
+    if not info["writable"]:
+        raise HTTPException(409, f"保存目录不可写（{info.get('reason') or '没有写入权限'}），请换一个目录")
+    return folder
+
+
+@api.post("/save-dir/outputs/{name}")
+def save_dir_copy_output(name: str):
+    """把 outputs/ 里的生成音频复制到保存目录（字节与「下载」完全一致）。"""
+    folder = _save_target_dir()
+    src = os.path.join(OUTPUTS_DIR, os.path.basename(name))
+    if not os.path.isfile(src):
+        raise HTTPException(404, "音频文件不存在或已被清理")
+    with _save_writer(folder, name) as (dest, out):
+        try:
+            with open(src, "rb") as inp:
+                shutil.copyfileobj(inp, out)
+        except FileNotFoundError as e:
+            logger.warning("源音频在复制期间消失：%s -> %s", src, e)
+            raise HTTPException(404, "音频文件不存在或已被清理") from e
+        except OSError as e:
+            raise _save_oserror(e, dest) from e
+        # 保留源文件的修改时间与属性，行为与旧的 shutil.copy2 一致
+        try:
+            shutil.copystat(src, dest)
+        except OSError as e:
+            logger.warning("复制音频属性失败（音频本身已存好）：%s -> %s", dest, e)
+        written = out.tell()
+    logger.info("已复制到保存目录：%s（源 %s，%d 字节）", dest, src, written)
+    return {"ok": True, "path": dest, "dir": folder}
+
+
+@api.post("/save-dir/upload")
+def save_dir_upload(name: str = Form(""), file: UploadFile = File(...)):
+    """接收浏览器算出的剪辑结果并落盘（剪辑 WAV 只存在于前端）。
+
+    这是唯一由客户端直接投喂内容到保存目录的入口，必须和 /tts 的上传口
+    同样严格：魔数嗅探 + 32MB 上限 + 边读边写（内存恒定 ≤1MB）。文件名有
+    _safe_audio_name 保护，内容以前是裸奔的——任意内容任意体积都能写进去。
+    """
+    folder = _save_target_dir()
+    try:
+        head = file.file.read(64)
+        # 只放行 WAV / MP3（前端能算出来的两种），并区分具体格式：
+        # 只看 bool 会把"wav 改名成 .mp3"当合法上传存下去，后缀与内容对不上。
+        content_ext = _audio_ext_from_magic(head)
+        if content_ext not in _SAVE_AUDIO_EXTS:
+            raise HTTPException(400, "上传内容不是 WAV / MP3 音频（这个入口只接收浏览器生成的音频）")
+        raw_name = (name or file.filename or "audio").strip()
+        base = os.path.basename(raw_name.replace("\\", "/"))
+        given_ext = os.path.splitext(base)[1].lower()
+        if given_ext in _SAVE_AUDIO_EXTS and given_ext != content_ext:
+            raise HTTPException(
+                400, f"文件扩展名与内容不符（实际内容是 {content_ext}，文件名却是 {given_ext}）"
+            )
+        if given_ext not in _SAVE_AUDIO_EXTS:
+            base = base + content_ext        # 没有扩展名：按嗅探结果补全
+        # 不是死代码：文件全长 ≤64 字节时全落在 head 里，下面的分块循环拿到空
+        # chunk 直接 break，超限只能在这里拦（上限被调小的测试路径依赖此检查）。
+        if len(head) > AUDIO_MAX_BYTES:
+            raise HTTPException(413, f"音频过大（上限 {AUDIO_MAX_BYTES // 1048576} MB）")
+        with _save_writer(folder, base, allowed_exts=_SAVE_AUDIO_EXTS) as (dest, out):
+            try:
+                out.write(head)
+                written = len(head)
+                while True:
+                    chunk = file.file.read(1 << 20)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > AUDIO_MAX_BYTES:
+                        raise HTTPException(
+                            413, f"音频过大（上限 {AUDIO_MAX_BYTES // 1048576} MB）"
+                        )
+                    out.write(chunk)
+            except OSError as e:
+                raise _save_oserror(e, dest) from e
+    finally:
+        try:
+            file.file.close()
+        except Exception:
+            pass
+    logger.info("已保存上传音频：%s（%d 字节）", dest, written)
+    return {"ok": True, "path": dest, "dir": folder}
+
 
 
 def _load_examples(include_experimental=False):
@@ -2224,7 +3350,7 @@ def examples_list(include_experimental: bool = False):
     return JSONResponse({"examples": _load_examples(include_experimental=include_experimental)})
 
 
-_EXAMPLE_AUDIO_EXT = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
+_EXAMPLE_AUDIO_EXT = SUPPORTED_AUDIO_EXTS
 
 
 @api.get("/examples/{name}")
@@ -2243,10 +3369,24 @@ def examples_file(name: str):
 
 
 @api.post("/segments")
-def segments_preview(text: str = Form(""), max_text_tokens_per_segment: int = Form(120)):
-    text = text.strip()
+def segments_preview(request: Request, text: str = Form(""), max_text_tokens_per_segment: int = Form(120)):
+    # 这个接口只吃表单。以前 JSON body 也回 200：text 取到默认值 ""，于是返回
+    # {"segments": []}——看起来像"这段文本被切出了 0 段"，而且顺手绕过了下面的
+    # 413 超长护栏（BUG-011）。非表单的 Content-Type 现在直接 415 说清楚。
+    ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    _FORM_TYPES = ("application/x-www-form-urlencoded", "multipart/form-data")
+    if ctype and ctype not in _FORM_TYPES:
+        raise HTTPException(
+            415,
+            "/segments 只接受表单参数（Content-Type: "
+            + " 或 ".join(_FORM_TYPES)
+            + f"），当前是 {ctype}",
+        )
+    text = (text or "").strip()
     if not text:
-        return JSONResponse({"segments": []})
+        if ctype:
+            return JSONResponse({"segments": []})
+        raise HTTPException(422, "缺少 text 表单字段：分段预览需要待切分的文本")
     if len(text) > TEXT_CHARS_HARD:
         raise HTTPException(
             413,
@@ -2326,12 +3466,22 @@ def glossary_add(
     if not reading_zh and not reading_en:
         raise HTTPException(400, "请至少输入一种读法")
 
-    if reading_zh and reading_en:
-        reading = {"zh": reading_zh, "en": reading_en}
-    elif reading_zh:
-        reading = {"zh": reading_zh}
+    # 同一术语再次提交时按列合并：只填了中文列就只改中文读法，英文列沿用原值。
+    # 以前这里整体覆盖，未提交的那一列被静默清空（BUG-004）——条目还在，读法少了一半，
+    # 界面上看不出发生过任何事。
+    existing = tts.normalizer.term_glossary.get(term)
+    if isinstance(existing, dict):
+        reading = {k: existing[k].strip() for k in ("zh", "en")
+                   if isinstance(existing.get(k), str) and existing[k].strip()}
+    elif isinstance(existing, str) and existing.strip():
+        # 老格式/手写 YAML：一个字符串表示中英文读法相同
+        reading = {"zh": existing.strip(), "en": existing.strip()}
     else:
-        reading = {"en": reading_en}
+        reading = {}
+    if reading_zh:
+        reading["zh"] = reading_zh
+    if reading_en:
+        reading["en"] = reading_en
 
     # 复制写入：不要原地往 term_glossary 上加 key（见 _glossary_replace）
     new_glossary = dict(tts.normalizer.term_glossary)
@@ -2339,6 +3489,7 @@ def glossary_add(
     _glossary_replace(new_glossary)
     saved = _save_glossary()
     _set_cascade(cascade, saved)
+    logger.info("术语已更新：%s -> %s（原值 %r）", term, reading, existing)
     return JSONResponse(_glossary_payload())
 
 
@@ -2370,7 +3521,7 @@ def _set_cascade(cascade, saved: bool = True):
         tts.normalizer.save_glossary_settings(tts.glossary_settings_path)
     except Exception as e:
         # 内存里已经改了但没落盘：提示用户「重启后会失效」，别默默丢掉
-        logger.warning("Failed to save glossary settings: %s", e)
+        logger.warning("Failed to save glossary settings: %s", e, exc_info=True)
         raise HTTPException(500, f"级联开关已生效但保存失败，重启后会恢复默认: {e}")
     logger.info("Glossary cascade replacement: %s", tts.normalizer.cascade_glossary)
 
@@ -2410,6 +3561,56 @@ def glossary_remove(term: str):
     _glossary_replace(new_glossary)
     _save_glossary()
     return JSONResponse(_glossary_payload())
+
+
+# ---- 使用指南：web/guide/guide.md 在服务端渲染成 HTML -------------------------
+# 解析放服务端：前端零依赖 / 零构建；图片走 /assets/guide/ 静态路由。
+_GUIDE_MD = os.path.join(_WEB_DIR, "guide", "guide.md")
+_GUIDE_CACHE: dict = {}
+
+try:
+    import markdown as _markdown
+except Exception:  # 只在漏装 server extra 的环境里触发，不能因此让服务起不来
+    _markdown = None
+
+
+def _guide_slugify(value, separator):
+    # 默认 slugify 会把中文整段抹掉（只剩 "0"、"1"），目录跳转就失去意义。
+    value = re.sub(r"[^\w]+", separator, value.strip().lower(), flags=re.UNICODE)
+    return value.strip(separator) or "section"
+
+
+# 只给应用内指南页用，不属于对外 TTS 接口：不进 openapi，
+# 免得 agent skill 的接口对账把它算成「服务端有、skill 没适配」。
+@api.get("/guide", include_in_schema=False)
+def guide_content():
+    if _markdown is None:
+        raise HTTPException(503, "服务端缺少 markdown 组件，请执行 uv sync --extra server")
+    try:
+        st = os.stat(_GUIDE_MD)
+    except OSError:
+        raise HTTPException(404, "使用指南未安装（web/guide/guide.md 不存在）")
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _GUIDE_CACHE.get("payload")
+    if cached and cached[0] == key:
+        return cached[1]
+    with open(_GUIDE_MD, "r", encoding="utf-8") as f:
+        text = f.read()
+    md = _markdown.Markdown(
+        extensions=["tables", "fenced_code", "toc", "sane_lists"],
+        extension_configs={"toc": {"toc_depth": "2-3", "slugify": _guide_slugify}},
+    )
+    html = md.convert(text)
+    # 图片相对路径 → 静态路由；带内容指纹，指南更新后不会命中旧图缓存
+    ver = hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
+    html = html.replace('src="images/', 'src="/assets/guide/images/')
+    html = re.sub(r'src="(/assets/guide/images/[^"]+)"',
+                  lambda m: f'src="{m.group(1)}?v={ver}"', html)
+    html = re.sub(r'<a href="(https?://[^"]+)"',
+                  r'<a href="\1" target="_blank" rel="noopener noreferrer"', html)
+    payload = {"html": html, "toc": md.toc_tokens, "version": ver}
+    _GUIDE_CACHE["payload"] = (key, payload)
+    return payload
 
 
 # ---- API 挂载 -----------------------------------------------------------------
@@ -2455,9 +3656,7 @@ _register_legacy_redirects()
 
 if __name__ == "__main__":
     import uvicorn
-    removed = _clean_stale_outputs()
-    if removed:
-        logger.info("Cleaned %d output file(s) older than %d days.", removed, OUTPUTS_RETENTION_DAYS)
+    # 孤儿清理已在 import 期执行（见 _clean_stale_outputs 之后的调用）
     logger.info("IndexTTS2 server starting... port %d", cmd_args.port)
     # 后台加载 numpy + audiotsm：变速引擎的 import 成本提前付掉，顺便让「包内
     # 缺少 audiotsm」在启动日志里就报出来，而不是等用户拖滑块时卡在「变速计算中…」。
