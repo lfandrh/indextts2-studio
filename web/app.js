@@ -382,7 +382,7 @@ async function restoreJob() {
               // 恢复路径与 SSE 路径对齐:先释放按钮/计时器/波形动画,再展示结果
               stopUi();
               await restoreCandidates(s.result);
-              await loadResult(s.result.wav, s.result.elapsed, s.result.file, { melCapped: s.result.mel_capped, normalizeFallback: s.result.normalize_fallback });
+              await loadResult(s.result.wav, s.result.elapsed, s.result.file, { melCapped: s.result.mel_capped, normalizeFallback: s.result.normalize_fallback, subtitle: s.result.subtitle });
               await refreshHistory();
             } else if (s.state === "stopped") {
               // 已经跑起来、中途被用户停掉的：中性提示
@@ -410,7 +410,7 @@ async function restoreJob() {
       // 与 SSE done 路径一致:先释放按钮/计时器,再展示已恢复的结果
       stopUi();
       await restoreCandidates(job.result);
-      await loadResult(job.result.wav, job.result.elapsed, job.result.file, { melCapped: job.result.mel_capped, normalizeFallback: job.result.normalize_fallback });
+      await loadResult(job.result.wav, job.result.elapsed, job.result.file, { melCapped: job.result.mel_capped, normalizeFallback: job.result.normalize_fallback, subtitle: job.result.subtitle });
       await refreshHistory();
     } else if (job.state === "error") {
       showError(job.error || "生成失败");
@@ -2457,6 +2457,9 @@ async function adoptCandidate(index, opts = {}) {
   const loaded = await loadResult(item.url, item.elapsed, item.file, {
     melCapped: item.melCapped,
     normalizeFallback: item.normalizeFallback,
+    // 本轮新生成的候选带 done 标记；历史重建的候选没有，留 undefined 让
+    // refreshSubRow 走一次探测，别把「未知」当成「没有字幕」。
+    subtitle: item.subtitle,
   });
   if (!loaded) {
     // 文件被 20 条上限/14 天清理掉：只标这一张卡，其它候选照常可用
@@ -2723,6 +2726,7 @@ async function runOneGeneration(fd, index, total) {
             historyId: ev.history_id || "",
             melCapped: !!ev.mel_capped,
             normalizeFallback: ev.normalize_fallback || null,
+            subtitle: !!ev.subtitle,
           };
         } else if (ev.type === "error") {
           sawTerminal = true;
@@ -2936,13 +2940,14 @@ function hideNormFallbackNote() { const el = $("normCapNote"); if (el) el.hidden
 })();
 
 async function loadResult(url, elapsed, serverFile, opts) {
-  const { melCapped = false, normalizeFallback = null } = opts || {};
+  const { melCapped = false, normalizeFallback = null, subtitle } = opts || {};
   $("melCapNote").hidden = !melCapped;
   if (normalizeFallback) showNormFallbackNote(normalizeFallback);
   else hideNormFallbackNote();
   curUrl = url;
   // 下载名与服务端 outputs/ 里的实际文件一致；文本改动不再影响已生成的结果名
   curServerFile = serverFile || (url || "").split("/").pop() || "";
+  subReset();   // 上一次的字幕行/面板先收掉，等这份音频的缓存查证完再决定出现与否
   loadingBox.hidden = true;
   setResultVisible(true);
   clearActionError();
@@ -2978,6 +2983,7 @@ async function loadResult(url, elapsed, serverFile, opts) {
     + ` / ${(trim.buffer.sampleRate / 1000).toFixed(1)}kHz`;
   syncAxis();
   updateDlName();
+  await refreshSubRow(subtitle);
   drawTrimWave();
   return true;
 }
@@ -3396,6 +3402,190 @@ $("fmtSeg").addEventListener("keydown", (e) => {
   if (cur) cur.focus();
 });
 syncFmtSeg();
+
+/* ---------------- 字幕（段级） ----------------
+   数据来自服务端在生成收尾时存下的段边界缓存（data/subtitles/<同名>.json）。
+   时间是每段波形 + 段间静音的物理累加，不是按字数估的；粒度是「一段一条」，段内不切句。
+   整行只在确认有缓存时才出现——不留一个点了才报 404 的按钮。 */
+let subFormat = "srt";
+let subCues = [];          // 当前音频的字幕条目
+let subTick = null;        // player 上的 timeupdate：换音频必须摘掉，否则高亮跳到别处
+const subHas = new Map();  // 文件名 -> 有没有缓存：历史列表来回点时不重复请求
+
+const SUB_TEXT_SOURCE = {
+  anchor: "用户原文",
+  proportional: "用户原文（段边界按长度估算）",
+  readable: "模型词元还原",
+};
+
+function subFile() {
+  return curServerFile || (curUrl || "").split("/").pop() || "";
+}
+
+// 右侧显示「导出后叫什么」，与源音频行同一套布局。名字跟着格式开关走，
+// 免得切到 VTT 后显示的还是 .srt。
+function syncSubName() {
+  $("subName").textContent = swapExt($("dlSrcName").textContent || srcFileName(), "." + subFormat);
+}
+
+function setSubPanel(open) {
+  $("subPanel").hidden = !open;
+  $("subToggle").setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+function subShowNote(msg) {
+  const el = $("subNote");
+  el.textContent = msg || "";
+  el.hidden = !msg;
+}
+
+// 与 selStopTick 同一套收尾：监听器挂在 <audio> 上，换音频/清空时必须显式移除
+function subDetach() {
+  if (subTick) { player.removeEventListener("timeupdate", subTick); subTick = null; }
+}
+
+function subReset() {
+  subCues = [];
+  $("subRow").hidden = true;
+  subShowNote("");
+  setSubPanel(false);
+  $("subList").textContent = "";
+  subDetach();
+}
+
+/** 查这份音频有没有字幕缓存。known 传 done 事件的权威值，可以省掉这一次请求。 */
+async function refreshSubRow(known) {
+  const file = subFile();
+  subReset();
+  if (!file || file === "audio") return;
+  let has = known;
+  if (has === undefined) has = subHas.get(file);
+  if (has === undefined) {
+    try {
+      await apiFetch(`/subtitle?file=${encodeURIComponent(file)}`);
+      has = true;
+    } catch (e) {
+      // 404 = 旧音频没有缓存（字幕功能上线前生成的）；其它错误也只是「不可用」。
+      // 都不该打断音频本身，所以静默收下，整行不出现。
+      has = false;
+    }
+  }
+  subHas.set(file, has);
+  $("subRow").hidden = !has;
+  if (has) syncSubName();
+}
+
+async function loadSubCues() {
+  const file = subFile();
+  if (!file) return false;
+  try {
+    const r = await apiFetch(`/subtitle?file=${encodeURIComponent(file)}`);
+    const d = await r.json();
+    subCues = d.cues || [];
+    $("subGrain").textContent = `${subCues.length} 条 · 段级（每段一条） · 文本：`
+      + (SUB_TEXT_SOURCE[d.text_source] || "用户原文");
+    subShowNote("");
+    renderSubList();
+    return true;
+  } catch (e) {
+    subShowNote(`字幕读取失败：${e.message || e}`);
+    return false;
+  }
+}
+
+function renderSubList() {
+  const box = $("subList");
+  box.textContent = "";
+  if (!subCues.length) {
+    const li = document.createElement("li");
+    li.className = "sub-item";
+    li.textContent = "这份音频没有可显示的字幕条目";
+    box.appendChild(li);
+    return;
+  }
+  subCues.forEach((cue) => {
+    const li = document.createElement("li");
+    li.className = "sub-item";
+    const t = document.createElement("span");
+    t.className = "sub-time mono";
+    t.textContent = `${cue.start.toFixed(2)}–${cue.end.toFixed(2)}s`;
+    const x = document.createElement("span");
+    x.className = "sub-text";
+    x.textContent = cue.text;          // textContent：字幕正文永不按 HTML 解析
+    li.append(t, x);
+    li.addEventListener("click", () => {
+      player.currentTime = cue.start;
+      const p = player.play();
+      if (p && p.catch) p.catch(() => { /* 自动播放被拦：时间点已经落好 */ });
+    });
+    box.appendChild(li);
+  });
+}
+
+/* 播放到哪条高亮哪条。段与段之间有静音，落在间隙里时保持上一条——
+   一句说完就闪掉高亮看起来像坏了。 */
+function subMarkActive() {
+  if (!subCues.length) return;
+  const t = player.currentTime;
+  let idx = -1;
+  for (let i = 0; i < subCues.length; i++) {
+    if (subCues[i].start > t + 0.05) break;
+    idx = i;
+  }
+  const items = $("subList").children;
+  for (let i = 0; i < items.length; i++) items[i].classList.toggle("cur", i === idx);
+  const box = $("subList");
+  if (idx >= 0 && items[idx] && !$("subPanel").hidden) {
+    const el = items[idx];
+    if (el.offsetTop < box.scrollTop || el.offsetTop + el.offsetHeight > box.scrollTop + box.clientHeight) {
+      box.scrollTop = el.offsetTop - box.clientHeight / 2 + el.offsetHeight / 2;
+    }
+  }
+}
+
+$("subToggle").addEventListener("click", async () => {
+  const open = $("subPanel").hidden;      // hidden 是唯一状态源，不另存一份布尔
+  setSubPanel(open);
+  if (!open) return;
+  if (!subCues.length) {
+    const ok = await loadSubCues();
+    if (!ok) { setSubPanel(false); return; }
+  }
+  if (!subTick) {
+    subTick = subMarkActive;
+    player.addEventListener("timeupdate", subTick);
+    subMarkActive();
+  }
+});
+$("subClose").addEventListener("click", () => { setSubPanel(false); subDetach(); });
+
+$("subDlBtn").addEventListener("click", () => {
+  const file = subFile();
+  if (!file) { showActionError("当前没有可导出的音频"); return; }
+  const name = swapExt($("dlSrcName").textContent || file, "." + subFormat);
+  // 同源 GET + <a download>：任何浏览器都行，也不必把整份文本读进 JS 再造 blob
+  triggerDownload(`${API}/subtitle/export?file=${encodeURIComponent(file)}&fmt=${subFormat}`, name);
+  $("subDlLabel").textContent = "已导出";
+  setTimeout(() => { $("subDlLabel").textContent = "导出字幕"; }, 1600);
+});
+
+$("subFmtSeg").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-sfmt]");
+  if (!b || b.disabled) return;
+  subFormat = b.dataset.sfmt;
+  $("subFmtSeg").querySelectorAll("button[data-sfmt]").forEach((x) => {
+    x.setAttribute("aria-pressed", x === b ? "true" : "false");
+  });
+  $("subDlBtn").title = `下载 ${subFormat.toUpperCase()} 字幕文件`;
+  syncSubName();
+});
+$("subFmtSeg").addEventListener("keydown", (e) => {
+  if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+  e.preventDefault();
+  const next = subFormat === "srt" ? "vtt" : "srt";
+  const btn = $("subFmtSeg").querySelector(`button[data-sfmt="${next}"]`);
+  if (btn) { btn.focus(); btn.click(); }
+});
 
 /* ---------------- 保存到指定目录（服务端落盘，任何浏览器都能用） ----------------
    与「下载」是两条独立的路：下载永远走浏览器；保存只在点保存按钮时把文件复制/

@@ -22,6 +22,7 @@ from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.maskgct_utils import build_semantic_model, build_semantic_codec
 from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.front import TextNormalizer, TextTokenizer
+from indextts.utils.subtitle import cumulative_slices, segment_texts
 
 from indextts.s2mel.modules.commons import load_checkpoint2, MyModel
 from indextts.s2mel.modules.bigvgan import bigvgan
@@ -252,6 +253,9 @@ class IndexTTS2:
         # 上一次生成是否遇到文本规范化失败并退回原文（读音可能不标准）。
         # server 读取后随 done 事件提示前端，详见 infer_generator 中 tokenize 之后。
         self.text_normalize_fallback = None
+        # 最近一次生成的段边界快照（字幕用）。None = 这次没记上，前端不出字幕。
+        self.segment_slices = None
+        self.segment_text_method = None
         # 段内各子阶段耗时占比（gpt生成/gpt前向/s2mel/bigvgan），每次生成后 EMA 自校准
         self._phase_ema = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
@@ -421,6 +425,41 @@ class IndexTTS2:
                 wavs_list.append(sil_tensor)
 
         return wavs_list
+
+    def _record_segment_slices(self, wavs, seg_token_lists, text, sampling_rate, interval_silence):
+        """把「每段在成品音频里的起止秒 + 对应的原文片段」存进 self.segment_slices。
+
+        字幕靠这个快照把文本对齐到时间轴。时间是【物理】的：成品 = 各段波形 +
+        段间静音拼接，所以起止秒由各段样本数累加得出，不是按字数估算。文本走
+        subtitle.segment_texts 锚回【用户原文】（词元流是规范化后的大写英文 +
+        半角标点，直接当字幕没法看）。
+
+        这是附属产物：任何异常都吞掉并置 None，绝不让一次已成功的生成变成报错。
+        段数对不上时也置 None —— 宁可没有字幕，也不要文本和时间错位的字幕。
+        """
+        self.segment_slices = None
+        self.segment_text_method = None
+        try:
+            if len(wavs) != len(seg_token_lists):
+                logger.warning("Subtitle skipped: %d audio segments vs %d token segments",
+                               len(wavs), len(seg_token_lists))
+                return
+            seg_samples = [int(w.shape[-1]) for w in wavs]
+            boundaries = cumulative_slices(seg_samples, sampling_rate, interval_silence)
+            texts, method = segment_texts(text, seg_token_lists)
+            if len(texts) != len(boundaries):
+                logger.warning("Subtitle skipped: %d texts vs %d boundaries",
+                               len(texts), len(boundaries))
+                return
+            self.segment_slices = [
+                {"index": i, "start": start, "end": end, "text": texts[i]}
+                for i, (start, end) in enumerate(boundaries)
+            ]
+            self.segment_text_method = method
+        except Exception as e:  # noqa: BLE001 - 字幕失败不能影响音频
+            self.segment_slices = None
+            self.segment_text_method = None
+            logger.warning("Subtitle slice recording failed: %s", e, exc_info=True)
 
     def _set_gr_progress(self, value, desc):
         if self.gr_progress is not None:
@@ -845,6 +884,10 @@ class IndexTTS2:
         # 上一次生成是否触到 max_mel_tokens 上限：server 读取后随 done 事件提示前端
         # （文本被静默截断，用户必须知情），下一次生成前复位。
         self.mel_tokens_capped = False
+        # 本次生成的段边界快照（字幕用），在拼接前由 _record_segment_slices 填充。
+        # 必须在每次生成前清空：否则上一次的字幕会挂到这一次的音频上。
+        self.segment_slices = None
+        self.segment_text_method = None
         silence = None # for stream_return
 
         # ---- 段级批处理：非流式路径上先把所有段的 mel codes 预生成 ----
@@ -1080,6 +1123,10 @@ class IndexTTS2:
                     silence = self.interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
                 yield silence
         end_time = time.perf_counter()
+
+        # 段边界要在插入段间静音【之前】记录：insert_interval_silence 会返回把静音
+        # 张量也塞进去的新列表，那时 len 和样本数都不是「每段音频」的口径了。
+        self._record_segment_slices(wavs, segments, text, sampling_rate, interval_silence)
 
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
         if not wavs:

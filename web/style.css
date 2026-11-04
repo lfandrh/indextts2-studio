@@ -1663,6 +1663,67 @@ input[type="range"]:disabled { cursor: not-allowed; }
 }
 .dl-name:empty { display: none; }
 
+/* ---- 字幕（段级） --------------------------------------------------------
+   行与面板全部复用下载行那套长相：同一档 24px 控件、同一条 hairline、同一个
+   .cur 选中态。不加阴影、不加圆角层级、不加新配色——字幕是出口之一，
+   不该比音频更显眼。 */
+.sub-row #subDlBtn { margin-left: auto; }
+.sub-row .dl-name { margin-left: var(--s2); min-width: 0; flex: 0 1 auto; }
+.sub-panel {
+  margin-top: var(--s2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.sub-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-11);
+  color: var(--muted);
+}
+.sub-grain { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sub-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 260px;      /* 与 .hist-list 同一档，超出走内部滚动，不把右栏撑爆 */
+  overflow-y: auto;
+}
+.sub-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s3);
+  padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  font-size: var(--fs-12);
+  line-height: 1.5;
+  transition: background .15s ease;
+}
+.sub-item:last-child { border-bottom: 0; }
+.sub-item:hover { background: var(--surface); }
+.sub-item.cur { background: color-mix(in srgb, var(--primary) 4%, var(--surface)); }
+.sub-item.cur .sub-time { color: var(--primary); font-weight: 600; }
+.sub-time {
+  flex: none;
+  font-family: var(--mono);
+  font-size: var(--fs-11);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.sub-text { min-width: 0; color: var(--ink); overflow-wrap: anywhere; }
+/* 面板内的提示行：.trim-hint 本身没有左右内边距（面板外用是贴齐卡片内容的），
+   放进面板里会顶到边框，这里补一档内缩并用 hairline 与列表分开 */
+.sub-panel .trim-hint {
+  margin-top: 0;
+  padding: var(--s2) var(--s3);
+  border-top: 1px solid var(--border);
+}
+
 /* 音频编辑 */
 .edit-panel { margin-top: var(--s4); padding-top: var(--s4); border-top: 1px solid var(--border); }
 /* 音量 / 变速折叠面板：不是所有人都用这两个滑块，收起时右栏少两行控件。
@@ -3185,6 +3246,11 @@ input.mg-search { width: 260px; flex: 0 1 260px; height: 32px; margin-left: auto
   .gl-del { opacity: 1; }
   .sel-actions .btn { flex: 1 1 0; min-width: 0; }
   .sel-actions #dlSrcBtn { margin-left: 0; flex: 1 1 100%; }
+  /* 字幕行同理：开关与两个按钮各占一行的一档，文件名让到第二行右对齐 */
+  .sub-row { flex-wrap: wrap; }
+  .sub-row #subDlBtn { margin-left: 0; flex: 1 1 0; min-width: 0; }
+  .sub-row #subToggle { flex: 1 1 0; min-width: 0; }
+  .sub-row .dl-name { flex: 1 1 100%; margin-left: 0; }
   .out-foot { align-items: stretch; }
   .out-foot .btn { width: 100%; }
   .mg-top-r .btn { flex: 1; }

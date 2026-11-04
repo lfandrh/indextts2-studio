@@ -88,6 +88,18 @@ from indextts.utils.server_helpers import (
     VIDEO_MAX_BYTES,
     VIDEO_MAX_SECONDS,
 )
+# 字幕纯计算（段边界 -> 条目 -> SRT/VTT）：同样是标准库实现，可在不导入
+# torch 的情况下被单测钉住；HTTP 与落盘编排留在本文件。
+from indextts.utils.subtitle import (
+    SIDECAR_VERSION,
+    cues_from_segments,
+    format_srt,
+    format_vtt,
+    load_sidecar,
+    save_sidecar,
+    sidecar_path,
+    tokens_to_readable,
+)
 # 中文路径分发包兼容：kaldifst 走 ANSI C API 打开 .fst，wetext 装在非 ASCII
 # 路径下 import 即炸。必须在任何 wetext 触达之前装好重定向（ASCII 路径下为空操作）。
 ensure_wetext_ascii_path()
@@ -495,6 +507,9 @@ PROMPTS_DIR = os.path.join(current_dir, "prompts")
 # 保留期清理（OUTPUTS_RETENTION_DAYS），把配置/历史放进去会跟着一起没。
 # 定义在模块前部，是因为历史模块（~2071 行）也要用，避免同一常量两处定义。
 DATA_DIR = os.path.join(current_dir, "data")
+# 字幕缓存目录：与音频同名换成 .json。刻意不放 outputs/——那是产物目录，
+# 启动时按保留期清理，字幕放进去会跟着一起没（昨天还能导出、今天 404）。
+SUBTITLE_DIR = os.path.join(DATA_DIR, "subtitles")
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 
@@ -843,12 +858,51 @@ def _clean_stale_outputs(retention_days: int = OUTPUTS_RETENTION_DAYS) -> int:
     return removed
 
 
+def _clean_stale_subtitles(retention_days: int = OUTPUTS_RETENTION_DAYS) -> int:
+    """清掉「对应音频已不在 outputs/、且自己也过了保留期」的字幕缓存。
+
+    字幕与音频同寿命：音频被保留期清掉（或被用户删除时由 _delete_audio_async
+    连带删掉）后，这份缓存永远不会再被读到，留着只会让 data/subtitles/ 无限
+    膨胀。天数沿用 OUTPUTS_RETENTION_DAYS，不另设参数。
+    """
+    if retention_days <= 0:
+        return 0
+    cutoff = time.time() - retention_days * 86400
+    try:
+        names = os.listdir(SUBTITLE_DIR)
+    except OSError:
+        return 0
+    removed = 0
+    for name in names:
+        path = os.path.join(SUBTITLE_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        # save_sidecar 的中间产物（x.json.tmp）在进程被杀时可能留下，一起按名清理
+        stem = name[:-4] if name.endswith(".tmp") else name
+        if not stem.endswith(".json"):
+            continue
+        wav = os.path.join(OUTPUTS_DIR, os.path.splitext(stem)[0] + ".wav")
+        if os.path.isfile(wav):
+            continue  # 音频还在，字幕就还能导出
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 # 与 _clean_legacy_prompts() 同理放在 import 期：以前只在 __main__ 分支跑，
 # `uvicorn server:app` 启动时孤儿 wav 清理永不执行，outputs/ 会无限膨胀。
 _removed_outputs = _clean_stale_outputs()
 if _removed_outputs:
     logger.info("Cleaned %d output file(s) older than %d days.",
                 _removed_outputs, OUTPUTS_RETENTION_DAYS)
+_removed_subtitles = _clean_stale_subtitles()
+if _removed_subtitles:
+    logger.info("Cleaned %d subtitle cache(s) with no matching output.",
+                _removed_subtitles)
 
 
 @api.get("/health")
@@ -1922,6 +1976,7 @@ def do_tts(
                     "history_id": ev.get("history_id"),
                     "mel_capped": ev.get("mel_capped", False),
                     "normalize_fallback": ev.get("normalize_fallback"),
+                    "subtitle": ev.get("subtitle", False),
                     # /jobs/current 的恢复路径读的就是这个字典：漏写会让刷新后
                     # 候选条退化成单条（见 PLAN §4.5）
                     "cand_group": ev.get("cand_group", ""),
@@ -2069,6 +2124,15 @@ def do_tts(
                 # 文本规范化失败并退回原文同样是无声的（读音不标准但音频出来了），
                 # 一起透给前端。None 表示一切正常。
                 normalize_fallback = getattr(model, "text_normalize_fallback", None)
+                # 字幕 sidecar 只在这一刻拿得到段边界（引擎实例上的本次快照），
+                # 存完就与任务无关了；写盘失败不影响音频，只让字幕导出不可用。
+                has_subtitle = _subtitle_save(
+                    wav_name,
+                    getattr(model, "segment_text_method", None),
+                    getattr(model, "segment_slices", None),
+                    interval_silence,
+                    len(str(text or "")),
+                )
                 record_event({
                     "type": "done",
                     "wav": f"{API_V1}/audio/{wav_name}",
@@ -2077,6 +2141,7 @@ def do_tts(
                     "history_id": entry["id"],
                     "mel_capped": mel_capped,
                     "normalize_fallback": normalize_fallback,
+                    "subtitle": has_subtitle,
                     "cand_group": cand_group,
                     "cand_index": cand_index,
                     "cand_total": cand_total,
@@ -2343,6 +2408,9 @@ _HISTORY_LOCK = threading.Lock()
 def _delete_audio_async(file_names) -> None:
     """Delete output wavs on a daemon thread so a slow disk can't stall anything.
 
+    字幕 sidecar 跟着音频一起删：只删 wav 会在 data/subtitles/ 里留下永不复活的
+    孤儿（历史不再引用它，也不会再有同名产物）。
+
     最坏情况只是文件暂时残留（甚至删不掉），服务本身照常可用——这是刻意的取舍：
     宁可漏清理，不可让生成或删除请求卡住。
     """
@@ -2352,10 +2420,13 @@ def _delete_audio_async(file_names) -> None:
 
     def run():
         for n in names:
-            try:
-                os.remove(os.path.join(OUTPUTS_DIR, os.path.basename(n)))
-            except OSError:
-                pass
+            base = os.path.basename(n)
+            for p in (os.path.join(OUTPUTS_DIR, base),
+                      sidecar_path(SUBTITLE_DIR, base)):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
     threading.Thread(target=run, name="history-delete", daemon=True).start()
 
@@ -3398,38 +3469,107 @@ def segments_preview(request: Request, text: str = Form(""), max_text_tokens_per
     tokens = tts.tokenizer.tokenize(text)
     segs = tts.tokenizer.split_segments(tokens, max_text_tokens_per_segment=max_text_tokens_per_segment)
 
-    def _readable(seg):
-        """把 BPE 词元拼回可读文本。
-
-        词元序列本身就是【规范化之后】的文本（也就是真正会被念出来的内容），
-        只是被 BPE 切碎、每个词元用 ▁ 标记词首。所以直接拼起来、去掉 ▁ 就行。
-
-        这里刻意【不】用 tokenizer.decode()：它会走 indextts/utils/common.py 的
-        de_tokenized_by_CJK_char，那函数先��英文词替换成 <sent_N> 占位符再还原，
-        还原的条件是 `if len(all_matches) > 1`——单个英文词只产生 1 个占位符，
-        于是永远还原不回来。实测后果（改用 decode 时的数据）：
-
-            这里有 English 这个单词。 -> 这里有<sent_0>这个单词.
-            Hello world, this is a test. -> <sent_0>,<sent_1>.   信息全丢
-            test@example.com -> test<sent_2>?example.com        内容还被改坏
-
-        纯中文 / 纯数字场景下 decode 的输出与直接拼词元完全一致，所以换成直接拼
-        没有任何损失，英文场景则是从「看不见」变成「看得见」。
-
-        不用 sp_model.Decode 也不行：它会给汉字之间也插空格（"这 是 一 段"），
-        等于退回更早的碎片显示。
-
-        decode() 本身在 indextts/infer_v2.py:886 解析 Qwen 情绪 JSON 时被真实
-        用到，那个上游函数的还原判断不该为了预览去动。
-        """
-        return "".join(seg).replace("▁", "")
-
+    # 词元拼回可读文本的实现在 indextts/utils/subtitle.py，与字幕共用一份。
+    # 这里以前是 `"".join(seg).replace("▁", "")`：英文词元带词首标记（▁I ▁LOVE），
+    # 直接删掉▁会把单词粘成 ILOVE，预览看不出到底念了什么。
     return JSONResponse({
         "segments": [
-            {"index": i, "text": _readable(s), "tokens": len(s)}
+            {"index": i, "text": tokens_to_readable(s)[0], "tokens": len(s)}
             for i, s in enumerate(segs)
-        ]
+        ],
     })
+
+
+# ---- 字幕（段级） -----------------------------------------------------------
+# 时间是【物理】的：成品音频 = 各段波形 + 段间静音拼接，引擎在拼接前把每段的
+# 样本数记进 model.segment_slices（见 infer_v2._record_segment_slices），这里
+# 只负责存盘与出文件。算法与格式化都在 indextts/utils/subtitle.py（纯标准库）。
+#
+# 必须在生成结束的那一刻存：过了这刻只剩成品 wav 的总时长，每段边界再也算不出来。
+# 所以每次生成都顺手落一份 sidecar（几 KB），用户点不点导出都一样。
+
+def _subtitle_save(wav_name: str, text_source: str, segments, interval_ms, chars: int) -> bool:
+    """把本次生成的段边界快照写进 data/subtitles/<同名>.json；失败只返回 False。"""
+    if not segments:
+        # 引擎没记上（段数对不上 / 内部异常）：没有字幕可用，前端据此说明原因。
+        return False
+    data = {
+        "version": SIDECAR_VERSION,
+        "file": os.path.basename(wav_name),
+        "granularity": "segment",
+        "text_source": text_source or "",
+        "interval_ms": int(interval_ms or 0),
+        "chars": int(chars or 0),
+        "created_at": time.time(),
+        "segments": segments,
+    }
+    if not save_sidecar(sidecar_path(SUBTITLE_DIR, wav_name), data):
+        logger.warning("字幕缓存写入失败：%s（音频已生成成功，不影响播放）", wav_name)
+        return False
+    return True
+
+
+def _subtitle_load_or_404(name: str) -> dict:
+    """读 sidecar；缺文件或结构不对都回 404，并把「为什么没有」说清楚。"""
+    base = os.path.basename(name or "")
+    if not base:
+        raise HTTPException(400, "缺少音频文件名")
+    data = load_sidecar(sidecar_path(SUBTITLE_DIR, base))
+    if data is None:
+        raise HTTPException(
+            404,
+            f"{base} 没有字幕记录：这份音频生成时还没记录段边界"
+            "（字幕是后加的功能，旧音频没有）。重新生成一次即可导出字幕。",
+        )
+    return data
+
+
+@api.get("/subtitle", include_in_schema=False)
+def subtitle_get(file: str = ""):
+    """段级字幕条目（前端字幕面板用）。纯读盘 + 纯计算，不占推理锁。"""
+    data = _subtitle_load_or_404(file)
+    segments = data["segments"]
+    return JSONResponse({
+        "file": data["file"],
+        "granularity": data.get("granularity") or "segment",
+        "text_source": data.get("text_source") or "",
+        "created_at": data.get("created_at"),
+        "segments": segments,
+        "cues": cues_from_segments(segments),
+    })
+
+
+@api.get("/subtitle/export", include_in_schema=False)
+def subtitle_export(file: str = "", fmt: str = "srt"):
+    """导出 SRT / WebVTT 文本。浏览器直接下载，所以文件名走 filename*。
+
+    SRT 用 UTF-8 带 BOM：中文 Windows 上 PotPlayer / Premiere 之类别的文件不写
+    BOM 就当 ANSI 读，字幕直接变乱码。VTT 按规范纯 UTF-8。
+    """
+    fmt = (fmt or "srt").lower()
+    if fmt not in ("srt", "vtt"):
+        raise HTTPException(400, f"字幕格式只支持 srt / vtt，收到 {fmt}")
+    data = _subtitle_load_or_404(file)
+    cues = cues_from_segments(data["segments"])
+    if not cues:
+        raise HTTPException(404, "这份音频的字幕条目是空的（文本被全部过滤）")
+    if fmt == "srt":
+        body = format_srt(cues).encode("utf-8-sig")
+        media = "application/x-subrip"
+    else:
+        body = format_vtt(cues).encode("utf-8")
+        media = "text/vtt"
+    stem = os.path.splitext(os.path.basename(data["file"]))[0] or "subtitle"
+    filename = quote(f"{stem}.{fmt}")
+    return Response(
+        content=body,
+        media_type=f"{media}; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                f"attachment; filename=\"subtitle.{fmt}\"; filename*=UTF-8''{filename}",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 def _glossary_dict():

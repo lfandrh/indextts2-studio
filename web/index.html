@@ -111,6 +111,13 @@
            聚焦文本框（label 的默认行为），而且读屏会把按钮念成标签的一部分。 -->
       <div class="text-head">
         <label class="oplabel" for="text">合成文本</label>
+        <!-- 英文缩写读不出连读是模型词表的硬限制，术语表也修不了；放角标让用户在输入前就知道，
+             免得生成完才发现来问。体例与「分句预览 / 术语读音」的 .q 一致（多行 title）。 -->
+        <span class="q" title="英文撇号缩写（don't / can't / isn't / that's）读不出原本的连读音，这是模型词表的限制，术语表也修不了。
+能恢复原音的只有四个，换成同音整词：they're→their、you're→your、it's→its、we'll→well。
+其余缩写请写完整形式：do not / cannot / will not / is not / they are / let us。
+从 Word 粘贴的弯撇号 ’ 要换成半角 '；所有格 the rabbit's fur 会念成 the rabbit is fur，建议改写成 the fur of the rabbit。
+详见使用指南 3.1。"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></span>
         <button class="btn ghost mini text-import" id="textImportBtn" type="button" title="导入 .txt / .md 文本文件，也可以直接把文件拖到文本框">
           <svg class="ico" aria-hidden="true"><use href="#i-upload"></use></svg>导入文本
         </button>
@@ -429,6 +436,33 @@
         </div>
         <span class="dl-name mono" id="dlSrcName"></span>
       </div>
+      <!-- 字幕行：与上面两行同属「源音频出口」，作用于未剪辑的生成音频。
+           没拿到段边界缓存时整行隐藏（旧音频 / 生成时没记上），不给人点出错误来 -->
+      <div class="dl-row sub-row" id="subRow" hidden>
+        <div class="fmtseg" id="subFmtSeg" role="group" aria-label="字幕格式">
+          <button type="button" data-sfmt="srt" aria-pressed="true" title="SRT：剪映 / Premiere / PotPlayer 等通用">SRT</button>
+          <button type="button" data-sfmt="vtt" aria-pressed="false" title="WebVTT：网页 video track 用">VTT</button>
+        </div>
+        <button class="btn ghost mini" id="subToggle" type="button" aria-expanded="false" aria-controls="subPanel">字幕列表</button>
+        <button class="btn primary mini" id="subDlBtn" type="button" title="下载字幕文件">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><line x1="7" y1="14" x2="13" y2="14"/><line x1="15" y1="14" x2="17" y2="14"/><line x1="7" y1="10" x2="11" y2="10"/></svg>
+          <span id="subDlLabel">导出字幕</span>
+        </button>
+        <span class="dl-name mono" id="subName"></span>
+      </div>
+      <!-- 字幕面板：每条一行，点一行从该句起播。时间是引擎给出的每段物理边界，
+           不是按字数估的；粒度是「一段一条」，段内不再切句 -->
+      <div class="sub-panel" id="subPanel" hidden>
+        <div class="sub-head">
+          <span class="sub-grain" id="subGrain"></span>
+          <button class="iconbtn" id="subClose" type="button" aria-label="关闭字幕列表">
+            <svg class="ico" aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="5" y1="5" x2="19" y2="19"/><line x1="19" y1="5" x2="5" y2="19"/></svg>
+          </button>
+        </div>
+        <ol class="sub-list" id="subList"></ol>
+        <div class="trim-hint">点一条字幕可从该句开始播放 · 时间对应未剪辑的生成音频，裁剪或变速后不再对齐</div>
+      </div>
+      <div class="capnote" id="subNote" hidden></div>
       <div class="capnote" id="melCapNote" hidden>⚠ 文本超过单段生成长度上限，结尾被截断——请减少每段 Token（分句上限）或调高「最大 mel tokens」后重新生成</div>
       <!-- 文本规范化退化的提示。第一次完整展开；提示过一次之后再发生就降级成
            右上角的小铃铛，点击可随时展开——不重复打扰，但不丢信息。
