@@ -83,6 +83,10 @@ class FakeHandler(BaseHTTPRequestHandler):
     unload_calls = 0
     config_calls = 0
     restart_calls = 0
+    model_load_calls = 0
+    segments_calls = 0
+    model_loaded = True
+    segments_fail = False
     glossary = {}
     model_cfg = {"loaded": True, "fp16": True, "s2mel_fp16": True, "w2v_fp16": False,
                  "qwen_fp16": True, "cudnn_benchmark": False,
@@ -112,13 +116,14 @@ class FakeHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         p = urlsplit(self.path).path
         if p == "/api/v1/health":
-            self._json({"status": "ok", "model_loaded": True})
+            self._json({"status": "ok", "model_loaded": type(self).model_loaded})
         elif p == "/api/v1/status":
-            self._json({"loaded": True, "gpu_name": "FakeGPU",
+            self._json({"loaded": type(self).model_loaded, "gpu_name": "FakeGPU",
                         "vram_used_mb": 4096, "vram_total_mb": 8192,
                         "cpu_percent": 10, "mem_used_mb": 2048, "mem_total_mb": 16384})
         elif p == "/api/v1/model":
             self._json({"ok": True, "generating": type(self).generating,
+                        "loaded": type(self).model_loaded,
                         "phase": "generating" if type(self).generating else "idle",
                         **type(self).model_cfg})
         elif p == "/openapi.json":
@@ -128,7 +133,8 @@ class FakeHandler(BaseHTTPRequestHandler):
                 "/api/v1/health": {"get": {}}, "/api/v1/status": {"get": {}},
                 "/api/v1/model": {"get": {}}, "/api/v1/model/unload": {"post": {}},
                 "/api/v1/model/config": {"post": {}}, "/api/v1/model/restart": {"post": {}},
-                "/api/v1/model/load": {"post": {}},            # ← 未适配
+                "/api/v1/model/load": {"post": {}},
+                "/api/v1/metrics": {"get": {}},               # ← 未适配
                 "/api/v1/presets": {"get": {}, "post": {}},
                 "/api/v1/presets/{name}": {"get": {}},
                 "/api/v1/examples": {"get": {}}, "/api/v1/segments": {"post": {}},
@@ -173,11 +179,31 @@ class FakeHandler(BaseHTTPRequestHandler):
             type(self).tempo_calls += 1
             self._send(WAV_BYTES, "audio/wav")
         elif p == "/api/v1/segments":
+            type(self).segments_calls += 1
+            if type(self).segments_fail:
+                self._json({"detail": "segments exploded"}, 500)
+                return
             form = parse_qs(body.decode("utf-8", "replace"))
             text = (form.get("text") or [""])[0]
             cut = max(1, len(text) // 2)
+            numbers = []
+            for raw, read in (("5090", "五千零九十"), ("2026年", "二零二六年")):
+                if raw in text:
+                    numbers.append({"text": raw, "read": read})
+            normalized = text.replace("5090", "五千零九十").replace("2026年", "二零二六年")
             self._json({"segments": [{"index": 0, "text": text[:cut], "tokens": cut},
-                                     {"index": 1, "text": text[cut:], "tokens": len(text) - cut}]})
+                                     {"index": 1, "text": text[cut:], "tokens": len(text) - cut}],
+                        "normalized_text": normalized,
+                        "numbers": numbers,
+                        "numbers_truncated": False,
+                        "normalize_fallback": None})
+        elif p == "/api/v1/model/load":
+            if type(self).generating:
+                self._json({"detail": "正在生成语音（已进行 3 秒）。"}, 409)
+            else:
+                type(self).model_load_calls += 1
+                type(self).model_loaded = True
+                self._json({"ok": True, "loaded": True, "phase": "idle"})
         elif p == "/api/v1/model/config":
             req = json.loads(body.decode("utf-8") or "{}")
             unknown = sorted(k for k in req if k not in type(self).CONFIG_KEYS)
@@ -266,6 +292,10 @@ class ClientTestCase(unittest.TestCase):
         FakeHandler.unload_calls = 0
         FakeHandler.config_calls = 0
         FakeHandler.restart_calls = 0
+        FakeHandler.model_load_calls = 0
+        FakeHandler.segments_calls = 0
+        FakeHandler.model_loaded = True
+        FakeHandler.segments_fail = False
         FakeHandler.glossary = {}
         FakeHandler.model_cfg = {"loaded": True, "fp16": True, "s2mel_fp16": True,
                                  "w2v_fp16": False, "qwen_fp16": True,
@@ -331,7 +361,7 @@ class ClientTestCase(unittest.TestCase):
     def test_version(self):
         r = self.run_client("--version")
         self.assertEqual(0, r.returncode, r.stderr)
-        self.assertIn("indextts2-tts 1.2.4", r.stdout)
+        self.assertIn("indextts2-tts 1.2.5", r.stdout)
 
     # ---- 模型管理（/model、/model/unload）----
     def test_model_plain_and_json(self):
@@ -341,6 +371,50 @@ class ClientTestCase(unittest.TestCase):
         self.assertIn("steps=25", r.stdout)
         r = self.run_client("model", "--json")
         self.assertTrue(self.json_out(r)["ok"])
+
+    # ---- 懒加载：不能让它变成"等模型加载"的死循环 ----
+    def test_health_notes_lazy_load_when_model_not_loaded(self):
+        FakeHandler.model_loaded = False
+        r = self.run_client("health")
+        self.assertEqual(0, r.returncode, r.stderr)
+        d = self.json_out(r)
+        self.assertFalse(d["health"]["model_loaded"])
+        self.assertIn("不要轮询", d["note"])
+        # 已加载时不应出现这条 note
+        FakeHandler.model_loaded = True
+        d = self.json_out(self.run_client("health"))
+        self.assertNotIn("note", d)
+
+    def test_ensure_notes_lazy_load_after_start(self):
+        FakeHandler.model_loaded = False
+        r = self.run_client("ensure")
+        self.assertEqual(0, r.returncode, r.stderr)
+        self.assertIn("不要等 model_loaded", r.stderr)
+        self.assertIn("note", self.json_out(r))
+
+    def test_model_load_triggers_explicit_load(self):
+        FakeHandler.model_loaded = False
+        r = self.run_client("model-load")
+        self.assertEqual(0, r.returncode, r.stderr)
+        d = self.json_out(r)
+        self.assertTrue(d["ok"])
+        self.assertTrue(d["loaded"])
+        self.assertEqual(1, FakeHandler.model_load_calls)
+        self.assertIn("模型已加载", r.stderr)
+
+    def test_model_load_refuses_while_generating(self):
+        FakeHandler.generating = True
+        r = self.run_client("model-load")
+        self.assertEqual(1, r.returncode)
+        d = self.json_out(r)
+        self.assertEqual("generating", d["reason"])
+        self.assertEqual(0, FakeHandler.model_load_calls)
+
+    def test_status_does_not_invite_waiting_when_unloaded(self):
+        FakeHandler.model_loaded = False
+        r = self.run_client("status")
+        self.assertEqual(0, r.returncode, r.stderr)
+        self.assertIn("不要等", r.stdout)
 
     def test_unload_refuses_while_generating(self):
         FakeHandler.generating = True
@@ -450,14 +524,15 @@ class ClientTestCase(unittest.TestCase):
     def test_api_audit_lists_unadapted_core_endpoint(self):
         r = self.run_client("api")
         self.assertEqual(0, r.returncode, r.stderr)
-        self.assertIn("POST /model/load", r.stdout)
+        self.assertIn("GET /metrics", r.stdout)
+        self.assertNotIn("POST /model/load", r.stdout)
         self.assertIn("longform", r.stdout)
 
     def test_api_audit_strict_fails_on_gap(self):
         r = self.run_client("api", "--strict")
         self.assertEqual(1, r.returncode, "有核心缺口但 --strict 没报错")
         d = self.json_out(self.run_client("api", "--json"))
-        self.assertIn("POST /model/load", d["unadapted"])
+        self.assertIn("GET /metrics", d["unadapted"])
         self.assertEqual([], d["missing_on_server"], "假服务里 skill 写的接口应当都存在")
 
     # ---- health：连不上时要能说清原因 ----
@@ -681,6 +756,42 @@ class ClientTestCase(unittest.TestCase):
         r = self.run_client("batch", "-f", out_json)
         m = self.json_out(r)
         self.assertEqual(2, m["done"], r.stderr)
+
+    def test_segments_reports_normalized_text_and_numbers(self):
+        r = self.run_client("segments", "--text", "5090显卡真快")
+        self.assertEqual(0, r.returncode, r.stderr)
+        d = self.json_out(r)
+        self.assertEqual("五千零九十显卡真快", d["normalized_text"])
+        self.assertEqual([{"text": "5090", "read": "五千零九十"}], d["numbers"])
+        self.assertIn("5090→五千零九十", r.stderr)
+        self.assertIn("glossary --add", r.stderr)
+
+    def test_synth_preview_reports_number_reading(self):
+        r = self.run_client("synth", "--voice", self.voice, "--text", "5090显卡真快",
+                            "--out", self.tmp / "a.wav")
+        self.assertEqual(0, r.returncode, r.stderr)
+        d = self.json_out(r)
+        self.assertEqual(1, FakeHandler.segments_calls, "synth 默认应当取一次分段预览")
+        self.assertEqual(2, d["preview"]["count"])
+        self.assertEqual([{"text": "5090", "read": "五千零九十"}], d["preview"]["numbers"])
+        self.assertIn("5090→五千零九十", r.stderr)
+
+    def test_synth_no_preview_skips_segments(self):
+        r = self.run_client("synth", "--voice", self.voice, "--text", "5090显卡真快",
+                            "--out", self.tmp / "b.wav", "--no-preview")
+        self.assertEqual(0, r.returncode, r.stderr)
+        d = self.json_out(r)
+        self.assertIsNone(d["preview"])
+        self.assertEqual(0, FakeHandler.segments_calls)
+
+    def test_synth_preview_failure_does_not_block_generation(self):
+        FakeHandler.segments_fail = True
+        r = self.run_client("synth", "--voice", self.voice, "--text", "照常生成",
+                            "--out", self.tmp / "c.wav")
+        self.assertEqual(0, r.returncode, "预览失败不该拦下合成")
+        d = self.json_out(r)
+        self.assertIsNone(d["preview"])
+        self.assertIn("跳过分段预览", r.stderr)
 
     def test_tempo_applied_for_rate(self):
         tasks = self.write_tasks([{"id": "a", "text": "快一点", "rate": 1.2}])

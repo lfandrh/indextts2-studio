@@ -62,7 +62,7 @@
 | 加速选项 | 8 个开关，含 flash-attn / torch_compile / deepspeed | 精简为 5 个开关 + 3 个参数（扩散步数、CFG 强度、分段批处理），实测负优化与厂商绑定的项全部移除 |
 | 生成任务 | gradio 内置队列，用户不可见、不可控 | 排队位次、排队可取消、生成中可停止、刷新页面自动找回任务 |
 | 结果处理 | 只能下载原始音频 | 波形选区、音量、保音高变速、撤销重做、源文件与编辑结果分开下载；WAV / MP3 导出、段级 SRT / VTT 字幕，或直接保存到服务所在电脑的指定目录 |
-| Agent 集成 | 无（只有 gradio 界面和 Python API） | 自带 agent skill：纯标准库客户端，25 个子命令，支持批量与上游 Skill 编排 |
+| Agent 集成 | 无（只有 gradio 界面和 Python API） | 自带 agent skill：纯标准库客户端，26 个子命令，支持批量与上游 Skill 编排 |
 | 重复合成 | 参考音频按随机 uuid 存盘，预处理缓存永不命中 | 参考音频按内容 md5 存盘，同一声色第二次起跳过特征提取 |
 | 安全 | 默认对外监听 | 默认只绑 `127.0.0.1`，且所有文件路径取 `basename` |
 
@@ -88,7 +88,7 @@
 | 预设系统 | 参考音频 + 全部参数保存为预设，一键回填复用，支持改名 / 复制 / 删除；服务端存储，跨会话可用 |
 | 预设管理页 | 三栏工作台：左侧按「含音频 / 仅参数 / 四种情绪模式」筛选、中间卡片墙、右侧检视面板（内置试听、参数全览、应用到合成页）；点卡片只选中不跳走 |
 | 参数锁定 | 锁定高级参数后，应用预设 / 刷新页面都不会覆盖当前数值；锁定状态存服务端 |
-| AI Agent Skill | 自带 `skills/indextts2-tts`：零依赖客户端 + 25 个子命令，一句话让 agent 完成「探活 → 选音色 → 合成 → 交路径」，支持批量清单、断点续跑与上游 Skill 编排 |
+| AI Agent Skill | 自带 `skills/indextts2-tts`：零依赖客户端 + 26 个子命令，一句话让 agent 完成「探活 → 选音色 → 合成 → 交路径」，支持批量清单、断点续跑与上游 Skill 编排；合成前先回传分段与数字读音预览，专治 `5090` 被念成「五千零九十」 |
 | 内置示例 | 9 条示例一键填充文本与参数（另有 2 条情感文本示例默认隐藏），用于快速试听音色 |
 | 情感控制 | 四种模式：同参考音频 / 情感参考音频 / 8 维情感向量（滑块直控、权重可缩放）/ 情感文本描述（Qwen）；参考音频超过 15 秒时提示仅取前 15 秒，并可直接打开裁剪弹窗截出目标片段 |
 | 术语词汇表 | 自定义术语读音（落盘 `checkpoints/glossary.yaml`），支持单条删除、一键清空，以及默认关闭的「级联替换」开关 |
@@ -369,18 +369,20 @@ http://127.0.0.1:7860
 2. **禁止并行生成**。服务端是全局单锁 + 队列，客户端再加一把文件锁（`--lock-wait`），避免多条命令互相挂死。
 3. **音频必须可找回**。不传 `--out` 也会落到 `<输出目录>/<日期>/` 并写 `last.json`，`last` 子命令随时取回上一次的结果。
 
-### 能力：25 个子命令
+### 能力：26 个子命令
 
 | 分组 | 命令 |
 | --- | --- |
-| 定位与启动 | `locate`（找项目根，退出码 3 = 请用户选路）· `ensure`（没跑就拉起来并等就绪）· `health`（连不上时区分「没监听 / 在加载 / 端口被占 / DNS 错」四种原因）· `status`（模型状态 + 显存仪表） |
-| 模型与显存 | `model` · `model-config`（改扩散步数与 CFG，即时生效）· `model-restart` · `unload`（释放显存） |
+| 定位与启动 | `locate`（找项目根，退出码 3 = 请用户选路）· `ensure`（没跑就拉起来并等就绪）· `health`（探活；连不上时区分「没监听 / 无应答 / 端口被占 / DNS 错」四种原因；模型未加载会明说这是正常状态）· `status`（模型状态 + 显存仪表） |
+| 模型与显存 | `model` · `model-load`（显式预加载；平时首个 `synth` 会自动触发）· `model-config`（改扩散步数与 CFG，即时生效）· `model-restart` · `unload`（释放显存） |
 | 音色 | `presets` · `preset` · `preset-save`（把一段录音存成命名音色）· `examples`（内置示例）· `choose` |
-| 合成 | `synth` · `segments`（长文分段，可直接产出批量清单）· `batch` · `tempo`（保音高变速，不重算）· `stop` · `last` · `history` |
+| 合成 | `synth`（默认先回传分段预览与数字读法）· `segments`（预览分段 / 规范化读法，可直接产出批量清单）· `batch` · `tempo`（保音高变速，不重算）· `stop` · `last` · `history` |
 | 读音与自检 | `glossary`（术语增删查）· `doctor`（端到端体检）· `capabilities` · `api`（接口对账，查整合包升级后有没有漂移）· `selftest` |
 
 几条比较实用的：
 
+- **模型是懒加载的，别等 `model_loaded`**：`health` 返回 `model_loaded:false` 是正常空闲态，没有任何后台线程会去加载；直接 `synth` / `doctor` 就会触发（约 30~60 秒），想预加载用 `model-load`。
+- **合成前先看读音**：`synth` 默认先调 `/segments`，把「原文 → 读法」打在 stderr、把分段和数字读法放进 stdout 的 `preview`；读错就 `glossary --add "5090" --zh "五零九零"` 再重跑，不用生成完才发现。
 - **`doctor` 而不是「能不能用」**：探活 → 接口 → **真合成一句** → 对这句变速一次，输出 `ready: true` 且退出码 0 才算能开工。只证明接口能连的 `selftest` 不算数。
 - **`api` 对账**：拉服务端 `openapi.json` 跟脚本已适配的清单比对，列出「服务端有但没适配」与「脚本在调但服务端没有」，整合包升级后这是唯一的漂移探针。
 - **`tempo` 先于重新合成**：用户嫌快/嫌慢，先 `tempo --rate 1.2` 变速，不重新推理、不占 GPU，只有音质不可接受才重录。
@@ -405,7 +407,7 @@ python skills/indextts2-tts/scripts/tts_client.py batch -f tasks.json --resume
 
 ```bash
 # 仓库内直接可用，不需要安装
-python skills/indextts2-tts/scripts/tts_client.py --version     # indextts2-tts 1.2.4
+python skills/indextts2-tts/scripts/tts_client.py --version     # indextts2-tts 1.2.5
 
 # 装成用户级 Skill，任意工作目录都能用
 # Git Bash / macOS / Linux
@@ -422,18 +424,18 @@ xcopy /E /I skills\indextts2-tts "%USERPROFILE%\.workbuddy\skills\indextts2-tts"
 | 「把这篇 3000 字念成有声书」 | `segments` 分段 → `batch` 一次跑完，回传每句时长 |
 | 「这段用龙三叔的声音」 | 查预设 → `synth --preset`，没有就让你先选 |
 | 「第 12 句太快了」 | `batch --only` 重跑那一句，其它不动 |
-| 「`IndexTTS2` 总念错」 | 往术语表加一条读音 |
+| 「`IndexTTS2` 总念错」 | 往术语表加一条读音（`5090显卡` 这类数字贴中文的也匹配） |
 
 ### Skill 目录（`skills/indextts2-tts/`）
 
 | 文件 | 内容 |
 | --- | --- |
-| `SKILL.md` | 主文档：三条硬规则、标准流程、25 个子命令、排障 |
+| `SKILL.md` | 主文档：六条硬规则、标准流程（含合成前的读音预检）、26 个子命令、排障 |
 | `scripts/tts_client.py` | 客户端本体，单文件、纯标准库 |
 | `references/api.md` | 全部 HTTP 端点、SSE 事件字段、状态码语义、预设目录结构 |
 | `references/parameters.md` | `/tts` 全部表单字段、四种情感模式、采样参数与调参建议 |
 | `references/pitfalls.md` | 实测踩坑清单（含沙箱 / 代理 / 中文路径） |
-| `tests/test_client.py` | 离线回归测试：假服务、不需要 GPU，改脚本后先跑这个（当前 38 项全过） |
+| `tests/test_client.py` | 离线回归测试：假服务、不需要 GPU，改脚本后先跑这个（当前 47 项全过） |
 
 ### 它不做什么
 

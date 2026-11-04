@@ -67,7 +67,15 @@ from pathlib import Path
 
 # skill 自身版本。用户报问题时先问这个——skill 有两份副本（用户级/项目内），
 # 没有版本号就只能靠"文件时间"猜，也没法判断两份是否漂移。
-SKILL_VERSION = "1.2.4"
+SKILL_VERSION = "1.2.5"
+
+# 模型是懒加载的：没收到 /tts（或显式 /model/load）之前，model_loaded 永远是
+# false。这句话要出现在所有"看起来像在等加载"的地方，否则调用方会去轮询一个
+# 不会自己变化的状态，卡死在启动之后。
+LAZY_LOAD_NOTE = (
+    "model_loaded=false 是正常状态：模型懒加载，只有 synth/batch/doctor 或 "
+    "model-load 才会触发加载；不要轮询等待。"
+)
 
 
 def _relax_stdio():
@@ -340,6 +348,7 @@ ADAPTED_ENDPOINTS = {
     "GET /health",
     "GET /status",
     "GET /model",
+    "POST /model/load",
     "POST /model/unload",
     "POST /model/config",
     "POST /model/restart",
@@ -1070,7 +1079,9 @@ def _health_hints(reason):
         ]
     if reason == "timeout":
         return [
-            "服务正在加载模型（首次 30~60s）：等一下再探，或调大 INDEXTTS_HTTP_TIMEOUT",
+            "服务正在启动或繁忙（端口已监听但 5 秒没应答）：稍等再探",
+            "模型是懒加载的：没加载时 health 会立刻返回 model_loaded=false，不会超时；"
+            "加载模型请用 synth/doctor/model-load",
             "机器卡住/显存换页：看任务管理器 GPU、内存占用",
         ]
     if reason == "http_error":
@@ -1093,6 +1104,10 @@ def cmd_health(args):
         out["reason"] = reason
         out["detail"] = detail
         out["hints"] = _health_hints(reason)
+    elif not h.get("model_loaded"):
+        # 最容易误判的一项：服务已经能应答，但模型没加载。调用方（尤其是 agent）
+        # 常把它当成"还在加载"然后一直等，而懒加载状态下不主动请求就永远不会变。
+        out["note"] = LAZY_LOAD_NOTE
     print(json.dumps(out, ensure_ascii=False))
     return 0 if h is not None else 1
 
@@ -1477,7 +1492,13 @@ def cmd_locate(args):
 def cmd_ensure(args):
     ok = ensure_server(allow_start=not args.no_start)
     h = health()
-    print(json.dumps({"ok": ok, "health": h}, ensure_ascii=False))
+    out = {"ok": ok, "health": h}
+    if ok and h is not None and not h.get("model_loaded"):
+        out["note"] = LAZY_LOAD_NOTE
+        print("[ensure] 服务已就绪（模型尚未加载，这是正常的）。"
+              "下一步直接 synth / doctor 即可触发加载，不要等 model_loaded。",
+              file=sys.stderr)
+    print(json.dumps(out, ensure_ascii=False))
     return 0 if ok else 1
 
 
@@ -1491,7 +1512,8 @@ def cmd_status(args):
         return 0
 
     loaded = bool(st.get("loaded"))
-    line = "模型: %s" % ("已加载" if loaded else "未加载（首次合成时才加载，约 30~60s）")
+    line = "模型: %s" % ("已加载" if loaded else
+                        "未加载（正常，懒加载：直接 synth/doctor/model-load 会触发加载，约 30~60s，不要等）")
     if st.get("generating"):
         line += "，正在生成中"
     print(line)
@@ -1544,7 +1566,8 @@ def cmd_model(args):
         return 0
 
     loaded = bool(d.get("loaded"))
-    head = "模型: %s" % ("已加载" if loaded else "未加载")
+    head = "模型: %s" % ("已加载" if loaded else
+                        "未加载（正常，懒加载；直接 synth/doctor/model-load 才会加载）")
     if d.get("generating"):
         head += "，正在生成中"
     print(head)
@@ -1563,6 +1586,41 @@ def cmd_model(args):
         print("cuDNN benchmark: on")
     if not loaded:
         print("  (未加载时以上是**下次加载**会用的配置；改配置在 WebUI「模型管理」页)")
+        print("  (不要等 model_loaded 自己变 true：直接 synth/doctor 或 model-load 触发加载)")
+    return 0
+
+
+def cmd_model_load(args):
+    """POST /model/load：显式触发懒加载。
+
+    正常流程不需要它——synth / batch / doctor 的首次请求都会自动加载。
+    但有些 agent/上游程序会「先等模型加载好再开始」，而 /health 在没收到
+    合成请求前永远报 model_loaded=false。与其让它轮询一个不会自己变化的状态，
+    不如给一个明确的加载动作：要么调这个命令，要么直接生成。
+    """
+    if not ensure_server(allow_start=not args.no_start):
+        return 1
+    t0 = time.time()
+    print("[model-load] 加载模型中（首次 30~60s；8G 卡加载后约 6.7G 显存）...",
+          file=sys.stderr)
+    status, out = api_post_form("/model/load", {}, timeout=HTTP_TIMEOUT)
+    if status == 409:
+        detail = out.get("detail") if isinstance(out, dict) else out
+        print(json.dumps({"ok": False, "reason": "generating", "detail": detail},
+                         ensure_ascii=False))
+        print("[model-load] 正在生成，服务端拒绝重复加载。等这次生成结束即可，"
+              "它已经加载好了。", file=sys.stderr)
+        return 1
+    if status >= 400 or not isinstance(out, dict) or not out.get("ok"):
+        print(json.dumps({"ok": False, "detail": out}, ensure_ascii=False))
+        print("[model-load] 加载失败：HTTP %s。" % status
+              + "看服务日志 logs/server.log，或先跑 doctor 定位（显存不足/模型文件缺失最常见）。",
+              file=sys.stderr)
+        return 1
+    elapsed = round(time.time() - t0, 1)
+    print(json.dumps({"ok": True, "loaded": bool(out.get("loaded", True)),
+                      "elapsed": elapsed}, ensure_ascii=False))
+    print("[model-load] 模型已加载（%.1fs），后续合成不用再等。" % elapsed, file=sys.stderr)
     return 0
 
 
@@ -1790,12 +1848,64 @@ def cmd_examples(args):
     return 0
 
 
+def _print_reading_notes(out, tag):
+    """把 /segments 的数字读法翻成一句可执行的提示（stderr，给人看）。"""
+    nums = out.get("numbers") or []
+    if not nums:
+        return
+    shown = nums[:10]
+    pairs = "；".join("%s→%s" % (n.get("text"), n.get("read")) for n in shown)
+    more = "" if len(nums) <= 10 else "（另有 %d 个）" % (len(nums) - 10)
+    print("[%s] 数字读音：%s%s" % (tag, pairs, more), file=sys.stderr)
+    print("[%s] 读法不对：glossary --add \"<原文>\" --zh \"<同音汉字>\" 后重新生成"
+          "（词表是服务端全局的，会影响别处）" % tag, file=sys.stderr)
+    if out.get("numbers_truncated"):
+        print("[%s] 数字太多，列表已截断；完整读法看 segments 输出。" % tag, file=sys.stderr)
+
+
+PREVIEW_MAX_SEGMENTS = 50
+
+
+def fetch_text_preview(text, seg_tokens=None, timeout=60):
+    """取 /segments 的预览（分段 + 规范化文本 + 数字读法）。
+
+    失败时返回 None：预览只是核对手段，不能因为它把真正的合成拦下来。
+    旧版服务端没有 numbers/normalized_text 字段时，其余字段照常可用。
+    """
+    fields = {"text": text}
+    if seg_tokens:
+        fields["max_text_tokens_per_segment"] = seg_tokens
+    try:
+        status, out = api_post_form("/segments", fields, timeout=timeout)
+    except (SystemExit, Exception):
+        return None
+    if status != 200 or not isinstance(out, dict):
+        return None
+    segs = out.get("segments") or []
+    return {
+        "count": len(segs),
+        "segments": [{"index": s.get("index"), "text": s.get("text")}
+                     for s in segs[:PREVIEW_MAX_SEGMENTS]],
+        "segments_truncated": len(segs) > PREVIEW_MAX_SEGMENTS,
+        "numbers": out.get("numbers") or [],
+        "numbers_truncated": bool(out.get("numbers_truncated")),
+        "normalized_text": out.get("normalized_text"),
+        "normalize_fallback": out.get("normalize_fallback"),
+    }
+
+
 def cmd_segments(args):
     text = args.text or (read_text_file(args.text_file) if args.text_file else "")
     if not text.strip():
         raise SystemExit("ERROR: empty text")
     _, out = api_post_form("/segments", {"text": text, "max_text_tokens_per_segment": args.seg_tokens})
     segs = out.get("segments") or []
+
+    # 每段的 text 是**规范化之后**的读法（数字/符号已展开），合成前核对的就是它。
+    print("[segments] 共 %d 段；每段 text 是模型实际会读的内容。" % len(segs), file=sys.stderr)
+    if out.get("normalize_fallback"):
+        print("[warn] 文本规范化失败，已退回原文（读音可能不标准）。", file=sys.stderr)
+    _print_reading_notes(out, "segments")
 
     if not getattr(args, "out", None):
         print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -2322,15 +2432,24 @@ def cmd_capabilities(args):
             "first_synth_seconds": "30~60（首次要加载模型）",
             "loaded_synth_seconds": "≈ 音频时长 × 1~3",
         },
+        "model_loading": {
+            "lazy": True,
+            "model_loaded_false_is_normal": True,
+            "trigger": ["synth", "batch", "doctor", "model-load"],
+            "do_not": "不要轮询 health 的 model_loaded 等它变 true；没有请求触发就不会加载",
+        },
         "commands": {
             "locate": "定位项目根；exit 3 = 需要用户给路径或先起服务",
             "health": "探活；连不上时带 reason(connection_refused/timeout/http_error/dns_error) 与 hints",
             "doctor": "端到端能力体检（含冒烟合成）；exit 0 = 可以开始生成",
             "presets": "预设清单", "examples": "内置示例音色",
             "preset-save": "把一段参考音频存成命名音色（之后 --preset 引用）",
-            "synth": "单条合成，stdout 一行 JSON", "batch": "批量合成，stdout 一份 manifest",
+            "synth": "单条合成，stdout 一行 JSON（默认带 preview 分段/数字读法）",
+            "batch": "批量合成，stdout 一份 manifest",
+            "segments": "分段预览 + 规范化文本 + 数字读音（不合成）",
             "tempo": "保音高变速，不占 GPU", "last": "找回最近一次产物",
             "model": "模型配置 + 是否正在生成（不占 GPU）",
+            "model-load": "显式触发加载（正常不需要：synth/batch/doctor 首次请求会自动加载）",
             "unload": "卸载模型释放显存（--force 可打断正在进行的生成）",
             "model-config": "改精度开关/扩散步数/CFG（精度类要 model-restart 才生效）",
             "model-restart": "按当前配置重建模型（30~60s，生成中 409）",
@@ -2669,6 +2788,22 @@ def cmd_synth(args):
             }, ensure_ascii=False))
         raise SystemExit(2)
 
+    # ---- 文本预检：把"模型实际会怎么读"回传给调用方 -------------------------
+    # 数字是最容易读错的一类（"5090显卡" → "五千零九十显卡"），而合成本身
+    # 不会报错。默认在生成前取一次 /segments，把分段与数字读法放进 stdout JSON，
+    # 让 agent 能当场核对（并提示用术语表纠正）。--no-preview 可关。
+    preview = None
+    if not getattr(args, "no_preview", False):
+        preview = fetch_text_preview(text, args.seg_tokens)
+        if preview is not None:
+            print("[synth] 分段预览：%d 段（每段 text 是模型实际读法）" % preview["count"],
+                  file=sys.stderr)
+            if preview.get("normalize_fallback"):
+                print("[warn] 文本规范化失败，已退回原文（读音可能不标准）。", file=sys.stderr)
+            _print_reading_notes(preview, "synth")
+        else:
+            print("[synth] 跳过分段预览（/segments 不可用，不影响生成）", file=sys.stderr)
+
     # ---- 全局合成锁：禁止并行生成 ---------------------------------------------
     lock = SynthLock(SYNTH_LOCK_PATH, wait_seconds=args.lock_wait)
     if not lock.acquire():
@@ -2712,6 +2847,7 @@ def cmd_synth(args):
             "voice": voice_ref,
             "out": str(out_path.resolve()),
             "server_path": server_path,
+            "preview": preview,
         }
         _write_last_output({
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -3229,6 +3365,10 @@ def build_parser():
     sp.add_argument("--json", action="store_true", help="print the raw /model JSON")
     sp.set_defaults(func=cmd_model)
 
+    sp = sub.add_parser("model-load", help="explicitly load the model (normally unnecessary: synth loads it)")
+    sp.add_argument("--no-start", action="store_true", help="fail instead of spawning server")
+    sp.set_defaults(func=cmd_model_load)
+
     sp = sub.add_parser("unload", help="unload the model to free VRAM")
     sp.add_argument("--force", action="store_true",
                     help="interrupt a running generation and unload (otherwise the server refuses with 409)")
@@ -3416,6 +3556,8 @@ def build_parser():
     sp.add_argument("--lock-wait", type=int, default=3600, metavar="SEC",
                     help="max seconds to wait for the global synth lock (default 3600; 0=fail fast if busy)")
     sp.add_argument("--no-start", action="store_true", help="fail instead of spawning server")
+    sp.add_argument("--no-preview", action="store_true",
+                    help="skip the pre-synthesis segment/number-reading preview (default: on)")
     sp.set_defaults(func=cmd_synth)
     return p
 

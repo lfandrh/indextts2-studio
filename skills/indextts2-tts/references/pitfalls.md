@@ -15,8 +15,31 @@
 | `http_error` | ③ 端口有监听但不返回 IndexTTS2 的 health |
 | `dns_error` | 主机名解析不了：改用 IP |
 
-`timeout`（有监听但 5 秒没应答）通常是**服务正在加载模型**，等 30~60 秒再探一次；
-一直超时再看显存/内存有没有被占满（第 9 章）。
+`timeout`（有监听但 5 秒没应答）说明进程在但**转不过来**：通常是刚启动还没绑好路由、或者正被一次
+生成占满（单锁，推理期间不响应新请求）。**不是"模型正在加载"**——模型懒加载，加载发生在 `/tts` 内部，
+期间请求本身就是那个长连接。等 30~60 秒再探一次；一直超时看显存/内存有没有被占满（第 9 章）。
+
+### ✅ 现象：Agent 起了服务后就一直等模型加载，永远等不到
+
+```
+GET /health -> {"status": "ok", "model_loaded": false}   # 然后死等 model_loaded 变 true
+```
+
+**原因**：模型是**懒加载**的。`/health` 返回 `model_loaded:false` 是**完全正常的空闲状态**，服务端
+没有任何后台线程会去加载模型——只有 `POST /tts`（含 `synth` / `batch` / `doctor` 的合成步骤）或
+显式 `POST /model/load` 才会触发。等服务自己变 `true` 就是死循环。
+
+**处理**：判断"服务可用"只看 `status: ok`，**不看** `model_loaded`。下一步直接生成：
+
+```bash
+python tts_client.py health     # 返回的 note 字段会再次说明这点
+python tts_client.py synth --text "要合成的文本" --voice <音色>
+# 想先预加载（比如给用户一个"准备中"提示）：
+python tts_client.py model-load
+```
+
+v1.2.5 起：`health` 在未加载时给 `note`，`ensure` 会明确打印"模型尚未加载，这是正常的"，
+`status` / `model` 的未加载行也写明了触发方式和"不要等"。
 
 ### ✅ 现象：连本地服务却返回 `502 upstream connect failed`
 
@@ -191,6 +214,7 @@ v1.1.0 起脚本启动时会把非 tty 的 stdout/stderr 固定成 UTF-8（`erro
 文本规范化失败，退回了原文。**音频仍然生成**，但多音字/数字/符号的读音可能不标准。
 
 **处理**：读 `done` 事件的 `normalize_fallback`，非 null 时提示用户核对读音。
+想提前发现就别等合成完：`segments` / `synth` 的预览里已经带了同一个字段（失败时退回原文的提示）。
 
 ### ✅ `interval_silence` 越界被静默夹取
 
@@ -448,14 +472,23 @@ python tts_client.py model-restart --w2v-fp16 on
 预处理（分离人声、降噪）比调参数有效得多 —— `emo_weight`、`temperature` 这些
 动的是"情感"和"随机性"，救不了脏输入，只会让结果更不可预测。
 
-### 现象：「重庆」读成 chóng qìng、「2026」读成「二零二六」
+### 现象：「重庆」读成 chóng qìng、「2026」读成「二零二六」、`5090显卡` 读成「五千零九十显卡」
 
 **原因**：文本规范化的局限，不是模型坏。多音字、阿拉伯数字、英文缩写在送进模型前
-会被规则处理，规则没覆盖到就按默认读法。
+会被规则处理，规则没覆盖到就按默认读法。`5090显卡` 这种"数字直接贴中文"的最常见，
+`tn` 会把整串按数量读成"五千零九十"，而不是逐位读"五零九零"。
 
-**处理**：用术语表把词改写成"读出来就是对的"写法：
+**处理**：先看模型到底会怎么读，再决定要不要改：
 
 ```bash
+python tts_client.py segments --text "5090显卡，2026年发布"
+# 输出里的 numbers 直接给「原文→读法」，segments[].text 是模型真正会念的内容
+```
+
+读法不对就用术语表把词改写成"读出来就是对的"写法：
+
+```bash
+python tts_client.py glossary --add "5090" --zh "五零九零"
 python tts_client.py glossary --add "重庆" --zh "虫庆"
 python tts_client.py glossary --add "2026" --zh "二零二六年"
 python tts_client.py glossary --delete "重庆"     # 删
@@ -463,11 +496,17 @@ python tts_client.py glossary                     # 看当前词表
 ```
 
 - `--zh` 填**同音汉字**，不是拼音。它是在送模型前做文本替换。
+- 数字/英文术语**直接贴中文也能命中**（`5090显卡`、`TTS技术` 都行）——v1.2.5 起术语边界只按
+  ASCII 字母数字判断，以前用的 Unicode `\w` 把中文也算成"词内字符"，导致这类术语永远匹配不上。
+  反过来 `ATTS` 里的 `TTS` 仍不会误命中，`C++` 里的 `C` 也不会。
 - 词表是**服务端全局**的：`POST /api/v1/glossary` 落到 `<模型目录>/glossary.yaml`，
   由服务端 normalizer 统一替换。**前端页面、别的 Skill、别的项目会一起变**——
   不是"只影响我这一个调用方"。加词前想一下会不会误伤别人的稿子。
 - 换机器 / 换整合包，词表各是各的（跟着模型目录走）。
 - 别加太短的词（`"C"`、`"了"`），会和别的词连锁误伤（见第 5 章 `cascade`）。
+
+**别等生成完再发现读错**：`synth` 默认会把分段预览和数字读法打出来（stdout 的 `preview`、
+stderr 的 `[synth] 数字读音：…`），长稿交给用户之前先扫一眼这一行，比返工重生成便宜得多。
 
 ---
 
@@ -542,12 +581,13 @@ python tts_client.py api              # 整合包版本和脚本适配的接口�
 改了脚本本身？先跑离线测试，它不需要 GPU：
 
 ```bash
-python tests/test_client.py           # 38 项，约 25 秒
+python tests/test_client.py           # 47 项，约 25 秒
 ```
 
 合成成功后按这个顺序验，能挡住绝大多数"看起来成功其实废了"：
 
 - [ ] 生成前已向用户确认音色（或用户明确给了 `--voice`）
+- [ ] 看过 `preview` / `[synth] 数字读音`，数字和专有名词的读法已确认或已加术语表
 - [ ] SSE 收到了 `done`（不是 `stopped`，也不是流断在半路）
 - [ ] `mel_capped` 为 `false`
 - [ ] `normalize_fallback` 为 `null`

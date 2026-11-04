@@ -3472,12 +3472,60 @@ def segments_preview(request: Request, text: str = Form(""), max_text_tokens_per
     # 词元拼回可读文本的实现在 indextts/utils/subtitle.py，与字幕共用一份。
     # 这里以前是 `"".join(seg).replace("▁", "")`：英文词元带词首标记（▁I ▁LOVE），
     # 直接删掉▁会把单词粘成 ILOVE，预览看不出到底念了什么。
+    #
+    # 额外返回 normalized_text 与 numbers：模型读的是规范化之后的文本，
+    # 而数字是最高频的出错点（"5090显卡" 会被读成"五千零九十显卡"）。
+    # 调用方据此在合成前就能核对读法，读错了用术语表纠正后再生成。
+    normalizer = tts.normalizer
+    normalized_text = normalizer.normalize(text)
+    # 必须先取：_number_readings 里还会调 normalize（每次调用都会复位
+    # normalize_fallback），放在后面读就变成"最后一个数字片段"的状态了。
+    normalize_fallback = normalizer.normalize_fallback
+    numbers, truncated = _number_readings(normalizer, text)
     return JSONResponse({
         "segments": [
             {"index": i, "text": tokens_to_readable(s)[0], "tokens": len(s)}
             for i, s in enumerate(segs)
         ],
+        "normalized_text": normalized_text,
+        "numbers": numbers,
+        "numbers_truncated": truncated,
+        "normalize_fallback": normalize_fallback,
     })
+
+
+# 数字读音提示用的匹配范围：连续数字（含小数/千分位/时间冒号）、百分号，
+# 再加一个可能改变读法的中文单位（"2026年" 读"二零二六年"，而裸 "2026"
+# 会读成"两千零二十六"）。只做提示，不参与实际合成。
+_NUMBER_HINT_RE = re.compile(r"\d+(?:[.,:]\d+)*(?:[%％])?[年月日号点岁元块万亿千百十]?")
+_NUMBER_HINT_MAX = 50
+
+
+def _number_readings(normalizer, text: str):
+    """返回 (数字读法列表, 是否被截断)。
+
+    每项是 {"text": 原文片段, "read": 规范化后的读法}。读法是单独规范化
+    这个片段得到的，语境可能略有差别（比如 "8:00 AM" 单独读"八点"、
+    整句读"上午八点"），完整语境以 segments 里的文本为准——这里的作用
+    是让调用方一眼看到"模型到底会怎么念这个数字"，方便判断要不要加术语表。
+    """
+    items, seen = [], set()
+    truncated = False
+    for m in _NUMBER_HINT_RE.finditer(text):
+        raw = m.group(0)
+        if raw in seen:
+            continue
+        seen.add(raw)
+        try:
+            read = (normalizer.normalize(raw) or "").strip()
+        except Exception:
+            read = ""
+        if read and read != raw:
+            if len(items) >= _NUMBER_HINT_MAX:
+                truncated = True
+                break
+            items.append({"text": raw, "read": read})
+    return items, truncated
 
 
 # ---- 字幕（段级） -----------------------------------------------------------

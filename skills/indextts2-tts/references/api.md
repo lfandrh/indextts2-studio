@@ -13,6 +13,7 @@
 | `GET /health` | `health` |
 | `GET /status` | `status [--json]` |
 | `GET /model` | `model [--json]` |
+| `POST /model/load` | `model-load`（显式加载；正常由首个 `/tts` 自动触发） |
 | `POST /model/unload` | `unload [--force]` |
 | `POST /model/config` | `model-config --diffusion-steps N --cfg-rate R --w2v-fp16 on\|off …` |
 | `POST /model/restart` | `model-restart [同上的配置参数]`（重建模型，30~60s） |
@@ -26,7 +27,7 @@
 | `GET /history` | `history` |
 | `GET /glossary` / `POST /glossary` / `DELETE /glossary/{term}` / `DELETE /glossary` | `glossary [--add/--delete/--clear --yes]` |
 
-其余接口（`POST /model/load`、预设改名复制删除、历史清理、`/jobs/*`、`/metrics`、`/prefs/*`、
+其余接口（预设改名复制删除、历史清理、`/jobs/*`、`/metrics`、`/prefs/*`、
 `/save-dir/*`、`/lf/*` 长篇台本、`/lf/tl/*` 时间轴）没有封装，需要时按下面的字段直接打 HTTP。
 想知道你的整合包比这份清单多了什么，跑 `tts_client.py api`。
 
@@ -303,6 +304,26 @@ outputs/presets/胡桃/
 `Content-Type` 也没有表单时给 **422**「缺少 text 表单字段」，而带了表单但 `text` 为空则正常返回
 `{"segments": []}`——空数组只表示"这段文本确实切不出段"，不再兼作"你没传参数"。
 `max_text_tokens_per_segment` 按 `/tts` 同一区间夹取，不做硬拒。
+
+**`POST /segments` 的响应里还带规范化和数字读法**（v1.2.5 起），用来在合成前发现"读错字"：
+
+```json
+{
+  "segments": [{"index": 0, "text": "五零九零显卡,值得买", "tokens": 18}],
+  "normalized_text": "五零九零显卡,值得买",
+  "numbers": [{"text": "5090", "read": "五千零九十"}],
+  "numbers_truncated": false,
+  "normalize_fallback": null
+}
+```
+
+- `segments[].text` 是**模型实际会读的内容**（规范化后、术语表替换后），不是原始输入；
+- `numbers` 是逐个数字片段单独规范化的结果（最多 50 条，超出置 `numbers_truncated=true`），
+  **只作提示**——真正的读音以上下文里的 `segments[].text` 为准；
+- `normalize_fallback` 非 null 表示规范化整条失败退回了原文，读音可能不标准。
+
+`synth` 默认先调一次 `/segments` 并把同样的内容放进 stdout 的 `preview` 字段（`--no-preview` 跳过）；
+`/segments` 不可用时跳过预览，不影响合成。
 
 **`POST /glossary` 同一术语再次提交时按列合并**：只填 `reading_zh` 就只改中文读法，`reading_en` 沿用原值
 （反之亦然）；两列都填则都替换。以前是整体覆盖，未提交的那一列被静默清空——条目还在、读法少了一半、界面

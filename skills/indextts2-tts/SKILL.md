@@ -1,7 +1,7 @@
 ---
 name: indextts2-tts
-version: 1.2.4
-description: 调用 IndexTTS2 HTTP 服务做零样本语音合成（音色克隆）时使用。覆盖：项目目录定位（三条路：用户给路径 / 启动服务后反查端口 / 没有整合包则引导去 B 站获取）、端到端能力体检（doctor：探活+接口+冒烟合成+变速+显存与磁盘余量，确认"现在就能出声"）、能力清单（capabilities，供上游 Skill 发现音色与限制）、单条与批量合成（batch：几十上百句一次跑完、id 撞车提前拦截、单条失败不中断、按内容指纹断点续跑、只重跑改动句、manifest 逐条落盘、统一变速、回传每句时长）、预设系统（参考音频+参数一键复用，生成前强制向用户确认音色）、四种情感控制模式（同参考音频/情感音频/8维向量/情感文本）、内置示例音色（本地缺文件自动下载）、长文本分段、SSE 事件流解析、保音高变速（tempo，不重新合成）、术语词汇表（多音字/数字/缩写读音纠错）、防并行合成锁、生成音频找回、只读自检、无头模式（INDEXTTS_HEADLESS，给视频配音等上游 Skill 调用）。含故障排查：显存不足与 OOM（8G 卡两种表现）、音色不像/带杂音的输入检查、中断后重跑排队、磁盘满。支持本机/远程/Docker/便携整合包部署，配置全走环境变量。**交互约定：本会话第一句话必须先讲清这个 skill 能干什么、流程有哪四步，再讲你接下来要做什么；之后每一步动手前先说一句正在做什么、大概多久；定位项目（locate）只跑一次，失败就把三条路摆给用户选，不要重试或扫盘。** 触发词：IndexTTS、indextts2、语音合成、TTS、音色克隆、参考音频、预设合成、情感向量、语速调整、变速、批量配音、视频配音、有声书、整合包、项目在哪、找不到项目、能不能用、体检、显存不足、OOM、变慢、声音不像、有杂音、读音错、多音字。
+version: 1.2.5
+description: 调用 IndexTTS2 HTTP 服务做零样本语音合成（音色克隆）时使用。覆盖：项目目录定位（三条路：用户给路径 / 启动服务后反查端口 / 没有整合包则引导去 B 站获取）、端到端能力体检（doctor：探活+接口+冒烟合成+变速+显存与磁盘余量，确认"现在就能出声"）、能力清单（capabilities，供上游 Skill 发现音色与限制）、单条与批量合成（batch：几十上百句一次跑完、id 撞车提前拦截、单条失败不中断、按内容指纹断点续跑、只重跑改动句、manifest 逐条落盘、统一变速、回传每句时长）、预设系统（参考音频+参数一键复用，生成前强制向用户确认音色）、四种情感控制模式（同参考音频/情感音频/8维向量/情感文本）、内置示例音色（本地缺文件自动下载）、长文本分段、分段与数字读音预览（合成前核对模型实际读法，数字读错用术语表纠正）、SSE 事件流解析、保音高变速（tempo，不重新合成）、术语词汇表（多音字/数字/缩写读音纠错）、防并行合成锁、生成音频找回、只读自检、无头模式（INDEXTTS_HEADLESS，给视频配音等上游 Skill 调用）。含故障排查：模型懒加载语义（model_loaded=false 不是"正在加载"，不要轮询等待）、显存不足与 OOM（8G 卡两种表现）、音色不像/带杂音的输入检查、中断后重跑排队、磁盘满。支持本机/远程/Docker/便携整合包部署，配置全走环境变量。**交互约定：本会话第一句话必须先讲清这个 skill 能干什么、流程有哪四步，再讲你接下来要做什么；之后每一步动手前先说一句正在做什么、大概多久；定位项目（locate）只跑一次，失败就把三条路摆给用户选，不要重试或扫盘。** 触发词：IndexTTS、indextts2、语音合成、TTS、音色克隆、参考音频、预设合成、情感向量、语速调整、变速、批量配音、视频配音、有声书、整合包、项目在哪、找不到项目、能不能用、体检、显存不足、OOM、变慢、声音不像、有杂音、读音错、多音字、数字读错、模型没加载、一直加载中。
 agent_created: true
 ---
 
@@ -9,13 +9,19 @@ agent_created: true
 
 **一句话**：合成入口是 `POST {INDEXTTS_URL}/api/v1/tts`（multipart/form-data，必传参考音频 `spk_audio`），返回 SSE 事件流，`done` 事件里带 wav 下载 URL。
 
-**版本**：`python "$CLIENT" --version`（写作时 1.2.4）。排障第一步先要版本 ——
+> **最重要的一条：模型是懒加载的。**
+> 服务起来之后，`health` / `status` / `model` 里的 `model_loaded:false` 是**正常状态**，
+> 不存在“正在加载、等一会儿就好”的阶段。不主动发合成请求，它永远不会自己加载。
+> 要加载模型只有三种做法：**直接 `synth` / `batch`**、**跑 `doctor`**、或显式 **`model-load`**。
+> **绝对不要轮询 `model_loaded` 等它变 true**——那会卡死在启动之后。
+
+**版本**：`python "$CLIENT" --version`（写作时 1.2.5）。排障第一步先要版本 ——
 skill 有两份副本（用户级 `~/.workbuddy/skills/` 与项目内 `skills/`），没版本号
 既判断不了用户装的是哪一版，也看不出两份是否漂移。
 
 **优先用本 skill 自带的 `scripts/tts_client.py`**（纯标准库，零依赖，Python 3.10+）。它已封装：服务探活与启动（失败打日志尾部）、预设确认守卫、防并行文件锁、SSE 解析、中文路径下载、示例音色自动下载、保音高变速、音频找回、统一错误信息。不要手搓 HTTP 请求，除非你要调用的能力脚本没覆盖（清单见下文「这个脚本不做什么」）。
 
-## 五条硬规则（第 2~4 条由脚本强制，第 0~1 条是交互契约）
+## 六条硬规则（第 2~4 条由脚本强制，第 0~1、5 条是交互契约）
 
 0. **第一句话先讲这个 Skill 是干什么的**。用户刚调用本 skill 时，他只知道"点了个东西"，
    不知道这东西能帮他做什么。所以**本会话的第一次响应，必须先介绍能力与流程**（话术见
@@ -32,6 +38,10 @@ skill 有两份副本（用户级 `~/.workbuddy/skills/` 与项目内 `skills/`�
 2. **生成前必须确认音色**。`synth` 既没 `--preset` 也没 `--voice` 时，打印候选清单并以**退出码 2** 中止。agent 必须停下来向用户询问，不允许自行挑一个。
 3. **禁止并行生成**。服务端是全局单锁 + 队列，并发请求只会排队；客户端再加一把文件锁（`--lock-wait` 秒，默认排队 3600s，`0` 表示抢不到立即失败）避免多条命令互相挂死。
 4. **音频必须可找回**。不传 `--out` 时落到 `<输出目录>/<YYYYMMDD>/<服务端文件名>` 并写 `last.json`；`last` 子命令随时找回最近一次。
+5. **不要等模型加载**。`ensure` 只保证 HTTP 服务起来了，`model_loaded:false` 不是错误、也不是进度条。
+   任何“先等模型加载好再开始”的写法都是死循环：没有 `/tts` 请求触发，模型不会自己加载。
+   下一步直接 `doctor` / `synth` / `batch`，或 `model-load`；这三条都会阻塞到加载完成再返回。
+   脚本在 `health` / `status` / `model` / `ensure` 的输出里都带了这句提示，看到就照做，不要自己加轮询。
 
 ## 配置：全部走环境变量，无硬编码路径
 
@@ -226,6 +236,10 @@ python "$CLIENT" ensure      # 已在跑直接返回；没在跑则后台拉起�
 
 服务起来了要**说一声再进下一步**（"服务起来了"），别闷头继续。
 
+**服务起来 ≠ 模型已加载。** `ensure` / `health` 返回 `model_loaded:false` 是懒加载的正常状态，
+不是“正在加载”。下一步 `doctor`（或直接 `synth` / `batch`）才会真正加载模型；
+**不要在这里停下来等模型**，也不要去查 `model_loaded` 轮询——它不会自己变。
+
 ### Step 2 — 能力体检：确认"现在就能出声"
 
 **这一步必须提前报预期**——首次要加载模型，用户会盯着界面等 30~60 秒：
@@ -279,6 +293,28 @@ python "$CLIENT" examples    # 没有预设时：内置示例音色（可直接�
   ```
   同名默认拒绝（`reason: exists`）；确认要换掉旧的就加 `--overwrite`，不要默认覆盖。
 
+### Step 3.5 — 文本预检：先看模型会怎么读（合成前必做）
+
+拿到文稿后、合成前，先跑一次分段预览。它返回**规范化之后的读法**（数字、符号已经展开成模型实际会念的字），
+还有一张数字读法表。合成前核对，比生成完再返工便宜得多。
+
+```bash
+python "$CLIENT" segments --text-file 稿子.txt          # 或 --text "..."
+python "$CLIENT" segments --text-file 长文.txt --out tasks.json --preset "胡桃"   # 长文顺便落批量清单
+```
+
+- 把 `numbers` 里的 `原文→读法` **念给用户核对**，例如 `5090→五千零九十`、`2026年→二零二六年`。
+- **数字是最高频的读错点**，尤其显卡型号、价格、编号这类不该按基数词读的内容：
+  `5090显卡` 会被读成“五千零九十显卡”。读法不对就用术语表改写成同音汉字：
+  ```bash
+  python "$CLIENT" glossary --add "5090" --zh "五零九零"
+  python "$CLIENT" segments --text-file 稿子.txt        # 复核
+  ```
+  术语紧贴中文（`5090显卡`、`TTS技术`）现在也能命中，不需要把整句写进词表。
+- 词表是**服务端全局**的：加之前确认不会误伤别的项目；只想改这一次就直接改写稿子本身。
+- 文本 ≤ 20 字且不含数字/英文缩写时可以跳过这一步；`synth` 仍会在输出 JSON 里带回 `preview`。
+- `batch` **不逐条**做预览。长文/多句请先用本步的 `segments` 看全文读法，再生成清单。
+
 ### Step 4 — 合成
 
 **合成前报一句预期**（长文本能跑一分钟以上，不打招呼会像卡死）：
@@ -303,6 +339,9 @@ python "$CLIENT" synth --voice v.wav --emo-mode 2 \
 ```
 
 - 阻塞到生成结束；stdout 输出**一行 JSON**，进度走 stderr。
+- **生成前会自动取一次分段预览**，放在 `preview` 字段里（`count` / `segments` / `numbers` /
+  `normalized_text`）；stderr 也会打 `[synth] 数字读音：5090→五千零九十`。
+  把数字读法转述给用户；读法不对就按 Step 3.5 加词表后重跑。不要预览时加 `--no-preview`。
 - `mel_capped=true` 表示音频触到 `max_mel_tokens` 被静默截断 —— 必须告诉用户并建议分段或调大上限。
 - CLI 显式传入的参数**优先于**预设里的值。
 - 用了与 `emo_mode` 不匹配的情感参数（如没给 `--emo-mode 2` 却传 `--emo-vector`）时，
@@ -327,6 +366,7 @@ python "$CLIENT" synth --voice v.wav --emo-mode 2 \
 | `--seg-tokens N` | 每段 token 上限（默认 120） |
 | `--lock-wait SEC` | 等锁上限，`0` = 抢不到立即失败 |
 | `--no-start` | 服务没在跑就报错，不自动拉起 |
+| `--no-preview` | 跳过生成前的分段/数字读音预览（默认会取；预览失败不影响生成） |
 
 ### Step 4b — 语速不对？先别重新合成
 
@@ -388,6 +428,7 @@ python "$CLIENT" model-restart --w2v-fp16 on --diffusion-steps 20   # 一步改�
 | `health` | `GET /health`。连得上输出 `{ok, origin, health}`；**连不上额外带 `reason` + `detail` + `hints`**（见下方「health 说不上话时怎么看」） |
 | `status [--json]` | 模型状态 + 显存/内存/CPU 仪表（默认人话，`--json` 给原始响应） |
 | `model [--json]` | 模型自己的配置（精度开关 / 扩散步数 / CFG）+ **是否正在生成**。不占 GPU |
+| `model-load` | **显式触发加载**（30~60s）。正常不需要：`synth`/`batch`/`doctor` 首次请求会自动加载；只在“必须先加载好再干别的”的编排里用。生成中 409 |
 | `model-config --diffusion-steps 20 --cfg-rate 0.6` | 改运行配置，不重建模型。**采样参数下次生成生效；精度开关只写配置，要重启才生效** |
 | `model-restart [--diffusion-steps N] [--w2v-fp16 on\|off]` | 按当前配置重建模型（可顺带改配置），30~60s；生成中服务端 409，无 force 通道 |
 | `unload [--force]` | 卸载模型释放显存。生成中服务端会拒绝（409）；`--force` 才打断当前生成 |
@@ -395,8 +436,8 @@ python "$CLIENT" model-restart --w2v-fp16 on --diffusion-steps 20   # 一步改�
 | `preset-save --name X --audio Y [--overwrite]` | 把一段参考音频存成命名音色（可带 `--emo-mode/--emo-text/--emo-vector` 与采样参数）；同名默认拒绝，`--overwrite` 才覆盖 |
 | `examples` | 内置示例音色清单（名字可直接喂给 `--voice`） |
 | `choose` | tty 下交互选预设；非 tty 打印候选并以退出码 2 退出 |
-| `segments --text "..." [--out tasks.json]` | 长文本分段预览（不合成）；`--out` 可直接产出 batch 能吃的清单（配 `--preset/--voice/--rate` 写进 defaults） |
-| `synth ...` | 合成（见上） |
+| `segments --text "..." [--out tasks.json]` | 分段预览（不合成）：每段 `text` 是**模型实际读法**，另带 `normalized_text` 与 `numbers`（数字 `原文→读法`）；`--out` 可直接产出 batch 能吃的清单（配 `--preset/--voice/--rate` 写进 defaults） |
+| `synth ...` | 合成（见上）；默认带回 `preview` 分段/数字读法，`--no-preview` 关闭 |
 | `tempo --file X --rate 1.2` | 保音高变速，不重新合成、不占 GPU |
 | `stop <job_id> [--keep-model]` | 停止任务；`--keep-model` 保留已加载模型 |
 | `last [--open]` | 找回最近一次生成 |
@@ -407,14 +448,13 @@ python "$CLIENT" model-restart --w2v-fp16 on --diffusion-steps 20   # 一步改�
 | `api [--json] [--strict]` | **接口对账**：拉服务端 `openapi.json`，和脚本已适配的接口清单比对。列出"服务端有但没适配"与"脚本在调但服务端没有"，并按 longform/timeline 分层归类 |
 | `batch [-f tasks.json] [--resume\|--resume-any] [--only id] [--rate 1.1] [--fail-fast]` | 批量合成；`--resume` 按**内容指纹**跳过（文本/音色/参数/变速没变才跳），`--only` 只重跑指定句，manifest 逐条落盘，单条失败不中断 |
 | `selftest` | 只读自检（不合成） |
-| `--version`（全局） | 打印 skill 版本，如 `indextts2-tts 1.2.4` |
+| `--version`（全局） | 打印 skill 版本，如 `indextts2-tts 1.2.5` |
 
 ### 这个脚本**不**做什么
 
 - 预设的删除 / 改名 / 复制（`DELETE /presets/{name}`、`/rename`、`/duplicate`）：AI 判断不了
   哪个音色该留、该叫什么名字，这类整理归人。
 - 历史清理（`DELETE /history*`、`POST /history/config`）：不可回溯，不交给 agent。
-- `POST /model/load`：没封装，因为不需要——`ensure` 拉服务、`synth`/`batch` 首次请求都会自动加载。
 - 长篇台本工作台（`/lf/*`，81 个接口）和多轨时间轴（`/lf/tl/*`，31 个接口）：那是 WebUI 的
   编辑工程层（素材处理、分轨混音、工程存档），和"文字出语音"不是一层。
 - `GET /jobs/*`：都强制要 `client_id`，那是浏览器标签页生成的，脚本拿不到，调了也是 400。
@@ -429,7 +469,7 @@ python "$CLIENT" model-restart --w2v-fp16 on --diffusion-steps 20   # 一步改�
 | `reason` | 含义 | 该做什么 |
 |---|---|---|
 | `connection_refused` | 端口没人监听 | 服务没启动 → 让用户双击 `start_server.bat`，或跑 `ensure`；也可能是 `INDEXTTS_URL` 端口写错 |
-| `timeout` | 有人监听但 5 秒没应答 | 服务正在加载模型（首次 30~60s），等一下；一直这样就看 GPU/内存是否被占满 |
+| `timeout` | 有人监听但 5 秒没应答 | 进程在但转不过来（刚启动没绑好路由，或正被一次生成占满），等 30~60s 再探；**不是模型加载**（懒加载发生在 `/tts` 内部，不会让探活超时） |
 | `http_error` | 端口有 HTTP 服务，但它不是 IndexTTS2 | 端口被别的程序占了（`detail` 里能看到对方返回什么），换端口或停掉占用进程 |
 | `dns_error` | 主机名解析不了 | 改用 IP，或检查网络/代理 |
 
@@ -445,9 +485,10 @@ headless 模式下 2 和 3 会**额外在 stdout 给结构化 JSON**（`need` + 
 **不需要 GPU、不需要真服务，10 秒跑完**：
 
 ```bash
-python tests/test_client.py          # 38 项：续跑指纹、id 冲突、manifest、--only、旧代码页编码、
+python tests/test_client.py          # 47 项：续跑指纹、id 冲突、manifest、--only、旧代码页编码、
                                      #      存音色同名保护、unload 409、模型配置键校验、openapi 对账、
-                                     #      health 失败原因分类、doctor summary 的两个时间…
+                                     #      health 失败原因分类、doctor summary 的两个时间、
+                                     #      懒加载提示 / model-load / 分段数字读法预览…
 ```
 
 覆盖的都是"改一行就可能悄悄坏掉"的契约：退出码、stdout JSON 字段、`--resume` 语义、
@@ -458,7 +499,7 @@ manifest 落盘、中文在 cp936/cp1252 管道下的输出。改完脚本先跑
 
 | 事实 | 值 |
 |---|---|
-| 模型加载 | **懒加载**：首个 `/tts` 请求才载入 GPU，约 30~60s |
+| 模型加载 | **懒加载**：首个 `/tts`（或显式 `POST /model/load`）才载入 GPU，约 30~60s。`model_loaded:false` 是启动后的正常状态，**不要轮询等待**——没有请求触发就不会加载 |
 | 模型驻留 | 加载后**一直驻留**，不会空闲自动卸载。要释放显存需显式 `POST /model/unload`（前端「模型管理」页） |
 | 显存占用 | 8G 卡加载后约 6.7 G，余 1.3 G 属正常；余量低于 1.2 G 时长文本明显变慢，再低会借共享显存（慢十倍但不报错） |
 | 并发 | 服务端全局单锁 + 队列串行推理；客户端另加文件锁 |
@@ -503,16 +544,22 @@ manifest 落盘、中文在 cp936/cp1252 管道下的输出。改完脚本先跑
 
 ### 二、读音不对（多音字 / 数字 / 英文缩写）
 
-"重庆"读成 chóng qìng、"2026"读成"二零二六"、iPhone 读成 i-p-h-o-n-e ——
+"重庆"读成 chóng qìng、"5090显卡"读成"五千零九十显卡"、iPhone 读成 i-p-h-o-n-e ——
 这是文本规范化的局限，**不是模型坏**。用术语表把它改写成"读出来就是对的"写法：
 
 ```bash
+# 先在生成前看模型会怎么读（numbers 里直接给 原文→读法）
+python "$CLIENT" segments --text-file 稿子.txt
+
+# 读法不对 → 用同音汉字覆盖
 python "$CLIENT" glossary --add "重庆" --zh "虫庆"
-python "$CLIENT" glossary --add "2026" --zh "二零二六年"
+python "$CLIENT" glossary --add "5090" --zh "五零九零"
 python "$CLIENT" glossary                  # 看当前词表
 python "$CLIENT" glossary --delete "重庆"  # 删掉
 ```
 
+- 术语**紧贴中文也能命中**：`5090显卡`、`TTS技术` 这类写法直接加 `5090` / `TTS` 即可，
+  不需要把整句写进词表。
 - `--zh` 填**同音汉字**，不是拼音 —— 词表是在送进模型前做文本替换。
 - **词表是服务端的、全局的**：`POST /api/v1/glossary` 写进
   `<模型目录>/glossary.yaml`，由服务端 normalizer 在每次规范化时统一替换。
@@ -558,6 +605,12 @@ python "$CLIENT" glossary --delete "重庆"  # 删掉
 20. **manifest 默认落盘**（`<outdir>/<日期>/manifest.json`，每完成一条刷新一次）：
     批量跑到 80/100 被 Ctrl-C，前 79 条的时长和路径都在，配 `--resume` 接着跑即可。
     `--no-manifest` 关掉，`--manifest-out` 换路径。
+21. **`model_loaded` 不会自己变 true**：模型懒加载，`ensure`/`health` 之后一直是 `false`，
+    直到有 `/tts` 或 `/model/load` 请求。看到 `false` 的正确反应是“下一步直接生成”，
+    不是“再等 30 秒”；循环查状态会永远等下去。
+22. **数字读错不会让合成失败**：`5090显卡` 读成“五千零九十显卡”时音频照样生成、退出码 0。
+    生成前用 `segments` 看 `numbers`，或看 `synth` 输出里的 `preview.numbers`；
+    读法不对用 `glossary --add "5090" --zh "五零九零"` 纠正（术语紧贴中文也能命中）。
 
 ## 被其他 Skill 调用（视频配音 / 有声书 / 批处理）
 
@@ -587,6 +640,13 @@ python "$CLIENT" glossary --delete "重庆"  # 删掉
 3. **批量用 `batch`，不要循环调 `synth`**。每调一次 `synth` 都要重新探活 + 抢一次文件锁，
    几十条叠起来固定开销比推理本身还贵。
 
+另外：`synth` 默认会先调一次 `/segments`，把 `preview`（分段文本 + 数字读音）放进 stdout JSON，
+供上游在合成前做文本校对；不需要时加 `--no-preview` 省掉这次请求。`batch` 不做逐条预览。
+
+关于模型加载：headless 编排里如果必须先确认“模型已加载”，用 `model-load`，**不要**轮询
+`health.model_loaded`。`health` 返回 `model_loaded:false` 只代表“还没人请求过”，
+不代表加载失败或正在进行。
+
 ### batch 的输入输出
 
 输入（`-f tasks.json`；省略或 `-` 读 stdin）：
@@ -613,7 +673,7 @@ python "$CLIENT" glossary --delete "重庆"  # 删掉
 输出（stdout 一行 JSON，同时**逐条落盘**到 `<outdir>/<日期>/manifest.json`）：
 
 ```json
-{"ok":false,"skill_version":"1.2.4","source":"tasks.json","manifest":".../manifest.json",
+{"ok":false,"skill_version":"1.2.5","source":"tasks.json","manifest":".../manifest.json",
  "count":3,"done":2,"skipped":0,"failed":1,"not_run":0,"interrupted":false,
  "filtered_out":0,"only":null,"total_audio_seconds":7.2,"failed_ids":["line_003"],
  "items":[{"id":"line_001","ok":true,"out":"...","duration":2.41,"sample_rate":22050,"rate":1.0},
