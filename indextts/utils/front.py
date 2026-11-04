@@ -19,10 +19,12 @@ def get_term_pattern(term: str):
     """编译术语匹配正则（模块级缓存，避免每条文本重复编译）。
 
     边界策略：只对纯 ASCII 的单词型术语补边界断言，否则 "TTS" 会命中
-    "ATTS"。边界字符集是 ``[\\w+]`` 而不是 ``\\w``——``+`` 不是单词字符，
-    只用 ``\\w`` 的话 "C" 会命中 "C++" 里的 C（那是个运算符，不是字母）。
-    含中文等非 ASCII 字符的术语不加边界——中文没有词边界，加了会让
-    "人工智能" 匹配不到 "人工智能技术" 这类连用场景。
+    "ATTS"。边界字符集必须是 ASCII（``[A-Za-z0-9_+]``）而不是 ``\\w``：
+    Python 的 ``\\w`` 默认匹配 Unicode，汉字也算单词字符，于是
+    "5090显卡" 里的 "5090"、"TTS技术" 里的 "TTS" 全都被边界挡住——
+    术语表写了也不生效。``+`` 放进边界是为了让 "C" 不命中 "C++" 里的 C
+    （那是个运算符，不是字母）。含中文等非 ASCII 字符的术语不加边界——
+    中文没有词边界，加了会让 "人工智能" 匹配不到 "人工智能技术" 这类连用场景。
 
     空词条返回 None（由调用方跳过）：术语表是用户可手写的，空 key 会让
     这里的 term[0] 抛 IndexError，进而让整条文本规范化链崩掉。
@@ -31,10 +33,10 @@ def get_term_pattern(term: str):
         return None
     pattern = re.escape(term)
     if term.isascii():
-        if re.match(r"\w", term[0]):
-            pattern = r"(?<![\w+])" + pattern
-        if re.match(r"\w", term[-1]):
-            pattern = pattern + r"(?![\w+])"
+        if re.match(r"[A-Za-z0-9_]", term[0]):
+            pattern = r"(?<![A-Za-z0-9_+])" + pattern
+        if re.match(r"[A-Za-z0-9_]", term[-1]):
+            pattern = pattern + r"(?![A-Za-z0-9_+])"
     return re.compile(pattern, re.IGNORECASE)
 
 
