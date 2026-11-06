@@ -1529,6 +1529,7 @@ async function updateSegments() {
   const fd = new FormData();
   fd.append("text", text);
   fd.append("max_text_tokens_per_segment", $("segTokens").value);
+  glAppendScenario(fd);
   try {
     const r = await fetch(`${API}/segments`, { method: "POST", body: fd });
     // 服务端报错（500 / 分词器加载失败 / 代理返回 HTML）时不判 ok，
@@ -1819,6 +1820,10 @@ function updateGenSummary() {
     curPresetName ? `预设: ${curPresetName}` : "预设: 无",
     `采样: temp ${Number($("temperature").value).toFixed(2)} / top_p ${Number($("topP").value).toFixed(2)} / top_k ${$("topK").value}`,
   ];
+  // 术语场景也写进摘要：避免「侧栏看的是 A、生成用的是 B」说不清
+  if (glState.doc) {
+    parts.push(`术语: ${glScenarioName(glState.doc, glState.doc.active_scenario)} (${glEffectiveCount(glState.doc)} 条)`);
+  }
   $("genSummary").replaceChildren(...parts.map((t) => {
     // 一段一个 span（样式里 nowrap）：换行只发生在段与段之间，
     // 不会把「top_k 30」拆成两行、让末行只剩一个孤零零的数字
@@ -2853,6 +2858,8 @@ genBtn.addEventListener("click", async () => {
   // 存进预设会让同一份音色参数因预设不同而发出不同的声音，没道理。
   fd.append("interval_silence", $("gapMs").value);
   fd.append("file_naming", "title_time");
+  // 组开始时固定场景：多候选/重试都沿用同一个快照目标（G39）
+  glAppendScenario(fd);
   lastFd = fd;
 
   // 串行循环：每条都是一次普通 /tts。单条时请求体/SSE 解析与改动前逐行等价，
@@ -4362,21 +4369,8 @@ $("histClear").addEventListener("click", async () => {
   } catch (err) { showActionError("清空历史失败"); }
 });
 
-/* ---------------- glossary ---------------- */
-const glError = $("glError");
-// 表格里当前显示的词，用于把"这条已存在，改的是哪一列"说清楚（BUG-004）
-let glossaryCache = {};
-function showGlossaryError(msg) {
-  glError.textContent = msg;
-  glError.hidden = false;
-}
-function clearGlossaryError() {
-  glError.textContent = "";
-  glError.hidden = true;
-}
-
 /* 折叠面板展开后，sticky CTA 会遮挡新展开内容的末尾（毛玻璃吸底），
-   自动把面板滚进 ops 可视区，让完整内容（如术语添加行）可见。 */
+   自动把面板滚进 ops 可视区，让完整内容可见。 */
 document.querySelectorAll("details.fold").forEach((f) => {
   f.addEventListener("toggle", () => {
     if (!f.open) return;
@@ -4393,120 +4387,1019 @@ document.querySelectorAll("details.fold").forEach((f) => {
   });
 });
 
+/* ---------------- glossary: 场景 + 规则批量管理 ----------------
+   侧栏负责「当前生效场景」，弹窗编辑草稿；只有点保存才 PUT 一次原子写。
+   侧栏与弹窗共用 glState.doc（服务端文档）；弹窗另存 draft，关掉即丢弃。 */
+
+const GL_DEFAULT = "";
+
+const glState = {
+  doc: null,           // 服务端最近一次文档
+  draft: null,         // 弹窗草稿（深拷贝）
+  editScenario: GL_DEFAULT,
+  filter: "",
+  selected: new Set(),
+  visibleKeys: [],
+  undo: [],
+  pendingUndo: null,   // 单元格聚焦时的快照，首次输入才入栈
+  dirty: 0,
+  errorKey: "",
+  open: false,
+  saving: false,
+  prevFocus: null,
+};
+
+const glErrorEl = $("glError");
+
+function glShowError(msg) {
+  glErrorEl.textContent = msg;
+  glErrorEl.hidden = false;
+}
+function glClearError() {
+  glErrorEl.textContent = "";
+  glErrorEl.hidden = true;
+}
+
+function glClone(v) { return JSON.parse(JSON.stringify(v)); }
+function glNewId(prefix) {
+  const rnd = (crypto.getRandomValues
+    ? Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => b.toString(16).padStart(2, "0")).join("")
+    : Math.random().toString(16).slice(2, 14));
+  return prefix + rnd.slice(0, 10);
+}
+function glEl(tag, cls, text) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  if (text !== undefined) el.textContent = text;
+  return el;
+}
+function glScenarioName(doc, sid) {
+  if (!sid) return "默认（全部启用）";
+  return (doc.scenarios.find((s) => s.id === sid) || {}).name || "默认（全部启用）";
+}
+function glEffectiveCount(doc) {
+  if (!doc.active_scenario) return doc.rules.filter((r) => r.enabled).length;
+  const sc = doc.scenarios.find((s) => s.id === doc.active_scenario);
+  if (!sc) return 0;
+  const members = new Set(sc.rule_ids);
+  return doc.rules.filter((r) => r.enabled && members.has(r.id)).length;
+}
+function glGenerationScenario() {
+  return (glState.doc && glState.doc.active_scenario) || "";
+}
+
+/* 生成摘要/预览始终带界面当前场景，避免「看的是 A、生成的是 B」 */
+function glAppendScenario(fd) {
+  fd.append("scenario_id", glGenerationScenario());
+}
+
+async function glSetActive(sid) {
+  const fd = new FormData();
+  fd.append("scenario_id", sid || "");
+  const j = await (await apiFetch("/glossary/active", { method: "POST", body: fd })).json();
+  glState.doc = j;
+  return j;
+}
+
 async function renderGlossary() {
   try {
     const j = await (await apiFetch("/glossary")).json();
-    const g = j.glossary || {};
-    glossaryCache = g;
-    // 级联开关跟术语表一起返回，刷新页面/别的标签页改了也能同步回来
-    $("glCascade").checked = !!j.cascade;
-    const keys = Object.keys(g);
-    const box = $("glTable");
-    box.replaceChildren();
-    if (!keys.length) {
-      const empty = document.createElement("div");
-      empty.className = "gl-row";
-      const term = document.createElement("span");
-      term.className = "gl-term";
-      term.textContent = "暂无自定义术语";
-      empty.append(term, document.createElement("span"), document.createElement("span"));
-      box.appendChild(empty);
-      $("btnClearTerms").hidden = true;
-      return;
-    }
-    for (const key of keys) {
-      const value = g[key];
-      const row = document.createElement("div");
-      row.className = "gl-row";
-      const term = document.createElement("span");
-      term.className = "gl-term";
-      const zh = document.createElement("span");
-      const en = document.createElement("span");
-      const del = document.createElement("button");
-      del.className = "gl-del";
-      del.type = "button";
-      del.innerHTML = ICON_CLOSE;
-      del.title = `删除术语「${key}」`;
-      del.setAttribute("aria-label", `删除术语 ${key}`);
-      del.addEventListener("click", () => removeTerm(key));
-      row.append(term, zh, en, del);
-      term.textContent = key;
-      zh.textContent = typeof value === "object" ? (value.zh || "") : "";
-      en.textContent = typeof value === "object" ? (value.en || "") : (value || "");
-      box.appendChild(row);
-    }
-    $("btnClearTerms").hidden = false;
-  } catch (err) { showGlossaryError("术语表加载失败，显示的是上次内容"); }
+    glState.doc = j;
+    glClearError();
+    glRenderSidebar();
+    updateGenSummary();
+  } catch (err) {
+    $("glSummary").textContent = "术语规则加载失败，可重试或查看服务日志";
+    glShowError("术语规则加载失败：" + (err.message || err));
+  }
 }
 
-/* 单条删除是轻量可逆操作（重新添加即可），不弹确认框；清空全部才拦截。 */
-async function removeTerm(key) {
-  try {
-    await apiFetch("/glossary/" + encodeURIComponent(key), { method: "DELETE" });
-    clearGlossaryError();
-    await renderGlossary();
-    showActionHint(`已删除术语: ${key}`);
-  } catch (err) { showGlossaryError("删除术语失败: " + (err.message || err)); }
+function glRenderSidebar() {
+  const doc = glState.doc;
+  if (!doc) return;
+  const sel = $("glScenario");
+  const opts = [document.createElement("option")];
+  opts[0].value = GL_DEFAULT;
+  opts[0].textContent = "默认（全部启用）";
+  for (const s of doc.scenarios) {
+    const o = document.createElement("option");
+    o.value = s.id;
+    o.textContent = s.name;
+    opts.push(o);
+  }
+  sel.replaceChildren(...opts);
+  sel.value = doc.active_scenario || GL_DEFAULT;
+
+  $("glCascade").checked = !!doc.cascade;
+  $("glSummary").textContent =
+    `${glScenarioName(doc, doc.active_scenario)} · 本场景生效 ${glEffectiveCount({ ...doc, active_scenario: doc.active_scenario })} 条 / 共 ${doc.rules.length} 条 · ${doc.scenarios.length} 个场景`;
+
+  let warn = "";
+  if (doc.active_scenario && glEffectiveCount(doc) === 0) {
+    warn = "当前场景未启用任何规则：生成时不会替换任何术语。";
+  } else if ((doc.warnings || []).length) {
+    warn = doc.warnings[0];
+  } else if (doc.read_only) {
+    warn = "规则文件版本未知，已按只读模式打开：可以查看，但不能保存。";
+  }
+  $("glWarn").textContent = warn;
+  $("glWarn").hidden = !warn;
+  $("btnManageTerms").disabled = false;
 }
 
-$("btnClearTerms").addEventListener("click", async () => {
+/* ---- 弹窗：草稿与差异 ---- */
+
+function glDiff() {
+  const saved = glState.doc, d = glState.draft;
+  if (!saved || !d) return { count: 0, rules: new Set() };
+  const fingerprint = (r) => [r.term, r.zh, r.en, r.enabled ? 1 : 0].join("\u0001");
+  const savedRules = new Map(saved.rules.map((r) => [r.id, fingerprint(r)]));
+  const changed = new Set();
+  const seen = new Set();
+  for (const r of d.rules) {
+    seen.add(r.id);
+    if (savedRules.get(r.id) !== fingerprint(r)) changed.add(r.id);
+  }
+  for (const id of savedRules.keys()) if (!seen.has(id)) changed.add(id);
+  let count = changed.size;
+  const savedSc = new Map(saved.scenarios.map((s) => [s.id, s.name + "\u0001" + [...s.rule_ids].sort().join(",")]));
+  for (const s of d.scenarios) {
+    const key = s.name + "\u0001" + [...s.rule_ids].sort().join(",");
+    if (savedSc.get(s.id) !== key) count += 1;
+    savedSc.delete(s.id);
+  }
+  count += savedSc.size;
+  if ((d.active_scenario || "") !== (saved.active_scenario || "")) count += 1;
+  return { count, rules: changed };
+}
+
+function glPushUndo() {
+  if (!glState.draft) return;
+  glState.undo.push(JSON.stringify({
+    rules: glState.draft.rules,
+    scenarios: glState.draft.scenarios,
+    editScenario: glState.editScenario,
+  }));
+  if (glState.undo.length > 100) glState.undo.shift();
+}
+
+function glAfterChange({ rerender = false } = {}) {
+  /* 改动发生后旧的校验错误就不再成立，留着会让人以为还没改好 */
+  if ($("glStatus").dataset.tone === "error") glStatus("");
+  glState.dirty = glDiff().count;
+  if (rerender) {
+    glRenderRows();
+    glRenderScenarios();
+  }
+  glRenderFooter();
+}
+
+function glUndo() {
+  const snap = glState.undo.pop();
+  if (!snap) { glStatus("没有可撤销的操作"); return; }
+  const data = JSON.parse(snap);
+  glState.draft.rules = data.rules;
+  glState.draft.scenarios = data.scenarios;
+  glState.editScenario = data.editScenario;
+  glState.errorKey = "";
+  glAfterChange({ rerender: true });
+  glStatus("已撤销上一步");
+}
+
+function glStatus(msg, tone = "") {
+  const el = $("glStatus");
+  el.textContent = msg || "";
+  el.dataset.tone = tone;
+}
+
+function glRenderFooter() {
+  const d = glState.draft;
+  if (!d) return;
+  const name = glScenarioName(d, d.active_scenario);
+  const effective = glEffectiveCount(d);
+  const parts = [];
+  if (glState.saving) parts.push("保存中…");
+  else if (glState.dirty > 0) parts.push(`已修改 ${glState.dirty} 项`);
+  parts.push(`当前生效：${name}（${effective} 条）`);
+  if (glState.doc && glState.doc.read_only) parts.push("只读模式");
+  $("glDirty").textContent = parts.join(" · ");
+  $("glSave").disabled = glState.saving || !!(glState.doc && glState.doc.read_only);
+  $("glCancel").disabled = glState.saving;
+}
+
+/* ---- 弹窗：场景栏 ---- */
+
+function glRenderScenarios() {
+  const d = glState.draft;
+  const list = $("glScenarioList");
+  const rows = [{ id: GL_DEFAULT, name: "默认（全部启用）" }, ...d.scenarios];
+  const frag = document.createDocumentFragment();
+  for (const s of rows) {
+    const b = glEl("button", "gl-scenario");
+    b.type = "button";
+    b.setAttribute("role", "option");
+    b.dataset.sid = s.id;
+    b.setAttribute("aria-selected", s.id === glState.editScenario ? "true" : "false");
+    if (s.id === d.active_scenario) b.classList.add("active-flag");
+    const count = s.id === GL_DEFAULT
+      ? d.rules.filter((r) => r.enabled).length
+      : d.rules.filter((r) => r.enabled && s.rule_ids.includes(r.id)).length;
+    b.append(glEl("span", "gl-scenario-name", s.name));
+    b.append(glEl("span", "gl-scenario-count", `${count} 条`));
+    frag.append(b);
+  }
+  list.replaceChildren(frag);
+
+  const isDefault = glState.editScenario === GL_DEFAULT;
+  ["glRenameScenario", "glDuplicateScenario", "glDeleteScenario"].forEach((id) => {
+    $(id).disabled = isDefault;
+  });
+  const editing = d.scenarios.find((s) => s.id === glState.editScenario);
+  $("glSideHint").textContent = isDefault
+    ? "默认场景包含所有启用的规则；自定义场景只使用勾选的规则。"
+    : (editing && !editing.rule_ids.length
+      ? "这个场景还没有勾选任何规则，生成时不会替换术语。"
+      : "勾选「本场景」= 这条规则参与当前场景；取消勾选只移出本场景，不会删除规则。");
+}
+
+function glSelectScenario(sid) {
+  glState.editScenario = sid;
+  glState.errorKey = "";
+  glRenderScenarios();
+  glRenderRows();
+}
+
+async function glNewScenario() {
+  const name = await uiPrompt({ title: "新建场景", body: "场景是一组规则的集合，生成时选择它即可只使用这些规则。", placeholder: "例如：技术文档" });
+  if (name === null) return;
+  const err = glCheckName(name.trim(), "");
+  if (err) { glStatus(err, "error"); return; }
+  glPushUndo();
+  const s = { id: glNewId("s_"), name: name.trim(), rule_ids: [] };
+  glState.draft.scenarios.push(s);
+  glState.editScenario = s.id;
+  glAfterChange({ rerender: true });
+  glStatus(`已新建场景「${s.name}」，勾选规则后保存`);
+}
+
+function glCheckName(name, excludeId) {
+  if (!name) return "场景名称不能为空";
+  if ([...name].length > 40) return "场景名称最多 40 字";
+  if (name === "默认" || name === "默认（全部启用）") return "「默认」是保留名称";
+  const dup = glState.draft.scenarios.find(
+    (s) => s.id !== excludeId && s.name.toLowerCase() === name.toLowerCase());
+  return dup ? `已有同名场景「${dup.name}」` : "";
+}
+
+async function glRenameScenario() {
+  const s = glState.draft.scenarios.find((x) => x.id === glState.editScenario);
+  if (!s) return;
+  const name = await uiPrompt({ title: "重命名场景", value: s.name });
+  if (name === null) return;
+  const err = glCheckName(name.trim(), s.id);
+  if (err) { glStatus(err, "error"); return; }
+  glPushUndo();
+  s.name = name.trim();
+  glAfterChange({ rerender: true });
+}
+
+async function glDuplicateScenario() {
+  const s = glState.draft.scenarios.find((x) => x.id === glState.editScenario);
+  if (!s) return;
+  glPushUndo();
+  let name = `${s.name} 副本`;
+  let n = 2;
+  while (glCheckName(name, "")) name = `${s.name} 副本 ${n++}`;
+  const copy = { id: glNewId("s_"), name, rule_ids: [...s.rule_ids] };
+  glState.draft.scenarios.push(copy);
+  glState.editScenario = copy.id;
+  glAfterChange({ rerender: true });
+  glStatus(`已复制为「${name}」`);
+}
+
+async function glDeleteScenario() {
+  const s = glState.draft.scenarios.find((x) => x.id === glState.editScenario);
+  if (!s) return;
+  const isActive = s.id === glState.draft.active_scenario;
   const ok = await uiConfirm({
-    title: "清空术语",
-    body: "确定清空全部自定义术语？此操作不可恢复。",
-    okText: "清空", danger: true,
+    title: "删除场景",
+    body: `删除「${s.name}」？规则本身会保留${isActive ? "；它当前是生效场景，保存后自动回默认场景" : ""}。`,
+    okText: "删除", danger: true,
   });
   if (!ok) return;
+  glPushUndo();
+  glState.draft.scenarios = glState.draft.scenarios.filter((x) => x.id !== s.id);
+  if (isActive) glState.draft.active_scenario = GL_DEFAULT;
+  glState.editScenario = GL_DEFAULT;
+  glAfterChange({ rerender: true });
+}
+
+/* ---- 弹窗：表格 ---- */
+
+function glVisibleRules() {
+  const d = glState.draft;
+  const q = glState.filter.trim().toLowerCase();
+  if (!q) return d.rules;
+  return d.rules.filter((r) =>
+    [r.term, r.zh, r.en].some((v) => String(v || "").toLowerCase().includes(q)));
+}
+
+function glRenderRows() {
+  const d = glState.draft;
+  const tbody = $("glRows");
+  const editingScenario = d.scenarios.find((s) => s.id === glState.editScenario);
+  const isDefault = !editingScenario;
+  const members = new Set(editingScenario ? editingScenario.rule_ids : []);
+  $("glMemberHead").hidden = isDefault;
+  /* 用户场景只保留一个勾选框（=成员），全局开关走行尾电源键：两个复选框并排会打架 */
+  $("glEnabledHead").hidden = !isDefault;
+
+  const rows = glVisibleRules();
+  glState.visibleKeys = rows.map((r) => r.id);
+  const savedIds = new Set(((glState.doc || {}).rules || []).map((r) => r.id));
+  const frag = document.createDocumentFragment();
+
+  rows.forEach((r, idx) => {
+    const tr = glEl("tr");
+    tr.dataset.key = r.id;
+    if (!r.enabled) tr.classList.add("gl-row-off");
+    if (!savedIds.has(r.id)) tr.classList.add("gl-row-new");
+    if (glState.errorKey === r.id) tr.classList.add("gl-row-error");
+
+    const pickTd = glEl("td", "gl-cb");
+    const pick = document.createElement("input");
+    pick.type = "checkbox";
+    pick.className = "gl-pick";
+    pick.checked = glState.selected.has(r.id);
+    pick.setAttribute("aria-label", `选择第 ${idx + 1} 条规则`);
+    pickTd.append(pick);
+
+    const enabledTd = glEl("td", "gl-cb");
+    enabledTd.hidden = !isDefault;
+    const enabled = document.createElement("input");
+    enabled.type = "checkbox";
+    enabled.className = "gl-enabled";
+    enabled.checked = isDefault ? !!r.enabled : members.has(r.id);
+    enabled.setAttribute("aria-label",
+      isDefault ? `启用第 ${idx + 1} 条规则` : `把第 ${idx + 1} 条规则加入当前场景`);
+    const memberTd = glEl("td", "gl-cb");
+    memberTd.hidden = isDefault;
+    (isDefault ? enabledTd : memberTd).append(enabled);
+
+    tr.append(pickTd, enabledTd);
+    tr.append(glCell(r, "term", "术语", idx, "如 IndexTTS2"));
+    tr.append(glCell(r, "zh", "中文读法", idx, "留空=不替换"));
+    tr.append(glCell(r, "en", "英文读法", idx, "留空=不替换"));
+    tr.append(memberTd);
+
+    const opTd = glEl("td", "gl-op");
+    const power = glEl("button", "iconbtn gl-power");
+    power.type = "button";
+    power.hidden = isDefault;
+    power.title = r.enabled ? "全局停用此规则" : "全局启用此规则";
+    power.setAttribute("aria-label", `${r.enabled ? "全局停用" : "全局启用"}规则「${r.term || "未命名"}」`);
+    power.innerHTML = `<svg class="ico" aria-hidden="true"><use href="#i-check"></use></svg>`;
+    power.style.color = r.enabled ? "var(--ok)" : "";
+    const del = glEl("button", "iconbtn gl-row-del");
+    del.type = "button";
+    del.title = "删除此规则";
+    del.setAttribute("aria-label", `删除规则「${r.term || "未命名"}」`);
+    del.innerHTML = `<svg class="ico" aria-hidden="true"><use href="#i-trash"></use></svg>`;
+    opTd.append(power, del);
+    tr.append(opTd);
+
+    frag.append(tr);
+  });
+
+  tbody.replaceChildren(frag);
+
+  const empty = $("glEmpty");
+  if (!rows.length) {
+    empty.hidden = false;
+    empty.textContent = d.rules.length
+      ? `没有匹配「${glState.filter.trim()}」的规则。新增规则不受搜索过滤，保存后若不符合条件才会隐藏。`
+      : "还没有术语规则。点「新增规则」开始，或从 YAML/JSON 导入。";
+  } else {
+    empty.hidden = true;
+  }
+  $("glCount").textContent = glState.filter.trim() ? `命中 ${rows.length} 条` : `共 ${d.rules.length} 条`;
+  glSyncSelectAll();
+  glRenderBatch();
+}
+
+function glCell(rule, field, label, idx, placeholder) {
+  const td = glEl("td");
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "gl-cell" + (field === "term" ? " gl-term-cell" : "");
+  input.dataset.field = field;
+  input.value = rule[field] || "";
+  input.placeholder = placeholder;
+  input.spellcheck = false;
+  input.autocomplete = "off";
+  input.setAttribute("aria-label", `第 ${idx + 1} 行 ${label}`);
+  td.append(input);
+  return td;
+}
+
+function glRuleByKey(key) {
+  return glState.draft.rules.find((r) => r.id === key);
+}
+
+function glSyncSelectAll() {
+  const box = $("glSelectAll");
+  const keys = glState.visibleKeys;
+  const picked = keys.filter((k) => glState.selected.has(k)).length;
+  box.checked = keys.length > 0 && picked === keys.length;
+  box.indeterminate = picked > 0 && picked < keys.length;
+}
+
+function glRenderBatch() {
+  const n = glState.selected.size;
+  $("glBatch").hidden = n === 0;
+  $("glSelCount").textContent = `已选 ${n} 条`;
+  /* 自定义场景里批量动作改的是成员关系，标签跟着换，避免被读成全局开关 */
+  const isDefault = glState.editScenario === GL_DEFAULT;
+  $("glBatchEnable").textContent = isDefault ? "启用" : "加入本场景";
+  $("glBatchDisable").textContent = isDefault ? "停用" : "移出本场景";
+}
+
+function glSelectedKeys() {
+  return [...glState.selected].filter((k) => glRuleByKey(k));
+}
+
+/* 批量启用/停用：默认场景=全局开关；自定义场景=加入/移出该场景（与表头一致） */
+function glBatchSet(enabled) {
+  const keys = glSelectedKeys();
+  if (!keys.length) return;
+  const d = glState.draft;
+  const sc = d.scenarios.find((s) => s.id === glState.editScenario);
+  glPushUndo();
+  if (!sc) {
+    for (const k of keys) {
+      const r = glRuleByKey(k);
+      if (r) r.enabled = enabled;
+    }
+  } else {
+    const set = new Set(sc.rule_ids);
+    for (const k of keys) {
+      if (enabled) set.add(k);
+      else set.delete(k);
+    }
+    sc.rule_ids = [...set];
+  }
+  glAfterChange({ rerender: true });
+}
+
+async function glBatchDelete() {
+  const keys = glSelectedKeys();
+  if (!keys.length) return;
+  const d = glState.draft;
+  const usedBy = new Map();
+  for (const s of d.scenarios) {
+    for (const k of keys) if (s.rule_ids.includes(k)) {
+      usedBy.set(s.name, (usedBy.get(s.name) || 0) + 1);
+    }
+  }
+  const detail = usedBy.size
+    ? `其中 ${usedBy.size} 个场景引用了这些规则（${[...usedBy.keys()].join("、")}），保存后引用会一并移除。`
+    : "";
+  const ok = await uiConfirm({
+    title: `删除 ${keys.length} 条规则`,
+    body: `保存后生效。${detail}`,
+    okText: "删除", danger: true,
+  });
+  if (!ok) return;
+  glPushUndo();
+  const drop = new Set(keys);
+  d.rules = d.rules.filter((r) => !drop.has(r.id));
+  for (const s of d.scenarios) s.rule_ids = s.rule_ids.filter((id) => !drop.has(id));
+  for (const k of keys) glState.selected.delete(k);
+  glAfterChange({ rerender: true });
+}
+
+function glAddRule() {
+  const d = glState.draft;
+  glPushUndo();
+  const r = { id: glNewId("r_"), term: "", zh: "", en: "", enabled: true };
+  d.rules.unshift(r);
+  const sc = d.scenarios.find((s) => s.id === glState.editScenario);
+  if (sc) sc.rule_ids.push(r.id);
+  glState.filter = "";
+  $("glSearch").value = "";
+  glState.errorKey = "";
+  glAfterChange({ rerender: true });
+  const first = $("glRows").querySelector('tr[data-key="' + r.id + '"] .gl-cell');
+  if (first) first.focus();
+}
+
+async function glDeleteRule(key) {
+  const r = glRuleByKey(key);
+  if (!r) return;
+  const d = glState.draft;
+  const usedBy = d.scenarios.filter((s) => s.rule_ids.includes(key)).map((s) => s.name);
+  if (usedBy.length) {
+    const ok = await uiConfirm({
+      title: "删除规则",
+      body: `「${r.term || "未命名"}」被 ${usedBy.length} 个场景引用（${usedBy.join("、")}），保存后会从这些场景移除。`,
+      okText: "删除", danger: true,
+    });
+    if (!ok) return;
+  }
+  glPushUndo();
+  d.rules = d.rules.filter((x) => x.id !== key);
+  for (const s of d.scenarios) s.rule_ids = s.rule_ids.filter((id) => id !== key);
+  glState.selected.delete(key);
+  glState.errorKey = "";
+  glAfterChange({ rerender: true });
+}
+
+/* ---- 弹窗：打开 / 关闭 / 键盘 ---- */
+
+function glOpenModal() {
+  const doc = glState.doc;
+  if (!doc) { glShowError("术语规则还没加载成功，请稍后再试"); return; }
+  glState.draft = glClone(doc);
+  glState.editScenario = doc.active_scenario || GL_DEFAULT;
+  glState.filter = "";
+  glState.selected = new Set();
+  glState.undo = [];
+  glState.pendingUndo = null;
+  glState.dirty = 0;
+  glState.errorKey = "";
+  glState.open = true;
+  glState.prevFocus = document.activeElement;
+  $("glSearch").value = "";
+  $("glRev").textContent = `rev ${doc.rev}`;
+  $("glModalMask").hidden = false;
+  glRenderScenarios();
+  glRenderRows();
+  glRenderFooter();
+  glStatus("");
+  $("glTestOut").hidden = true;
+  $("glTestText").value = "";
+  $("glSearch").focus();
+  window.addEventListener("beforeunload", glBeforeUnload);
+}
+
+async function glRequestClose() {
+  if (glState.saving) return;
+  const n = glDiff().count;
+  if (n > 0) {
+    const ok = await uiConfirm({
+      title: "放弃未保存的修改？",
+      body: `还有 ${n} 项修改没有保存，关闭后无法恢复。`,
+      okText: "放弃修改", cancelText: "继续编辑", danger: true,
+    });
+    if (!ok) return;
+  }
+  glCloseNow();
+}
+
+function glCloseNow() {
+  glState.open = false;
+  $("glModalMask").hidden = true;
+  glState.draft = null;
+  glState.undo = [];
+  glState.selected = new Set();
+  window.removeEventListener("beforeunload", glBeforeUnload);
+  if (glState.prevFocus && glState.prevFocus.focus) glState.prevFocus.focus();
+  glState.prevFocus = null;
+}
+
+function glBeforeUnload(e) {
+  if (!glState.open || glDiff().count === 0) return;
+  e.preventDefault();
+  e.returnValue = "";
+}
+
+function glTrapFocus(e) {
+  const focusables = [...$("glModal").querySelectorAll(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  )].filter((el) => el.offsetParent !== null);
+  if (!focusables.length) return;
+  const first = focusables[0], last = focusables[focusables.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+
+/* ---- 弹窗：校验 / 保存 ---- */
+
+function glValidateDraft() {
+  const d = glState.draft;
+  const errors = [];
+  const seen = new Map();
+  d.rules.forEach((r, i) => {
+    const term = (r.term || "").trim();
+    const where = `第 ${i + 1} 行${term ? `（${term}）` : ""}`;
+    if (!term) errors.push({ key: r.id, msg: `第 ${i + 1} 行：术语不能为空` });
+    else if ([...term].length > 200) errors.push({ key: r.id, msg: `${where}：术语最多 200 字` });
+    else if (seen.has(term.toLowerCase())) {
+      errors.push({ key: r.id, msg: `${where}：与「${seen.get(term.toLowerCase())}」重复（忽略大小写）` });
+    } else {
+      seen.set(term.toLowerCase(), term);
+    }
+    const zh = (r.zh || "").trim(), en = (r.en || "").trim();
+    if (!zh && !en) errors.push({ key: r.id, msg: `${where}：至少填一种读法` });
+    if ([...zh].length > 500 || [...en].length > 500) {
+      errors.push({ key: r.id, msg: `${where}：读法最多 500 字` });
+    }
+  });
+  for (const s of d.scenarios) {
+    const err = glCheckName((s.name || "").trim(), s.id);
+    if (err) errors.push({ key: "", msg: `场景「${s.name || "未命名"}」：${err}` });
+  }
+  return errors;
+}
+
+function glShowErrors(errors) {
+  if (!errors.length) return;
+  glState.errorKey = errors[0].key || "";
+  glStatus(`保存失败：${errors[0].msg}`, "error");
+  if (glState.errorKey) {
+    glRenderRows();
+    const row = $("glRows").querySelector('tr[data-key="' + glState.errorKey + '"]');
+    if (row) {
+      row.scrollIntoView({ block: "center" });
+      const input = row.querySelector(".gl-cell");
+      if (input) input.focus();
+    }
+  }
+}
+
+async function glSave() {
+  if (glState.saving || !glState.draft) return;
+  const errors = glValidateDraft();
+  if (errors.length) { glShowErrors(errors); return; }
+  const d = glState.draft;
+  const payload = {
+    rev: glState.doc.rev,
+    rules: d.rules.map((r) => ({
+      id: r.id, term: r.term.trim(), zh: r.zh.trim(), en: r.en.trim(), enabled: !!r.enabled,
+    })),
+    scenarios: d.scenarios.map((s) => ({
+      id: s.id, name: s.name.trim(), rule_ids: [...s.rule_ids],
+    })),
+  };
+  glState.saving = true;
+  glRenderFooter();
+  glStatus("保存中…");
   try {
-    await apiFetch("/glossary", { method: "DELETE" });
-    clearGlossaryError();
-    await renderGlossary();
-    showActionHint("术语已清空");
-  } catch (err) { showGlossaryError("清空术语失败: " + (err.message || err)); }
-});
-$("btnAddTerm").addEventListener("click", async () => {
-  const termKey = $("glTerm").value.trim();
-  const wantZh = $("glZh").value.trim();
-  const wantEn = $("glEn").value.trim();
-  const fd = new FormData();
-  fd.append("term", $("glTerm").value);
-  fd.append("reading_zh", $("glZh").value);
-  fd.append("reading_en", $("glEn").value);
+    let r = await fetch(`${API}/glossary/config`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (r.status === 409) {
+      const latest = await r.json().catch(() => ({}));
+      const overwrite = await uiConfirm({
+        title: "规则已在别处修改",
+        body: "这个弹窗打开后，规则在另一个标签页/窗口被改过。覆盖会丢弃那边的修改且无法恢复。",
+        okText: "覆盖保存", cancelText: "放弃并刷新", danger: true,
+      });
+      if (!overwrite) {
+        if (latest && latest.rules) {
+          glState.doc = latest;
+          glState.draft = glClone(latest);
+          glState.editScenario = latest.active_scenario || GL_DEFAULT;
+          glState.undo = [];
+          glState.selected = new Set();
+          glState.errorKey = "";
+          $("glRev").textContent = `rev ${latest.rev}`;
+          glRenderScenarios();
+          glRenderRows();
+          glAfterChange();
+          /* 别的标签页可能连场景都换过，侧栏与生成摘要一起同步，别只刷新弹窗内部 */
+          glRenderSidebar();
+          updateGenSummary();
+          scheduleSegments();
+          glStatus("已加载最新版本，当前草稿未保存", "");
+        }
+        return;
+      }
+      r = await fetch(`${API}/glossary/config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, force: true }),
+      });
+    }
+    if (!r.ok) {
+      let detail = "";
+      try {
+        const j = await r.json();
+        detail = typeof j.detail === "string" ? j.detail : (j.detail && j.detail.message) || "";
+        const errs = (j.detail && j.detail.errors) || [];
+        if (errs.length) {
+          const mapped = errs.map((e) => {
+            const rule = Number.isInteger(e.index) && e.index >= 0 ? d.rules[e.index] : null;
+            return { key: rule ? rule.id : "", msg: e.message };
+          });
+          glShowErrors(mapped);
+          return;
+        }
+      } catch (e) { /* non-JSON body */ }
+      throw new Error(detail || `保存失败（${r.status}）`);
+    }
+    const saved = await r.json();
+    glState.doc = saved;
+    glState.dirty = 0;
+    glState.saving = false;
+    glRenderSidebar();
+    updateGenSummary();
+    scheduleSegments();
+    glCloseNow();
+    showActionHint("术语规则已保存并应用，下次生成生效");
+  } catch (err) {
+    glStatus("保存失败：" + (err.message || err), "error");
+  } finally {
+    if (glState.saving) {
+      glState.saving = false;
+      glRenderFooter();
+    }
+  }
+}
+
+/* ---- 弹窗：试读 / 导入 / 导出 ---- */
+
+async function glRunTest() {
+  const text = $("glTestText").value;
+  if (!text.trim()) { glStatus("先输入一段文本再试读", "error"); return; }
+  const d = glState.draft;
+  glStatus("试读中…");
   try {
-    const j = await (await apiFetch("/glossary", { method: "POST", body: fd })).json();
-    $("glTerm").value = ""; $("glZh").value = ""; $("glEn").value = "";
-    clearGlossaryError();
-    await renderGlossary();
-    // 空着的那一列由服务端沿用原读法（BUG-004），这里必须说出来——
-    // 否则用户以为自己填的一列把整条覆盖了，或以为那一列是自己刚写的。
-    const saved = (j.glossary || {})[termKey] || {};
-    const kept = [];
-    if (!wantZh && saved.zh) kept.push(`中文读法沿用「${saved.zh}」`);
-    if (!wantEn && saved.en) kept.push(`英文读法沿用「${saved.en}」`);
-    showActionHint(kept.length ? `术语已更新，${kept.join("、")}` : "术语已添加");
-  } catch (err) { showGlossaryError("添加术语失败: " + (err.message || err)); }
+    const r = await fetch(`${API}/glossary/test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        rules: d.rules.map((x) => ({ id: x.id, term: x.term, zh: x.zh, en: x.en, enabled: x.enabled })),
+        scenarios: d.scenarios,
+        scenario_id: glState.editScenario || null,
+        cascade: $("glCascade").checked,
+      }),
+    });
+    if (!r.ok) {
+      let msg = `试读失败（${r.status}）`;
+      try {
+        const j = await r.json();
+        msg = typeof j.detail === "string" ? j.detail : (j.detail && j.detail.message) || msg;
+      } catch (e) { /* ignore */ }
+      throw new Error(msg);
+    }
+    const out = await r.json();
+    $("glTestResult").textContent = out.normalized_text;
+    const matched = out.matched || [];
+    $("glTestMatched").textContent = matched.length
+      ? `命中 ${matched.length} 条：` + matched.map((m) => `${m.term} → ${m.reading}`).join("；")
+      : `命中 0 条（按${out.lang === "en" ? "英文" : "中文"}列匹配）`;
+    $("glTestOut").hidden = false;
+    glStatus("");
+  } catch (err) {
+    glStatus("试读失败：" + (err.message || err), "error");
+  }
+}
+
+async function glImportFile(file) {
+  if (!file) return;
+  if (glDiff().count > 0) {
+    glStatus("请先保存或放弃当前修改，再导入文件", "error");
+    return;
+  }
+  glStatus("导入中…");
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    const j = await (await apiFetch("/glossary/import", { method: "POST", body: fd })).json();
+    const doc = await (await apiFetch("/glossary")).json();
+    glState.doc = doc;
+    glState.draft = glClone(doc);
+    glState.editScenario = doc.active_scenario || GL_DEFAULT;
+    glState.undo = [];
+    glState.selected = new Set();
+    glState.errorKey = "";
+    $("glRev").textContent = `rev ${doc.rev}`;
+    glRenderSidebar();
+    glRenderScenarios();
+    glRenderRows();
+    glAfterChange();
+    updateGenSummary();
+    scheduleSegments();
+    const extra = j.scenarios_added ? `、新增场景 ${j.scenarios_added} 个` : "";
+    glStatus(`已导入：新增 ${j.added} 条、更新 ${j.updated} 条${extra}`, "ok");
+  } catch (err) {
+    glStatus("导入失败：" + (err.message || err), "error");
+  }
+}
+
+function glExport() {
+  if (glDiff().count > 0) {
+    glStatus("导出的是已保存版本，当前未保存的修改不会包含（请先保存）", "error");
+    return;
+  }
+  const a = document.createElement("a");
+  a.href = `${API}/glossary/export?format=yaml`;
+  a.download = "glossary.yaml";
+  document.body.append(a);
+  a.click();
+  a.remove();
+}
+
+/* ---- 弹窗：事件绑定 ---- */
+
+$("btnManageTerms").addEventListener("click", glOpenModal);
+$("glClose").addEventListener("click", glRequestClose);
+$("glCancel").addEventListener("click", glRequestClose);
+/* 只认两个显式关闭入口：点遮罩不关，Esc 也不关（Esc 只在单元格里撤销本格） */
+
+$("glScenarioList").addEventListener("click", (e) => {
+  const b = e.target.closest(".gl-scenario");
+  if (b) glSelectScenario(b.dataset.sid);
 });
-["glTerm", "glZh", "glEn"].forEach((id) => {
-  $(id).addEventListener("input", clearGlossaryError);
+$("glNewScenario").addEventListener("click", glNewScenario);
+$("glRenameScenario").addEventListener("click", glRenameScenario);
+$("glDuplicateScenario").addEventListener("click", glDuplicateScenario);
+$("glDeleteScenario").addEventListener("click", glDeleteScenario);
+
+let glSearchTimer = null;
+$("glSearch").addEventListener("input", (e) => {
+  clearTimeout(glSearchTimer);
+  glSearchTimer = setTimeout(() => {
+    glState.filter = e.target.value;
+    glRenderRows();
+  }, 300);
 });
+
+$("glAddRule").addEventListener("click", glAddRule);
+$("glSelectAll").addEventListener("change", (e) => {
+  if (e.target.checked) glState.visibleKeys.forEach((k) => glState.selected.add(k));
+  else glState.visibleKeys.forEach((k) => glState.selected.delete(k));
+  glRenderRows();
+});
+$("glBatchEnable").addEventListener("click", () => glBatchSet(true));
+$("glBatchDisable").addEventListener("click", () => glBatchSet(false));
+$("glBatchDelete").addEventListener("click", glBatchDelete);
+$("glTestBtn").addEventListener("click", glRunTest);
+$("glTestText").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); glRunTest(); }
+});
+$("glSave").addEventListener("click", glSave);
+$("glImportBtn").addEventListener("click", () => {
+  if (glDiff().count > 0) { glStatus("请先保存或放弃当前修改，再导入文件", "error"); return; }
+  $("glImportFile").click();
+});
+$("glImportFile").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  await glImportFile(file);
+});
+$("glExportBtn").addEventListener("click", glExport);
+
+$("glRows").addEventListener("focusin", (e) => {
+  if (e.target.classList.contains("gl-cell")) {
+    glState.pendingUndo = JSON.stringify({
+      rules: glState.draft.rules,
+      scenarios: glState.draft.scenarios,
+      editScenario: glState.editScenario,
+    });
+    e.target.dataset.before = e.target.value;
+  }
+});
+$("glRows").addEventListener("focusout", () => {
+  glState.pendingUndo = null;
+  glState.dirty = glDiff().count;
+  glRenderFooter();
+});
+$("glRows").addEventListener("input", (e) => {
+  const input = e.target;
+  if (!input.classList.contains("gl-cell")) return;
+  const rule = glRuleByKey(input.closest("tr").dataset.key);
+  if (!rule) return;
+  if (glState.pendingUndo) {
+    glState.undo.push(glState.pendingUndo);
+    if (glState.undo.length > 100) glState.undo.shift();
+    glState.pendingUndo = null;
+  }
+  rule[input.dataset.field] = input.value;
+  glState.errorKey = "";
+  if ($("glStatus").dataset.tone === "error") glStatus("");
+  glState.dirty = glDiff().count;
+  glRenderFooter();
+});
+$("glRows").addEventListener("keydown", (e) => {
+  const input = e.target;
+  if (!input.classList.contains("gl-cell") || e.isComposing) return;
+  if (e.key === "Escape") {
+    /* Esc 只撤销本格，不关弹窗 */
+    e.preventDefault();
+    e.stopPropagation();
+    if (input.dataset.before !== undefined) {
+      input.value = input.dataset.before;
+      const rule = glRuleByKey(input.closest("tr").dataset.key);
+      if (rule) rule[input.dataset.field] = input.value;
+      glState.pendingUndo = null;
+      glState.dirty = glDiff().count;
+      glRenderFooter();
+    }
+    input.blur();
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    input.blur();
+  }
+});
+$("glRows").addEventListener("change", async (e) => {
+  const t = e.target;
+  const tr = t.closest("tr");
+  if (!tr) return;
+  const rule = glRuleByKey(tr.dataset.key);
+  if (!rule) return;
+  if (t.classList.contains("gl-pick")) {
+    if (t.checked) glState.selected.add(rule.id);
+    else glState.selected.delete(rule.id);
+    glSyncSelectAll();
+    glRenderBatch();
+    return;
+  }
+  if (t.classList.contains("gl-enabled")) {
+    glPushUndo();
+    const sc = glState.draft.scenarios.find((s) => s.id === glState.editScenario);
+    if (!sc) {
+      rule.enabled = t.checked;
+    } else {
+      const set = new Set(sc.rule_ids);
+      if (t.checked) set.add(rule.id); else set.delete(rule.id);
+      sc.rule_ids = [...set];
+    }
+    glAfterChange({ rerender: true });
+  }
+});
+$("glRows").addEventListener("click", async (e) => {
+  const tr = e.target.closest("tr");
+  if (!tr) return;
+  const key = tr.dataset.key;
+  if (e.target.closest(".gl-row-del")) { await glDeleteRule(key); return; }
+  if (e.target.closest(".gl-power")) {
+    const rule = glRuleByKey(key);
+    if (!rule) return;
+    glPushUndo();
+    rule.enabled = !rule.enabled;
+    glAfterChange({ rerender: true });
+  }
+});
+
+$("glModal").addEventListener("keydown", (e) => {
+  if (e.isComposing) return;
+  if (e.key === "Escape") { e.preventDefault(); return; }   // 不关弹窗
+  if (e.key === "Tab") { glTrapFocus(e); return; }
+  const mod = e.ctrlKey || e.metaKey;
+  if (mod && e.key.toLowerCase() === "s") { e.preventDefault(); glSave(); return; }
+  if (mod && !e.shiftKey && e.key.toLowerCase() === "z") {
+    /* 焦点在输入框里时交给浏览器做文本撤销 */
+    if (e.target.closest("input, textarea")) return;
+    e.preventDefault();
+    glUndo();
+  }
+});
+
+/* ---- 侧栏：场景切换 / 级联开关 ---- */
+
+$("glScenario").addEventListener("change", async (e) => {
+  const want = e.target.value;
+  const prev = (glState.doc && glState.doc.active_scenario) || GL_DEFAULT;
+  glClearError();
+  try {
+    const j = await glSetActive(want);
+    glState.doc = j;
+    glRenderSidebar();
+    updateGenSummary();
+    scheduleSegments();
+    showActionHint(want ? `已切换到场景「${glScenarioName(j, want)}」` : "已切回默认场景");
+  } catch (err) {
+    e.target.value = prev;
+    glShowError("切换场景失败：" + (err.message || err));
+  }
+});
+
 $("glCascade").addEventListener("change", async (e) => {
   const want = e.target.checked;
-  clearGlossaryError();
+  glClearError();
   const fd = new FormData();
   fd.append("cascade", want ? "true" : "false");
   try {
     const j = await (await apiFetch("/glossary/cascade", { method: "POST", body: fd })).json();
-    // 用服务端返回的值回填，别信本地 checkbox——失败时会和服务端不一致
     e.target.checked = !!j.cascade;
-    await renderGlossary();
-    scheduleSegments();          // 替换策略变了，预览要跟着重算
+    glState.doc = j;
+    glRenderSidebar();
+    scheduleSegments();
     showActionHint(want
       ? "已开启级联替换：读音里如果含有其它术语，会被继续改写"
       : "已关闭级联替换：每条术语只作用于你输入的原文");
   } catch (err) {
-    showGlossaryError("切换失败: " + (err.message || err));
-    await renderGlossary();
+    glShowError("切换失败：" + (err.message || err));
+    e.target.checked = !want;
   }
 });
+
+
 
 /* ---------------- page tabs (gen / presets / model) ---------------- */
 const tabBtns = document.querySelectorAll("#tabs .tab");

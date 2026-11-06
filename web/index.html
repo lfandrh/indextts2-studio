@@ -51,6 +51,9 @@
     <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
       <path d="m4.5 12.5 5 5 10-11"/>
     </symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 7h16"/><path d="M9 7V5h6v2"/><path d="M6 7l1 13h10l1-13"/><path d="M10 11v6"/><path d="M14 11v6"/>
+    </symbol>
     <!-- 外链图标：GitHub 用官方 mark（实心，识别度最高）；
          B 站官方 mark 的实心路径过长且易失真，这里按其核心形态（电视 + 天线 + 双眼）
          自绘为描边版，与 sprite 里其它图标的笔画风格一致，17px 下仍可辨认。 -->
@@ -291,25 +294,25 @@
       <button class="linkbtn" id="resetParams" type="button">恢复推荐默认值</button>
     </details>
 
-    <details class="fold">
-      <summary>术语读音 <span class="q" title="生成前把文本里的这个词整体替换成你写的读音。
+    <details class="fold" id="glFold">
+      <summary>术语读音 <span class="q" title="生成前把文本里的词整体替换成你写的读音。
 中文读法必须填同音汉字（银行→银杭、重庆→虫庆），填拼音不生效；
 英文读法填英文拼写，只对纯英文句子生效，中英混排建议两列都填。
-例：IndexTTS2 → 中文「Index T T S 二」/ 英文「Index T T S two」"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></span></summary>
+场景：默认场景包含所有「启用」的规则；自定义场景只使用其中勾选的规则。
+某条规则在场景里勾掉 = 本条不参与该场景；规则本身仍保留，可用于其它场景。"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></span></summary>
+      <div class="gl-current">
+        <label for="glScenario">当前场景</label>
+        <select id="glScenario" class="gl-select" aria-label="当前术语场景"></select>
+        <button class="btn ghost mini" id="btnManageTerms" type="button">管理规则</button>
+      </div>
+      <div class="gl-summary" id="glSummary">术语规则加载中…</div>
+      <div class="gl-warn" id="glWarn" hidden></div>
       <label class="switch gl-cascade"><input type="checkbox" id="glCascade"><span class="tk"></span>级联替换读音
         <b class="qinfo" title="关闭（默认）：每条术语只作用于你输入的原文，读音里如果含有其它术语，不会被再次改写。
 打开：替换结果会留在文本里，后面的术语会继续改写它——适合把读音拆成多条来组合，比如「集团」读作「控股」、「控股」读作「母公司」。
 注意：替换顺序固定按术语长度从长到短，你控制不了先后。">?</b>
       </label>
-      <div class="gl-add">
-        <input type="text" id="glTerm" placeholder="术语（如 IndexTTS2）">
-        <input type="text" id="glZh" placeholder="中文读法">
-        <input type="text" id="glEn" placeholder="英文读法">
-        <button class="btn ghost" id="btnAddTerm" type="button">添加</button>
-      </div>
       <div class="gl-error" id="glError" hidden></div>
-      <div class="gl-table" id="glTable"></div>
-      <div class="gl-foot"><button class="linkbtn" id="btnClearTerms" type="button" hidden>清空全部术语</button></div>
     </details>
 
     <!-- main CTA pinned at panel bottom -->
@@ -914,6 +917,93 @@
         <button class="btn primary" id="clipApply" type="button">设为参考音频</button>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- 术语规则管理：编辑的是草稿，点「保存并应用」才一次原子落盘。
+     关闭入口只有右上角 × 和底部取消——点遮罩、按 Esc 都不关。 -->
+<div class="modal-mask gl-modal-mask" id="glModalMask" hidden>
+  <div class="modal gl-modal" id="glModal" role="dialog" aria-modal="true" aria-labelledby="glModalTitle" tabindex="-1">
+    <header class="gl-head">
+      <h2 class="modal-title" id="glModalTitle">术语规则管理</h2>
+      <span class="gl-rev mono" id="glRev"></span>
+      <button class="iconbtn gl-close" id="glClose" type="button" aria-label="关闭术语规则管理" title="关闭">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6L6 18"/></svg>
+      </button>
+    </header>
+
+    <div class="gl-body">
+      <aside class="gl-side">
+        <div class="gl-side-head">编辑场景</div>
+        <div class="gl-scenarios" id="glScenarioList" role="listbox" aria-label="编辑场景"></div>
+        <button class="btn ghost mini" id="glNewScenario" type="button">+ 新建场景</button>
+        <div class="gl-scenario-ops" id="glScenarioOps">
+          <button class="linkbtn" id="glRenameScenario" type="button">改名</button>
+          <button class="linkbtn" id="glDuplicateScenario" type="button">复制</button>
+          <button class="linkbtn danger" id="glDeleteScenario" type="button">删除</button>
+        </div>
+        <p class="gl-side-hint" id="glSideHint">默认场景包含所有启用的规则；自定义场景只使用勾选的规则。</p>
+      </aside>
+
+      <section class="gl-main">
+        <div class="gl-toolbar">
+          <input type="search" id="glSearch" placeholder="搜索术语或读法…" aria-label="搜索术语或读法">
+          <button class="btn ghost mini" id="glAddRule" type="button">+ 新增规则</button>
+          <span class="gl-count mono" id="glCount"></span>
+        </div>
+
+        <div class="gl-grid-wrap" id="glGridWrap">
+          <table class="gl-grid">
+            <thead>
+              <tr>
+                <th class="gl-cb"><input type="checkbox" id="glSelectAll" aria-label="全选当前搜索结果"></th>
+                <th class="gl-cb" id="glEnabledHead">启用</th>
+                <th>术语</th>
+                <th>中文读法</th>
+                <th>英文读法</th>
+                <th class="gl-cb" id="glMemberHead" hidden>本场景</th>
+                <th class="gl-op-head"><span class="sr-only">操作</span></th>
+              </tr>
+            </thead>
+            <tbody id="glRows"></tbody>
+          </table>
+          <div class="gl-empty" id="glEmpty" hidden></div>
+        </div>
+
+        <div class="gl-batch" id="glBatch" hidden>
+          <span class="mono" id="glSelCount"></span>
+          <button class="btn ghost mini" id="glBatchEnable" type="button">启用</button>
+          <button class="btn ghost mini" id="glBatchDisable" type="button">停用</button>
+          <button class="btn ghost mini danger" id="glBatchDelete" type="button">删除</button>
+        </div>
+
+        <div class="gl-test">
+          <label for="glTestText">试读 <span class="gl-test-hint">用当前草稿与编辑中的场景，不改任何设置</span></label>
+          <div class="gl-test-row">
+            <input type="text" id="glTestText" maxlength="2000" placeholder="输入一小段文本，看会怎么读">
+            <button class="btn ghost mini" id="glTestBtn" type="button">试读</button>
+          </div>
+          <div class="gl-test-out" id="glTestOut" hidden>
+            <div class="gl-test-result" id="glTestResult"></div>
+            <div class="gl-test-matched mono" id="glTestMatched"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <footer class="gl-foot">
+      <div class="gl-io">
+        <button class="linkbtn" id="glImportBtn" type="button">导入…</button>
+        <button class="linkbtn" id="glExportBtn" type="button">导出 YAML</button>
+        <input type="file" id="glImportFile" accept=".yaml,.yml,.json" hidden>
+      </div>
+      <div class="gl-status" id="glStatus" role="status" aria-live="polite"></div>
+      <div class="gl-dirty mono" id="glDirty"></div>
+      <div class="gl-actions">
+        <button class="btn ghost" id="glCancel" type="button">取消</button>
+        <button class="btn primary" id="glSave" type="button">保存并应用</button>
+      </div>
+    </footer>
   </div>
 </div>
 

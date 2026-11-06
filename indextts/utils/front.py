@@ -1,43 +1,21 @@
 # -*- coding: utf-8 -*-
-from functools import lru_cache
 import logging
 import os
 import re
 from typing import List, Union, overload
 import warnings
 from indextts.utils.common import tokenize_by_CJK_char, de_tokenized_by_CJK_char
+from indextts.utils.glossary_store import (
+    apply_glossary as _apply_glossary,
+    get_term_pattern,
+    reading_for as _reading_for,
+)
 from sentencepiece import SentencePieceProcessor
 
 # 接进 server.py 已经配好的日志系统（logs/server.log，按天轮转）。
 # 之前这里一律用 print()，异常只落在 stdout 的黑窗口里，
 # 排查「为什么这次合成的读音不对」时看不到任何记录。
 logger = logging.getLogger("indextts.front")
-
-
-@lru_cache(maxsize=512)
-def get_term_pattern(term: str):
-    """编译术语匹配正则（模块级缓存，避免每条文本重复编译）。
-
-    边界策略：只对纯 ASCII 的单词型术语补边界断言，否则 "TTS" 会命中
-    "ATTS"。边界字符集必须是 ASCII（``[A-Za-z0-9_+]``）而不是 ``\\w``：
-    Python 的 ``\\w`` 默认匹配 Unicode，汉字也算单词字符，于是
-    "5090显卡" 里的 "5090"、"TTS技术" 里的 "TTS" 全都被边界挡住——
-    术语表写了也不生效。``+`` 放进边界是为了让 "C" 不命中 "C++" 里的 C
-    （那是个运算符，不是字母）。含中文等非 ASCII 字符的术语不加边界——
-    中文没有词边界，加了会让 "人工智能" 匹配不到 "人工智能技术" 这类连用场景。
-
-    空词条返回 None（由调用方跳过）：术语表是用户可手写的，空 key 会让
-    这里的 term[0] 抛 IndexError，进而让整条文本规范化链崩掉。
-    """
-    if not term:
-        return None
-    pattern = re.escape(term)
-    if term.isascii():
-        if re.match(r"[A-Za-z0-9_]", term[0]):
-            pattern = r"(?<![A-Za-z0-9_+])" + pattern
-        if re.match(r"[A-Za-z0-9_]", term[-1]):
-            pattern = pattern + r"(?![A-Za-z0-9_+])"
-    return re.compile(pattern, re.IGNORECASE)
 
 
 class TextNormalizer:
@@ -203,7 +181,7 @@ class TextNormalizer:
             )
             self.en_normalizer = NormalizerEn(overwrite_cache=False)
 
-    def normalize(self, text: str) -> str:
+    def normalize(self, text: str, glossary=None, cascade=None) -> str:
         if not self.zh_normalizer or not self.en_normalizer:
             logger.error("TextNormalizer is not initialized; returning raw text")
             self.normalize_fallback = "uninitialized"
@@ -212,8 +190,8 @@ class TextNormalizer:
         if self.use_chinese(text):
             text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
             # 应用术语词汇表（优先级最高，在所有保护之前）
-            if self.enable_glossary:
-                text = self.apply_glossary_terms(text, lang="zh")
+            if self.enable_glossary or glossary is not None:
+                text = self.apply_glossary_terms(text, lang="zh", glossary=glossary, cascade=cascade)
             # 保护技术术语（如 GPT-5-nano）避免被中文normalizer错误处理
             replaced_text, tech_list = self.save_tech_terms(text.rstrip())
             replaced_text, pinyin_list = self.save_pinyin_tones(replaced_text)
@@ -241,8 +219,8 @@ class TextNormalizer:
             try:
                 text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
                 # 应用术语词汇表（优先级最高，在所有保护之前）
-                if self.enable_glossary:
-                    text = self.apply_glossary_terms(text, lang="en")
+                if self.enable_glossary or glossary is not None:
+                    text = self.apply_glossary_terms(text, lang="en", glossary=glossary, cascade=cascade)
                 # 保护技术术语（如 GPT-5-Nano）避免被英文normalizer错误处理
                 replaced_text, tech_list = self.save_tech_terms(text)
                 result = self.en_normalizer.normalize(replaced_text)
@@ -344,88 +322,33 @@ class TextNormalizer:
         transformed_text = re.sub(r'\s*<H>\s*', '-', normalized_text)
         return transformed_text
 
-    def apply_glossary_terms(self, text, lang="zh"):
+    def apply_glossary_terms(self, text, lang="zh", glossary=None, cascade=None):
         """
-        应用术语词汇表，将专业术语替换为对应语言的读法
+        应用术语词汇表，将专业术语替换为对应语言的读法。
 
         Args:
             text: 待处理文本
             lang: 语言类型 "zh" 或 "en"
+            glossary: 可选快照；None 表示用实例上的 term_glossary
+            cascade: 可选级联开关；None 表示用实例上的 cascade_glossary
 
-        Returns:
-            处理后的文本
+        匹配实现放在 glossary_store（纯逻辑、无 torch），
+        保证「试读结果 = 预览结果 = 实际分词输入」。
 
         Example:
             "M.2 NVMe SSD" -> (zh) "M 二 NVMe SSD"
             "M.2 NVMe SSD" -> (en) "M dot two NVMe SSD"
         """
-        if not self.term_glossary:
+        source = self.term_glossary if glossary is None else glossary
+        if not source:
             return text
-
-        # 先取快照再遍历：术语表可以被 HTTP 线程增删（服务器端已改成
-        # 复制写入，但这里是纯库代码，自己也要对快照负责），
-        # 否则遍历中途改 size 会抛 RuntimeError。
-        glossary = dict(self.term_glossary)
-        # 按术语长度降序排列，避免短术语先匹配导致长术语无法匹配
-        # 例如："PCIe 5.0" 应该在 "PCIe" 之前匹配
-        sorted_terms = sorted(glossary.keys(), key=len, reverse=True)
-        transformed_text = text
-
-        if not getattr(self, "cascade_glossary", False):
-            # 默认：每条术语只作用于【原文】，替换结果不再参与后续匹配。
-            # 否则一条术语的读音里若含另一条术语，那条术语会再改写一次——
-            # 术语表 {"C++": "C 加加", "C": "西"} 输入「他主要写 C++」会得到
-            # 「他主要写西加加」，实际念成 xi jia jia，静默出错且界面无提示。
-            #
-            # 实现：替换结果先塞进私有区占位符（U+E000 起，正常文本不会出现），
-            # 全部替换完再统一还原。顺带好处是长短优先级更稳——长术语换成占位符
-            # 之后，短术语彻底碰不到它。
-            slots = []
-            for term in sorted_terms:
-                r = self._glossary_replacement(glossary, term, lang)
-                pattern = get_term_pattern(term)
-                if pattern is None:
-                    logger.warning("Skipping empty glossary term")
-                    continue
-                if r is None:
-                    continue
-                if not pattern.search(transformed_text):
-                    continue
-                slots.append(r)
-                ph = "\ue000%d\ue001" % (len(slots) - 1)
-                transformed_text = pattern.sub(lambda _m, p=ph: p, transformed_text)
-            for i, r in enumerate(slots):
-                transformed_text = transformed_text.replace("\ue000%d\ue001" % i, r)
-            return transformed_text
-
-        for term in sorted_terms:
-            replacement = self._glossary_replacement(glossary, term, lang)
-            # 使用正则进行大小写不敏感的替换
-            pattern = get_term_pattern(term)
-            if pattern is None:
-                logger.warning("Skipping empty glossary term")
-                continue
-            if replacement is None:
-                continue
-            # replacement 是用户填的自由文本，必须按【字面量】替换。
-            # 直接传给 sub() 会被当成正则模板：读音里含 \1 会抛
-            # re.error("invalid group reference")，整条链崩掉。
-            transformed_text = pattern.sub(lambda _m, r=replacement: r, transformed_text)
-
-        return transformed_text
+        use_cascade = self.cascade_glossary if cascade is None else cascade
+        result, _matched = _apply_glossary(text, source, lang, bool(use_cascade))
+        return result
 
     def _glossary_replacement(self, glossary, term, lang):
-        """取出该术语在指定语言下的读音；None 表示这条不该参与替换。"""
-        term_value = glossary[term]
-        if isinstance(term_value, dict):
-            replacement = term_value.get(lang, term_value.get(lang, term))
-        else:
-            replacement = term_value
-        if not isinstance(replacement, str):
-            # YAML 里写成数字/列表时的兜底，否则 re.sub 抛 TypeError
-            logger.warning("Coercing non-string reading for term %r: %r", term, replacement)
-            replacement = str(replacement)
-        return replacement
+        """兼容旧调用；空读法/缺列一律返回 None（不再替换成空串）。"""
+        return _reading_for(glossary.get(term), lang)
 
     def load_glossary(self, glossary_dict):
         """
@@ -462,7 +385,9 @@ class TextNormalizer:
         if glossary_path and os.path.exists(glossary_path):
             import yaml
             with open(glossary_path, 'r', encoding='utf-8') as f:
-                external_glossary = yaml.safe_load(f)
+                # BaseLoader：未加引号的 5090 / yes 全部按字符串读，
+                # 旧实现会把它解析成 int/bool，key 被 _clean_glossary 丢掉。
+                external_glossary = yaml.load(f, Loader=yaml.BaseLoader)
                 if external_glossary and isinstance(external_glossary, dict):
                     self.term_glossary = self._clean_glossary(external_glossary)
                     return True
@@ -494,14 +419,16 @@ class TextNormalizer:
 
     def save_glossary_to_yaml(self, glossary_path):
         """
-        保存术语词汇表到 YAML 文件
+        保存术语词汇表到 YAML 文件（原子替换，避免半截文件）。
 
         Args:
             glossary_path: YAML 文件路径
         """
         import yaml
-        with open(glossary_path, 'w', encoding='utf-8') as f:
+        tmp = glossary_path + ".tmp"
+        with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
             yaml.dump(self.term_glossary, f, allow_unicode=True, default_flow_style=False)
+        os.replace(tmp, glossary_path)
 
     def save_pinyin_tones(self, original_text):
         """
@@ -625,26 +552,36 @@ class TextTokenizer:
             tokens = [tokens]
         return [self.sp_model.PieceToId(token) for token in tokens]
 
-    def tokenize(self, text: str) -> List[str]:
-        return self.encode(text, out_type=str)
+    def tokenize(self, text: str, glossary=None, cascade=None) -> List[str]:
+        return self.encode(text, out_type=str, glossary=glossary, cascade=cascade)
 
-    def encode(self, text: str, **kwargs):
+    def encode(self, text: str, glossary=None, cascade=None, **kwargs):
         if len(text) == 0:
             return []
         if len(text.strip()) == 1:
+            # 原实现直接返回，术语表在这条路径上完全不生效。
+            # 只在调用方显式传了快照时补一次术语替换，保持库默认行为不变。
+            if self.normalizer and glossary is not None:
+                lang = "zh" if self.normalizer.use_chinese(text) else "en"
+                text = self.normalizer.apply_glossary_terms(
+                    text, lang=lang, glossary=glossary, cascade=cascade
+                )
             return self.sp_model.Encode(text, out_type=kwargs.pop("out_type", int), **kwargs)
         # 预处理
         if self.normalizer:
-            text = self.normalizer.normalize(text)
+            text = self.normalizer.normalize(text, glossary=glossary, cascade=cascade)
         if len(self.pre_tokenizers) > 0:
             for pre_tokenizer in self.pre_tokenizers:
                 text = pre_tokenizer(text)
         return self.sp_model.Encode(text, out_type=kwargs.pop("out_type", int), **kwargs)
 
-    def batch_encode(self, texts: List[str], **kwargs):
+    def batch_encode(self, texts: List[str], glossary=None, cascade=None, **kwargs):
         # 预处理
         if self.normalizer:
-            texts = [self.normalizer.normalize(text) for text in texts]
+            texts = [
+                self.normalizer.normalize(text, glossary=glossary, cascade=cascade)
+                for text in texts
+            ]
         if len(self.pre_tokenizers) > 0:
             for pre_tokenizer in self.pre_tokenizers:
                 texts = [pre_tokenizer(text) for text in texts]
