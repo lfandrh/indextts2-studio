@@ -91,7 +91,7 @@
 | AI Agent Skill | 自带 `skills/indextts2-tts`：零依赖客户端 + 26 个子命令，一句话让 agent 完成「探活 → 选音色 → 合成 → 交路径」，支持批量清单、断点续跑与上游 Skill 编排；合成前先回传分段与数字读音预览，专治 `5090` 被念成「五千零九十」 |
 | 内置示例 | 9 条示例一键填充文本与参数（另有 2 条情感文本示例默认隐藏），用于快速试听音色 |
 | 情感控制 | 四种模式：同参考音频 / 情感参考音频 / 8 维情感向量（滑块直控、权重可缩放）/ 情感文本描述（Qwen）；参考音频超过 15 秒时提示仅取前 15 秒，并可直接打开裁剪弹窗截出目标片段 |
-| 术语词汇表 | 自定义术语读音（落盘 `checkpoints/glossary.yaml`），支持单条删除、一键清空，以及默认关闭的「级联替换」开关 |
+| 术语词汇表 | 规则可增删改、批量启用/停用/删除、导入导出；规则按「场景」分组（默认场景 = 全部启用），生成时按当前场景取快照；落盘 `checkpoints/glossary_rules.yaml`，`glossary.yaml` 保留为旧工具兼容快照；级联替换默认关闭 |
 | 文本与分句调节 | 文本长度软提示（2000 字起警告、10000 字硬限）；分句最大 Token 与段间停顿（10~500 毫秒）可调，分句预览实时回显 |
 | 深色 / 浅色主题 | 一键切换并记忆；主题在首屏绘制前就已确定，深色刷新不闪白 |
 | GPU 仪表自适配 | Header 的 GPU 利用率与显存走「进程内 NVML → `nvidia-smi` → NVIDIA 老式安装目录（`NVSMI`）」三级通道，驱动较旧或 `nvidia-smi` 不在 PATH 的机器也能读到；某一项读不到只隐藏那一项，设备名显示 `--` 而不是误报成 CPU |
@@ -228,13 +228,14 @@ FastAPI + uvicorn，纯后端（不再内嵌 UI），负责推理调度、任务
 | --- | --- |
 | 系统 | `/health`、`/status`（模型状态 + 仪表 + `audio_exts` / `audio_max_mb` / `video_exts` / `video_max_mb` 的合并端点）、`/metrics` |
 | 模型 | `GET /model`、`POST /model/config`、`/model/load`、`/model/unload`、`/model/restart` |
-| 生成 | `POST /tts`（SSE 流式）、`/tts/{id}/cancel`、`/tts/{id}/stop`、`/jobs/current`、`/jobs/{id}` |
+| 生成 | `POST /tts`（SSE 流式，可选表单 `scenario_id`）、`/tts/{id}/cancel`、`/tts/{id}/stop`、`/jobs/current`、`/jobs/{id}` |
 | 音频 | `GET /audio/{name}`、`POST /audio/tempo`（保音高变速，纯 CPU、不占推理锁）、`POST /audio/extract`（视频抽音轨 / 浏览器解不了的 wma 转 WAV，需要 ffmpeg） |
 | 字幕 | `GET /subtitle`（段级条目与预览）、`GET /subtitle/export?fmt=srt\|vtt`；都是前端专用接口，`include_in_schema=False`，纯读盘 + 纯计算、不占推理锁 |
 | 历史 | `GET /history`、`POST /history/config`、`DELETE /history`、`DELETE /history/{id}` |
 | 预设 | `GET/POST /presets`、`/presets/{name}`、`/presets/{name}/audio/{kind}`、`DELETE`、`/rename`、`/duplicate` |
 | 保存目录 | `GET/PUT /prefs/save-dir`、`POST /prefs/save-dir/pick`、`/prefs/save-dir/open`、`POST /save-dir/outputs/{name}`、`POST /save-dir/upload` |
-| 辅助 | `/examples`、`POST /segments`（BPE 分句预览）、`/glossary`（术语读音与级联开关） |
+| 辅助 | `/examples`、`POST /segments`（BPE 分句预览，可选 `scenario_id`）、`/glossary`（旧版术语接口）、`/glossary/cascade` |
+| 术语管理 | `PUT /glossary/config`（规则 + 场景整包保存，带 rev）、`POST /glossary/active`、`/glossary/test`（草稿试读）、`/glossary/import`、`GET /glossary/export`；都是前端专用接口，`include_in_schema=False` |
 
 正式路径为 `/api/v1/*`，旧根路径做 307 兼容重定向。默认只监听 `127.0.0.1`：服务有文件删除类端点且没有鉴权，需要局域网访问时请显式 `--host 0.0.0.0` 并自行评估风险。
 
@@ -340,7 +341,7 @@ http://127.0.0.1:7860
 
 **长文本**：文本超过 2000 字会给黄色提示，超过 10000 字才硬性拦截。分句预览下方可调「分句最大 Token」，段数越多每段的固定开销越高，太长建议分段生成再拼接。
 
-**术语读音**：像 `IndexTTS2`、`CAMPPlus` 这类词直接写进术语表，分别给中文读法和英文读法；默认只替换原文（不连锁），需要把读音继续套用其它术语时再打开「级联替换」。
+**术语读音**：像 `IndexTTS2`、`CAMPPlus` 这类词直接写进术语表，分别给中文读法和英文读法；默认只替换原文（不连锁），需要把读音继续套用其它术语时再打开「级联替换」。规则可以按稿件分成「场景」（技术文档、播客…），侧栏切换当前场景即可；每条生成请求在开始时取场景快照，生成途中改规则或切场景只影响下一次。三份文件都在 `checkpoints/`：`glossary_rules.yaml` 是唯一事实源，`glossary.yaml` 是默认场景的扁平兼容快照，`glossary_settings.yaml` 存级联开关与当前场景。
 
 **英文撇号缩写（已知限制）**：`don't`、`can't`、`isn't`、`that's` 这类缩写读不出原本的连读音——2.0 的英文词表里没有缩写的整词写法，术语表也救不了。只有 `they're→their`、`you're→your`、`it's→its`、`we'll→well` 能换成同音整词读出原音，其余请写完整形式（`do not` / `cannot` / `they are`）。另注意从 Word 粘进来的弯撇号 `’` 会绕过术语表，先替换成半角 `'`。详见使用指南 3.1。
 

@@ -28,8 +28,9 @@
 | `GET /glossary` / `POST /glossary` / `DELETE /glossary/{term}` / `DELETE /glossary` | `glossary [--add/--delete/--clear --yes]` |
 
 其余接口（预设改名复制删除、历史清理、`/jobs/*`、`/metrics`、`/prefs/*`、
-`/save-dir/*`、`/lf/*` 长篇台本、`/lf/tl/*` 时间轴）没有封装，需要时按下面的字段直接打 HTTP。
-想知道你的整合包比这份清单多了什么，跑 `tts_client.py api`。
+`/save-dir/*`、`/glossary/cascade`）没有封装，需要时按下面的字段直接打 HTTP。
+`/lf/*`（长篇台本）与 `/lf/tl/*`（时间轴）是部分整合包才装的 WebUI 扩展，本 skill 不覆盖、
+本文档也不展开；你的包有没有，跑 `tts_client.py api` 看对账结果。
 
 ---
 
@@ -279,17 +280,17 @@ outputs/presets/胡桃/
 |---|---|
 | `GET /examples?include_experimental=0\|1` | 内置示例音色（来自 `examples/cases.jsonl`），自带推荐情感参数。默认**过滤掉 `emo_mode=3`** 的实验性条目，带 `include_experimental=1` 才全给 |
 | `GET /examples/{name}` | **返回该示例的音频文件本体**（`FileResponse`），不是 JSON 详情——名字对不上任何 `cases.jsonl` 条目也能取到 `examples/` 目录下的同名音频。**只放行音频扩展名**（`.wav` `.mp3` `.flac` `.ogg`），`cases.jsonl`、`batch/` 子目录、无扩展名一律 **404** |
-| `POST /segments` | `text` + `max_text_tokens_per_segment` → 预览自动分段结果，**不合成**。**只吃表单** |
+| `POST /segments` | `text` + `max_text_tokens_per_segment`（+ 可选 `scenario_id`）→ 预览自动分段结果，**不合成**。**只吃表单**；响应另带 `normalized_text`、`numbers`、`scenario_id/scenario_name` |
 | `GET /history` | 本次服务运行的生成历史（**内存态，重启即清**），最多 20 条 |
 | `POST /history/config` | `auto_clean` 开关：超出 20 条时是否连带删除音频文件 |
 | `DELETE /history` | 清空历史 |
 | `DELETE /history/{item_id}` | 删单条 |
 | `GET /metrics` | 轻量指标（供监控轮询） |
-| `GET /glossary` | `{"glossary": {...}, "cascade": bool}` |
-| `POST /glossary` | `term` + `reading_zh` / `reading_en`，持久化到 `checkpoints/glossary.yaml` |
+| `GET /glossary` | 规则文档：`rules` / `scenarios` / `active_scenario` / `rev` / `cascade`，另带旧字段 `glossary`（默认场景扁平表） |
+| `POST /glossary` | `term` + `reading_zh` / `reading_en`，写入 `checkpoints/glossary_rules.yaml`（`glossary.yaml` 同步为兼容快照）；新规则加入服务端当前场景 |
 | `POST /glossary/cascade` | `cascade=true\|false`，只改级联开关不动术语表 |
-| `DELETE /glossary/{term}` | 删单条；术语可含空格/中文/符号，需 percent-encode |
-| `DELETE /glossary` | 清空全部术语 |
+| `DELETE /glossary/{term}` | 删单条（并从所有场景移除引用）；术语可含空格/中文/符号，需 percent-encode |
+| `DELETE /glossary` | 清空规则；场景结构保留（变空场景） |
 
 **`prompt_audio` 是 URL 不是路径**：`GET /examples` 每条里的 `prompt_audio` 形如 `/examples/voice_01.wav`，
 是供前端直接播放的相对 URL。纯远程部署时客户端本地没有这个文件，必须走 `GET /examples/{name}` 下载
@@ -326,14 +327,14 @@ outputs/presets/胡桃/
 `/segments` 不可用时跳过预览，不影响合成。
 
 **`POST /glossary` 同一术语再次提交时按列合并**：只填 `reading_zh` 就只改中文读法，`reading_en` 沿用原值
-（反之亦然）；两列都填则都替换。以前是整体覆盖，未提交的那一列被静默清空——条目还在、读法少了一半、界面
-上看不出发生过任何事。要求至少填一种读法，否则 **400**；术语为空 **400**。老格式/手写 YAML 里一个术语对应
+（反之亦然）；两列都填则都替换。旧版是整体覆盖，未提交的那一列被静默清空——条目还在、读法少了一半、界面
+上看不出发生过任何事。至少填一种读法，否则 **400**；术语为空 **400**。老格式/手写 YAML 里一个术语对应
 一个字符串时，视为中英文读法相同，第一次按列提交会把它展开成 `{zh, en}` 再改其中一列。
-落盘是**复制后整体替换**（不原地往 `term_glossary` 上加 key）：推理线程可能正在遍历这张表，原地增删会抛
-`RuntimeError: dictionary changed size during iteration`，而该异常又被 `normalize()` 的兜底接住，表现为
-「读音不对但一声不吭」。写 YAML 失败返回 **500**（不吞错），但要注意顺序是**先换内存再落盘**：这一次请求
-之后新读法在本进程内已经生效，重启后会退回文件里的旧值。`POST /glossary/cascade` 落盘失败时 `detail` 会
-直接说明"级联开关已生效但保存失败，重启后会恢复默认"。
+
+落盘是整包事务：内存里复制一份改完再整体校验，然后按「扁平快照 → settings → rules」顺序**原子写**，
+`glossary_rules.yaml` 最后写、作为提交点；任何一步失败都会回滚已写文件且不发布内存状态，接口返回 **500**。
+保存成功后服务端把已加载 normalizer 的兜底词典同步为默认场景；显式带 `scenario_id` 的请求用请求开始时的
+快照，不受影响。`POST /glossary/cascade` 只改 settings，不递增 rev、不重写规则文件。
 
 ---
 

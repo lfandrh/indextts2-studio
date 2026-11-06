@@ -59,6 +59,15 @@ from indextts.utils.presets import (
     rename_preset,
     duplicate_preset,
 )
+from indextts.utils.glossary_store import (
+    DEFAULT_SCENARIO,
+    DEFAULT_SCENARIO_NAME,
+    GlossaryConflict,
+    GlossaryReadOnly,
+    GlossaryStore,
+    GlossaryValidationError,
+    UnknownScenario,
+)
 # Pure helpers (mojibake repair / filename rules) live in their own module so
 # they can be unit-tested without importing the app or torch.
 from indextts.utils.server_helpers import (
@@ -229,6 +238,14 @@ class LazyTTS:
         # 开头把它们 pop 进局部变量），没必要为它去抢 GPU 锁。
         self._cfg_lock = threading.Lock()
         self.cfg = None
+        # 规则库在启动时只读两个小 YAML，不加载 torch；管理接口因此能秒开。
+        # store 抛异常（磁盘损坏等）不能让服务起不来：失败时按空库继续，
+        # 具体原因会写进 warning 列表并在界面横幅提示。
+        try:
+            self.glossary_store = GlossaryStore(model_dir)
+        except Exception as e:
+            logger.error("Glossary store init failed: %s", e, exc_info=True)
+            self.glossary_store = None
         self.glossary_path = os.path.join(model_dir, "glossary.yaml")
         # 级联替换开关单独存。塞进 glossary.yaml 会被当成「术语 -> 读音」，
         # _clean_glossary 只查 key 不查 value，一个 bool 会活下来变成术语。
@@ -273,15 +290,27 @@ class LazyTTS:
             normalizer.load()
             bpe_path = os.path.join(self.model_dir, cfg.dataset["bpe_model"])
             tokenizer = TextTokenizer(bpe_path, normalizer)
-            if os.path.exists(self.glossary_path):
+            # 规则库是唯一事实源；normalizer 只保留一份默认场景快照，
+            # 给未显式传快照的旧库调用方兜底。
+            snapshot = None
+            if self.glossary_store is not None:
+                try:
+                    snapshot = self.glossary_store.snapshot(None)
+                except Exception as e:
+                    logger.warning("Failed to take default glossary snapshot: %s", e, exc_info=True)
+            if snapshot is not None:
+                normalizer.term_glossary = snapshot.glossary
+                normalizer.cascade_glossary = snapshot.cascade
+            elif os.path.exists(self.glossary_path):
                 try:
                     normalizer.load_glossary_from_yaml(self.glossary_path)
                 except Exception as e:
                     logger.warning("Failed to load glossary: %s", e, exc_info=True)
-            try:
-                normalizer.load_glossary_settings(self.glossary_settings_path)
-            except Exception as e:
-                logger.warning("Failed to load glossary settings: %s", e, exc_info=True)
+            if self.glossary_store is None:
+                try:
+                    normalizer.load_glossary_settings(self.glossary_settings_path)
+                except Exception as e:
+                    logger.warning("Failed to load glossary settings: %s", e, exc_info=True)
             # 全部就绪后才发布，中途不暴露半成品。cfg 是 235 行无锁快路径的
             # 发布标志位，必须最后赋——先赋它等于在 tokenizer 还空着时就挂了
             # 「已就绪」的牌子。
@@ -498,6 +527,25 @@ tts = LazyTTS(
     cudnn_benchmark=cmd_args.cudnn_benchmark,
     gpt_batch_size=cmd_args.gpt_batch,
 )
+
+
+def _glossary_store() -> GlossaryStore:
+    """管理接口用；store 初始化失败时给明确错误，而不是 None 上继续点属性。"""
+    store = tts.glossary_store
+    if store is None:
+        raise HTTPException(503, "术语规则库初始化失败，请查看 logs/server.log")
+    return store
+
+
+def _glossary_snapshot(scenario_id: str | None):
+    """请求级快照。不存在/已删除的场景 → 400，不静默换场景。"""
+    store = tts.glossary_store
+    if store is None:
+        return None
+    try:
+        return store.snapshot(scenario_id)
+    except UnknownScenario:
+        raise HTTPException(400, f"场景不存在或已删除：{scenario_id}")
 
 # 全部数据目录锚定到 server.py 所在的项目根，与 presets（_project_root）一致；
 # 不用 CWD 相对路径，避免从别的目录启动 `python server.py` 时文件落错位置
@@ -1769,6 +1817,9 @@ def do_tts(
     cand_group: str = Form(""),
     cand_index: int = Form(-1),
     cand_total: int = Form(1),
+    # 本次生成使用的术语场景。不传=默认场景（全部启用规则，兼容旧客户端）；
+    # 传了不存在的 id 直接 400，避免「看着是 A、实际用默认」的静默错配。
+    scenario_id: str | None = Form(None),
 ):
     if file_naming not in ("title_time", "title", "default"):
         file_naming = "title_time"
@@ -1828,6 +1879,8 @@ def do_tts(
     # 夹取要放在 warn 之前：提示里的段数必须和 /segments 预览用同一个上限，
     # 否则用户会看到「预览 36 段、提示 21 段」这种自相矛盾的数字。
     max_text_tokens_per_segment = _clamp_seg_tokens(max_text_tokens_per_segment)
+    # 在请求线程取一次快照：生成途中切场景/改规则不影响本次任务。
+    glossary_snapshot = _glossary_snapshot(scenario_id)
     text_warn = None
     if len(text) > TEXT_CHARS_SOFT:
         # 只警告不拦。段数用和 /segments 同一套分词算真实值；分词器起不来
@@ -1836,7 +1889,11 @@ def do_tts(
         est_segs = None
         try:
             tts._ensure_light()
-            _tokens = tts.tokenizer.tokenize(text)
+            _tokens = tts.tokenizer.tokenize(
+                text,
+                glossary=glossary_snapshot.glossary if glossary_snapshot else None,
+                cascade=glossary_snapshot.cascade if glossary_snapshot else None,
+            )
             est_segs = len(tts.tokenizer.split_segments(
                 _tokens, max_text_tokens_per_segment=max_text_tokens_per_segment))
         except Exception as e:
@@ -2109,6 +2166,8 @@ def do_tts(
                 repetition_penalty=repetition_penalty,
                 max_mel_tokens=max_mel_tokens,
                 interval_silence=interval_silence,
+                glossary=glossary_snapshot.glossary if glossary_snapshot else None,
+                cascade=glossary_snapshot.cascade if glossary_snapshot else None,
             )
             if result is None or not os.path.exists(out_path):
                 record_event({"type": "error", "detail": "Inference produced no output"})
@@ -3440,7 +3499,12 @@ def examples_file(name: str):
 
 
 @api.post("/segments")
-def segments_preview(request: Request, text: str = Form(""), max_text_tokens_per_segment: int = Form(120)):
+def segments_preview(
+    request: Request,
+    text: str = Form(""),
+    max_text_tokens_per_segment: int = Form(120),
+    scenario_id: str | None = Form(None),
+):
     # 这个接口只吃表单。以前 JSON body 也回 200：text 取到默认值 ""，于是返回
     # {"segments": []}——看起来像"这段文本被切出了 0 段"，而且顺手绕过了下面的
     # 413 超长护栏（BUG-011）。非表单的 Content-Type 现在直接 415 说清楚。
@@ -3465,8 +3529,14 @@ def segments_preview(request: Request, text: str = Form(""), max_text_tokens_per
             "这个上限只是防止误粘贴卡死服务；正常长文请分几次生成。",
         )
     max_text_tokens_per_segment = _clamp_seg_tokens(max_text_tokens_per_segment)
+    # 整个请求只取一次快照：分段、规范化文本、数字读音共用同一份词典。
+    snapshot = _glossary_snapshot(scenario_id)
     tts._ensure_light()
-    tokens = tts.tokenizer.tokenize(text)
+    tokens = tts.tokenizer.tokenize(
+        text,
+        glossary=snapshot.glossary if snapshot else None,
+        cascade=snapshot.cascade if snapshot else None,
+    )
     segs = tts.tokenizer.split_segments(tokens, max_text_tokens_per_segment=max_text_tokens_per_segment)
 
     # 词元拼回可读文本的实现在 indextts/utils/subtitle.py，与字幕共用一份。
@@ -3477,11 +3547,19 @@ def segments_preview(request: Request, text: str = Form(""), max_text_tokens_per
     # 而数字是最高频的出错点（"5090显卡" 会被读成"五千零九十显卡"）。
     # 调用方据此在合成前就能核对读法，读错了用术语表纠正后再生成。
     normalizer = tts.normalizer
-    normalized_text = normalizer.normalize(text)
+    normalized_text = normalizer.normalize(
+        text,
+        glossary=snapshot.glossary if snapshot else None,
+        cascade=snapshot.cascade if snapshot else None,
+    )
     # 必须先取：_number_readings 里还会调 normalize（每次调用都会复位
     # normalize_fallback），放在后面读就变成"最后一个数字片段"的状态了。
     normalize_fallback = normalizer.normalize_fallback
-    numbers, truncated = _number_readings(normalizer, text)
+    numbers, truncated = _number_readings(
+        normalizer, text,
+        glossary=snapshot.glossary if snapshot else None,
+        cascade=snapshot.cascade if snapshot else None,
+    )
     return JSONResponse({
         "segments": [
             {"index": i, "text": tokens_to_readable(s)[0], "tokens": len(s)}
@@ -3491,6 +3569,8 @@ def segments_preview(request: Request, text: str = Form(""), max_text_tokens_per
         "numbers": numbers,
         "numbers_truncated": truncated,
         "normalize_fallback": normalize_fallback,
+        "scenario_id": snapshot.scenario_id if snapshot else DEFAULT_SCENARIO,
+        "scenario_name": snapshot.scenario_name if snapshot else DEFAULT_SCENARIO_NAME,
     })
 
 
@@ -3501,13 +3581,14 @@ _NUMBER_HINT_RE = re.compile(r"\d+(?:[.,:]\d+)*(?:[%％])?[年月日号点岁元
 _NUMBER_HINT_MAX = 50
 
 
-def _number_readings(normalizer, text: str):
+def _number_readings(normalizer, text: str, glossary=None, cascade=None):
     """返回 (数字读法列表, 是否被截断)。
 
     每项是 {"text": 原文片段, "read": 规范化后的读法}。读法是单独规范化
     这个片段得到的，语境可能略有差别（比如 "8:00 AM" 单独读"八点"、
     整句读"上午八点"），完整语境以 segments 里的文本为准——这里的作用
     是让调用方一眼看到"模型到底会怎么念这个数字"，方便判断要不要加术语表。
+    传入的 glossary/cascade 必须与本请求分词用的快照一致。
     """
     items, seen = [], set()
     truncated = False
@@ -3517,7 +3598,7 @@ def _number_readings(normalizer, text: str):
             continue
         seen.add(raw)
         try:
-            read = (normalizer.normalize(raw) or "").strip()
+            read = (normalizer.normalize(raw, glossary=glossary, cascade=cascade) or "").strip()
         except Exception:
             read = ""
         if read and read != raw:
@@ -3620,22 +3701,55 @@ def subtitle_export(file: str = "", fmt: str = "srt"):
     )
 
 
-def _glossary_dict():
-    tts._ensure_light()
-    return {k: v for k, v in (tts.normalizer.term_glossary or {}).items()}
+# ---- 术语规则库 -------------------------------------------------------------
+# 规则/场景的唯一事实源在 indextts.utils.glossary_store；这里只做 HTTP 映射。
+# 管理接口是应用内前端专用，include_in_schema=False，skill 的接口对账不受影响。
+
+_GLOSSARY_SAVE_LOCK = threading.Lock()
 
 
 def _glossary_payload():
-    tts._ensure_light()
-    return {
-        "glossary": _glossary_dict(),
-        "cascade": bool(getattr(tts.normalizer, "cascade_glossary", False)),
-    }
+    return _glossary_store().document()
+
+
+def _glossary_json(document, status_code: int = 200):
+    return JSONResponse(
+        document, status_code=status_code, headers={"Cache-Control": "no-store"}
+    )
+
+
+def _sync_normalizer():
+    """保存后同步已加载 normalizer 的兜底词典（默认场景 + 当前 cascade）。
+
+    显式传快照的请求不受影响；还没改造的旧库调用方读实例字段，
+    这里保证它们看到的内容与文件一致。
+    """
+    if tts.normalizer is None:
+        return
+    try:
+        snapshot = _glossary_snapshot(None)
+    except Exception as e:
+        logger.warning("Failed to sync normalizer glossary: %s", e)
+        return
+    if snapshot is not None:
+        tts.normalizer.term_glossary = snapshot.glossary
+        tts.normalizer.cascade_glossary = snapshot.cascade
+
+
+def _glossary_http_error(exc: Exception, action: str, term: str = ""):
+    """把 store 的异常翻译成 HTTP；日志里保留完整堆栈。"""
+    if isinstance(exc, GlossaryValidationError):
+        detail = exc.errors[0]["message"] if exc.errors else str(exc)
+        return HTTPException(400, detail)
+    if isinstance(exc, GlossaryReadOnly):
+        return HTTPException(409, str(exc))
+    logger.exception("Failed to %s glossary%s", action, f" ({term})" if term else "")
+    return HTTPException(500, f"{action}失败：{exc}")
 
 
 @api.get("/glossary")
 def glossary_list():
-    return JSONResponse(_glossary_payload())
+    return _glossary_json(_glossary_payload())
 
 
 @api.post("/glossary")
@@ -3645,110 +3759,199 @@ def glossary_add(
     reading_en: str = Form(""),
     cascade: bool | None = Form(None),
 ):
-    tts._ensure_light()  # 懒加载：首次请求可能是本端点，normalizer 此时还是 None
+    """旧版单条 upsert：空列沿用原值（BUG-004），新规则加入服务端当前场景。"""
     term = _fix_mojibake(term).strip()
     reading_zh = _fix_mojibake(reading_zh).strip()
     reading_en = _fix_mojibake(reading_en).strip()
-    if not term:
-        raise HTTPException(400, "请输入术语")
-    if not reading_zh and not reading_en:
-        raise HTTPException(400, "请至少输入一种读法")
-
-    # 同一术语再次提交时按列合并：只填了中文列就只改中文读法，英文列沿用原值。
-    # 以前这里整体覆盖，未提交的那一列被静默清空（BUG-004）——条目还在，读法少了一半，
-    # 界面上看不出发生过任何事。
-    existing = tts.normalizer.term_glossary.get(term)
-    if isinstance(existing, dict):
-        reading = {k: existing[k].strip() for k in ("zh", "en")
-                   if isinstance(existing.get(k), str) and existing[k].strip()}
-    elif isinstance(existing, str) and existing.strip():
-        # 老格式/手写 YAML：一个字符串表示中英文读法相同
-        reading = {"zh": existing.strip(), "en": existing.strip()}
-    else:
-        reading = {}
-    if reading_zh:
-        reading["zh"] = reading_zh
-    if reading_en:
-        reading["en"] = reading_en
-
-    # 复制写入：不要原地往 term_glossary 上加 key（见 _glossary_replace）
-    new_glossary = dict(tts.normalizer.term_glossary)
-    new_glossary[term] = reading
-    _glossary_replace(new_glossary)
-    saved = _save_glossary()
-    _set_cascade(cascade, saved)
-    logger.info("术语已更新：%s -> %s（原值 %r）", term, reading, existing)
-    return JSONResponse(_glossary_payload())
-
-
-def _glossary_replace(new_dict):
-    """整本换掉术语表，不做原地修改。
-
-    推理线程可能正在遍历 term_glossary（front.py 的 apply_glossary_terms）。
-    原地增删会抛 RuntimeError: dictionary changed size during iteration，
-    该异常又会被 normalize() 的兜底接住，表现为「读音不对但一声不吭」。
-    重新赋值是原子操作，遍历中的线程继续用旧对象，不受影响。
-    """
-    tts.normalizer.term_glossary = new_dict
-
-
-def _save_glossary():
-    """落盘术语表。出错直接 500，不吞——静默写失败会让人以为改了其实没改。"""
+    store = _glossary_store()
     try:
-        tts.normalizer.save_glossary_to_yaml(tts.glossary_path)
+        with _GLOSSARY_SAVE_LOCK:
+            document = store.legacy_add(term, reading_zh, reading_en)
+            if cascade is not None:
+                document = store.set_cascade(cascade)
     except Exception as e:
-        raise HTTPException(500, f"保存词汇表出错: {e}")
-
-
-def _set_cascade(cascade, saved: bool = True):
-    """设置级联替换开关。None 表示本次请求没带这个参数，保持原值不动。"""
-    if cascade is None:
-        return
-    tts.normalizer.cascade_glossary = bool(cascade)
-    try:
-        tts.normalizer.save_glossary_settings(tts.glossary_settings_path)
-    except Exception as e:
-        # 内存里已经改了但没落盘：提示用户「重启后会失效」，别默默丢掉
-        logger.warning("Failed to save glossary settings: %s", e, exc_info=True)
-        raise HTTPException(500, f"级联开关已生效但保存失败，重启后会恢复默认: {e}")
-    logger.info("Glossary cascade replacement: %s", tts.normalizer.cascade_glossary)
+        raise _glossary_http_error(e, "保存术语", term) from e
+    _sync_normalizer()
+    logger.info("术语已更新：%s（中文=%r 英文=%r）", term, reading_zh, reading_en)
+    return _glossary_json(document)
 
 
 @api.post("/glossary/cascade")
 def glossary_set_cascade(cascade: bool = Form(...)):
-    """只改级联开关，不动术语表。"""
-    tts._ensure_light()
-    _set_cascade(cascade)
-    return JSONResponse(_glossary_payload())
+    """只改级联开关，不动规则文件。"""
+    store = _glossary_store()
+    try:
+        with _GLOSSARY_SAVE_LOCK:
+            document = store.set_cascade(cascade)
+    except Exception as e:
+        raise _glossary_http_error(e, "保存级联设置") from e
+    _sync_normalizer()
+    logger.info("Glossary cascade replacement: %s", bool(cascade))
+    return _glossary_json(document)
 
 
 @api.delete("/glossary")
 def glossary_clear():
-    tts._ensure_light()
-    _glossary_replace({})
-    _save_glossary()
-    return JSONResponse(_glossary_payload())
+    """清空规则，保留场景结构（场景变成空场景）。"""
+    store = _glossary_store()
+    try:
+        with _GLOSSARY_SAVE_LOCK:
+            document = store.legacy_clear()
+    except Exception as e:
+        raise _glossary_http_error(e, "清空术语") from e
+    _sync_normalizer()
+    logger.info("Glossary cleared (scenarios kept)")
+    return _glossary_json(document)
 
 
 @api.delete("/glossary/{term}")
 def glossary_remove(term: str):
-    """删除单条术语。
+    """删除单条术语，并从所有场景移除引用。
 
     路径参数里的术语可能带空格/中文/符号（"PCIe 5.0"、"C++"），前端必须
-    encodeURIComponent 后再拼 URL，FastAPI 会自动做百分号解码。
+    encodeURIComponent 后再拼 URL；含 "/" 的术语（TCP/IP）受路由限制，
+    改在弹窗里删除。
     """
-    tts._ensure_light()
     term = _fix_mojibake(term).strip()
     if not term:
         raise HTTPException(400, "术语不能为空")
-    glossary = tts.normalizer.term_glossary
-    if not glossary or term not in glossary:
-        raise HTTPException(404, "术语不存在")
-    new_glossary = dict(glossary)
-    del new_glossary[term]
-    _glossary_replace(new_glossary)
-    _save_glossary()
-    return JSONResponse(_glossary_payload())
+    store = _glossary_store()
+    try:
+        with _GLOSSARY_SAVE_LOCK:
+            document = store.legacy_delete(term)
+    except KeyError as e:
+        raise HTTPException(404, "术语不存在") from e
+    except Exception as e:
+        raise _glossary_http_error(e, "删除术语", term) from e
+    _sync_normalizer()
+    logger.info("术语已删除：%s", term)
+    return _glossary_json(document)
+
+
+@api.put("/glossary/config", include_in_schema=False)
+def glossary_config(payload: dict = Body(...)):
+    """一次保存规则 + 场景（带 rev）。校验全部通过才落盘。"""
+    rules = payload.get("rules")
+    scenarios = payload.get("scenarios")
+    if not isinstance(rules, list) or not isinstance(scenarios, list):
+        raise HTTPException(422, "请求体必须包含 rules 和 scenarios 两个列表")
+    force = bool(payload.get("force"))
+    store = _glossary_store()
+    try:
+        with _GLOSSARY_SAVE_LOCK:
+            document = store.save_config(
+                rules, scenarios, rev=payload.get("rev"), force=force
+            )
+    except GlossaryConflict as e:
+        logger.info("Glossary rev conflict; client must choose overwrite or refresh")
+        return _glossary_json(e.document, status_code=409)
+    except GlossaryValidationError as e:
+        raise HTTPException(422, detail={"message": str(e), "errors": e.errors}) from e
+    except GlossaryReadOnly as e:
+        raise HTTPException(409, str(e)) from e
+    except Exception as e:
+        logger.exception("Failed to save glossary config")
+        raise HTTPException(500, f"保存术语规则失败：{e}") from e
+    _sync_normalizer()
+    return _glossary_json(document)
+
+
+@api.post("/glossary/active", include_in_schema=False)
+def glossary_set_active(scenario_id: str = Form("")):
+    """切换服务端记住的当前场景。空串=默认场景。"""
+    store = _glossary_store()
+    try:
+        with _GLOSSARY_SAVE_LOCK:
+            document = store.set_active(scenario_id)
+    except UnknownScenario as e:
+        raise HTTPException(400, f"场景不存在或已删除：{scenario_id}") from e
+    except Exception as e:
+        raise _glossary_http_error(e, "切换场景") from e
+    return _glossary_json(document)
+
+
+@api.post("/glossary/test", include_in_schema=False)
+def glossary_test(payload: dict = Body(...)):
+    """用弹窗里的草稿试读，不改任何状态。"""
+    text = payload.get("text")
+    text = text if isinstance(text, str) else ""
+    if len(text) > 2000:
+        raise HTTPException(413, "试读文本上限 2000 字")
+    rules = payload.get("rules")
+    scenarios = payload.get("scenarios")
+    if not isinstance(rules, list) or not isinstance(scenarios, list):
+        raise HTTPException(422, "试读需要完整的 rules 和 scenarios")
+    store = _glossary_store()
+    try:
+        result = store.test(
+            text, rules, scenarios,
+            payload.get("scenario_id"), bool(payload.get("cascade")),
+        )
+    except UnknownScenario as e:
+        raise HTTPException(400, f"场景不存在或已删除：{e.scenario_id}") from e
+    except GlossaryValidationError as e:
+        raise HTTPException(422, detail={"message": str(e), "errors": e.errors}) from e
+    except Exception as e:
+        logger.exception("Glossary test failed")
+        raise HTTPException(500, f"试读失败：{e}") from e
+    return JSONResponse(result)
+
+
+@api.post("/glossary/import", include_in_schema=False)
+async def glossary_import(file: UploadFile = File(...)):
+    """导入 YAML/JSON 并与现有规则合并。全量校验，失败不改任何状态。"""
+    import yaml
+    raw = await file.read(2 * 1024 * 1024 + 1)
+    if len(raw) > 2 * 1024 * 1024:
+        raise HTTPException(413, "导入文件上限 2 MB")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise HTTPException(400, "导入文件不是 UTF-8 编码") from e
+    name = (file.filename or "").lower()
+    try:
+        if name.endswith(".json") or text.lstrip().startswith("{"):
+            data = json.loads(text)
+        else:
+            data = yaml.load(text, Loader=yaml.BaseLoader)
+    except Exception as e:
+        raise HTTPException(400, f"导入文件解析失败：{e}") from e
+    store = _glossary_store()
+    try:
+        with _GLOSSARY_SAVE_LOCK:
+            summary = store.import_data(data)
+    except GlossaryValidationError as e:
+        raise HTTPException(422, detail={"message": str(e), "errors": e.errors}) from e
+    except GlossaryReadOnly as e:
+        raise HTTPException(409, str(e)) from e
+    except Exception as e:
+        logger.exception("Glossary import failed")
+        raise HTTPException(500, f"导入失败：{e}") from e
+    _sync_normalizer()
+    return JSONResponse(summary)
+
+
+@api.get("/glossary/export", include_in_schema=False)
+def glossary_export(format: str = "yaml"):
+    """导出完整 v2 文档（含停用规则与场景）；文件名固定，不拼用户输入。"""
+    fmt = (format or "yaml").lower()
+    if fmt not in ("yaml", "json"):
+        raise HTTPException(400, "format 只支持 yaml 或 json")
+    store = _glossary_store()
+    try:
+        body = store.export_text(fmt)
+    except Exception as e:
+        logger.exception("Glossary export failed")
+        raise HTTPException(500, f"导出失败：{e}") from e
+    media = "application/json" if fmt == "json" else "application/x-yaml"
+    return Response(
+        content=body,
+        media_type=f"{media}; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="glossary.{fmt}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 # ---- 使用指南：web/guide/guide.md 在服务端渲染成 HTML -------------------------

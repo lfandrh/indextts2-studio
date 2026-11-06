@@ -1,8 +1,7 @@
 ---
 name: indextts2-tts
 version: 1.2.5
-description: 调用 IndexTTS2 HTTP 服务做零样本语音合成（音色克隆）时使用。覆盖：项目目录定位（三条路：用户给路径 / 启动服务后反查端口 / 没有整合包则引导去 B 站获取）、端到端能力体检（doctor：探活+接口+冒烟合成+变速+显存与磁盘余量，确认"现在就能出声"）、能力清单（capabilities，供上游 Skill 发现音色与限制）、单条与批量合成（batch：几十上百句一次跑完、id 撞车提前拦截、单条失败不中断、按内容指纹断点续跑、只重跑改动句、manifest 逐条落盘、统一变速、回传每句时长）、预设系统（参考音频+参数一键复用，生成前强制向用户确认音色）、四种情感控制模式（同参考音频/情感音频/8维向量/情感文本）、内置示例音色（本地缺文件自动下载）、长文本分段、分段与数字读音预览（合成前核对模型实际读法，数字读错用术语表纠正）、SSE 事件流解析、保音高变速（tempo，不重新合成）、术语词汇表（多音字/数字/缩写读音纠错）、防并行合成锁、生成音频找回、只读自检、无头模式（INDEXTTS_HEADLESS，给视频配音等上游 Skill 调用）。含故障排查：模型懒加载语义（model_loaded=false 不是"正在加载"，不要轮询等待）、显存不足与 OOM（8G 卡两种表现）、音色不像/带杂音的输入检查、中断后重跑排队、磁盘满。支持本机/远程/Docker/便携整合包部署，配置全走环境变量。**交互约定：本会话第一句话必须先讲清这个 skill 能干什么、流程有哪四步，再讲你接下来要做什么；之后每一步动手前先说一句正在做什么、大概多久；定位项目（locate）只跑一次，失败就把三条路摆给用户选，不要重试或扫盘。** 触发词：IndexTTS、indextts2、语音合成、TTS、音色克隆、参考音频、预设合成、情感向量、语速调整、变速、批量配音、视频配音、有声书、整合包、项目在哪、找不到项目、能不能用、体检、显存不足、OOM、变慢、声音不像、有杂音、读音错、多音字、数字读错、模型没加载、一直加载中。
-agent_created: true
+description: 调用 IndexTTS2 HTTP 服务做零样本语音合成（音色克隆）时使用。覆盖：项目目录定位（三条路：用户给路径 / 启动服务后反查端口 / 没有整合包则引导去 B 站获取）、端到端能力体检（doctor：探活+接口+冒烟合成+变速+显存与磁盘余量，确认"现在就能出声"）、能力清单（capabilities，供上游 Skill 发现音色与限制）、单条与批量合成（batch：几十上百句一次跑完、id 撞车提前拦截、单条失败不中断、按内容指纹断点续跑、只重跑改动句、manifest 逐条落盘、统一变速、回传每句时长）、预设系统（参考音频+参数一键复用，生成前强制向用户确认音色）、四种情感控制模式（同参考音频/情感音频/8维向量/情感文本）、内置示例音色（本地缺文件自动下载）、长文本分段、分段与数字读音预览（合成前核对模型实际读法，数字读错用术语表纠正）、SSE 事件流解析、保音高变速（tempo，不重新合成）、术语词汇表（多音字/数字/缩写读音纠错）、防并行合成锁、生成音频找回、只读自检、无头模式（INDEXTTS_HEADLESS，给视频配音等上游 Skill 调用）。含故障排查：模型懒加载语义（model_loaded=false 不是"正在加载"，不要轮询等待）、显存不足与 OOM（8G 卡两种表现）、音色不像/带杂音的输入检查、中断后重跑排队、磁盘满。支持本机/远程/Docker/便携整合包部署，配置全走环境变量。触发词：IndexTTS、indextts2、语音合成、TTS、音色克隆、参考音频、预设合成、情感向量、语速调整、变速、批量配音、视频配音、有声书、整合包、项目在哪、找不到项目、能不能用、体检、显存不足、OOM、变慢、声音不像、有杂音、读音错、多音字、数字读错、模型没加载、一直加载中。
 ---
 
 # IndexTTS2 语音合成客户端
@@ -16,8 +15,8 @@ agent_created: true
 > **绝对不要轮询 `model_loaded` 等它变 true**——那会卡死在启动之后。
 
 **版本**：`python "$CLIENT" --version`（写作时 1.2.5）。排障第一步先要版本 ——
-skill 有两份副本（用户级 `~/.workbuddy/skills/` 与项目内 `skills/`），没版本号
-既判断不了用户装的是哪一版，也看不出两份是否漂移。
+skill 可能有用户级与项目内两份副本，没版本号既判断不了用户装的是哪一版，
+也看不出两份是否漂移。
 
 **优先用本 skill 自带的 `scripts/tts_client.py`**（纯标准库，零依赖，Python 3.10+）。它已封装：服务探活与启动（失败打日志尾部）、预设确认守卫、防并行文件锁、SSE 解析、中文路径下载、示例音色自动下载、保音高变速、音频找回、统一错误信息。不要手搓 HTTP 请求，除非你要调用的能力脚本没覆盖（清单见下文「这个脚本不做什么」）。
 
@@ -52,9 +51,11 @@ skill 有两份副本（用户级 `~/.workbuddy/skills/` 与项目内 `skills/`�
 | `INDEXTTS_URL` | `http://127.0.0.1:7860` | 服务地址。连远程/换端口只需改这一个 |
 | `INDEXTTS_PROJECT_DIR` | 自动探测 | 项目根（含 `server.py` 与 `indextts/`）。**仅 `ensure` 需要**；定位顺序见 Step 0（环境变量 → 脚本位置 → cwd → 记忆文件 → 端口反查）。找不到时跑 `locate` 拿三条路 |
 | `INDEXTTS_OUT_DIR` | `<项目根>/outputs/agent_tts` | agent 默认输出目录；探测不到项目根时退到 `~/.indextts2-tts/agent_tts` |
+| `INDEXTTS_CONFIG_DIR` | `~/.indextts2-tts` | 定位记忆（`project.json`）与 `doctor` 缓存的存放目录；测试或多环境可隔离 |
 | `INDEXTTS_START_TIMEOUT` | `120` | `ensure` 拉起服务后的探活上限（秒） |
 | `INDEXTTS_HTTP_TIMEOUT` | `900` | 单次请求 socket 超时（秒）。首次合成要等模型加载，别调小 |
 | `INDEXTTS_PROXY` | 空（**不走代理**） | 默认绕过系统代理，见下方说明 |
+| `INDEXTTS_HEADLESS` | 空 | 置 `1` = 无头模式（等价全局 `--headless`）：该问人的地方 stdout 输出 JSON，供上游程序化调用 |
 
 **关于代理**：脚本默认禁用 `HTTP_PROXY`/`HTTPS_PROXY`。企业网、CI、agent 沙箱常设全局代理，会把发往 `127.0.0.1` 的请求也交给代理，拿到 `502 upstream connect failed`，看起来像服务挂了。确实需要走代理时设 `INDEXTTS_PROXY=http://host:port`。
 
@@ -62,41 +63,22 @@ skill 有两份副本（用户级 `~/.workbuddy/skills/` 与项目内 `skills/`�
 
 ## 开场：第一句话先讲这个 Skill 是干什么的
 
-用户调用这个 skill 时，他只知道"我点了个东西"，不知道它能干什么、要给什么、要等多久。
-**本会话第一次响应，先把这些讲清楚**（硬规则 0），再进入 Step 0。
+用户调用时只知道"点了个东西"。**本会话第一次响应，先讲清四件事再动手**（硬规则 0）：
+**是谁的包 → 能干哪两类活 → 要用户给什么 → 接下来做什么**；同会话只念一次，不超过 10 行。
 
-### A. 用户没说具体任务（只说了"用 IndexTTS2"之类）
+用户没给具体任务时，用这个口吻：
 
 > 这个 Skill 帮你调用 **B 站 UP 主「十一君Jun」制作的 IndexTTS2 超级优化版整合包**，
-> 在你自己的电脑上完成**视频配音、文字转语音**——用一段参考音频克隆音色，不需要训练模型。
->
-> 整个流程四步：
->
-> 1. **确认整合包**——我先找到它的位置（没装的话，我会告诉你去哪拿）
-> 2. **跑起来**——启动项目，测一遍接口是否正常，确认现在就能出声
-> 3. **给素材**——你选一段 3~10 秒的参考音频（好听的声音，或你自己的），再给我要念的文稿
-> 4. **出音**——生成完成后，我直接把克隆了那个音色的音频放给你听
->
-> 现在从第 1 步开始，我先找一下你的整合包在哪，几秒。
+> 在本机完成**视频配音、文字转语音**——给一段 3~10 秒参考音频就能克隆音色，不用训练。
+> 流程四步：① 找整合包（没装我告诉你去哪拿）→ ② 起服务并试合成一句 → ③ 你给参考音频和文稿
+> → ④ 我出音并交回文件。现在从第 1 步开始，我先找一下包在哪，几秒。
 
-### B. 用户已经说清任务（"把这段文稿配成音频"）
+用户已经说清任务（"把这段文稿配成音频"）时，只确认能做什么 + 先花一两分钟体检，不要背全文。
 
-> 这个 Skill 做的是文字转语音 + 音色克隆，你这个需求能直接做。开工前先花一到两分钟做次体检
-> （起服务 + 真合成一句验证能出声），过了就按你的内容出音。现在先找整合包。
+三条边界：**只讲能干的**，不主动列短板；**排障提问不念介绍**，直接进排查；
+**同会话只念一次**。开场别塞 B 站链接——等真的找不到包时再给。
 
-### 三条边界
-
-- **只讲能干的，不主动列短板。** 用户是来用工具的，不是来听免责声明的。能力边界写在
-  「这个脚本**不**做什么」那一节，**等他问到或真的撞上了再说**，别在开场泼冷水。
-- **排障类提问不念介绍。** 用户问"声音不像怎么办""8G 卡 OOM""报错 xxx"——他已经知道自己要什么，
-  直接回一句"这个能帮上，我先看一下"然后进排查。念开场白只会显得没听人说话。
-- **同会话只念一次，长度不超过 10 行。** 第二次之后的响应直接干活，不要再自我介绍。
-
-> 上面两版是**锚点不是台词**，可以按上下文调措辞，但四个要素不能少：
-> **是谁的包 → 能干哪两类活 → 要用户给什么 → 接下来我做什么**。
-> 也别把 B 站链接塞进开场——等到第 1 步真的找不到整合包时再给，那时候才有用。
-
-## Step 0 — 先定位项目（做任何事之前）
+## Step 0 — 先定位项目（标准流程的前置，做任何事之前）
 
 **这一步不能跳。** skill 只是调用客户端，不含模型和代码，说清"项目在哪"才谈得上合成。
 
@@ -112,7 +94,7 @@ skill 有两份副本（用户级 `~/.workbuddy/skills/` 与项目内 `skills/`�
 然后跑：
 
 ```bash
-SKILL_DIR="$HOME/.workbuddy/skills/indextts2-tts"     # 用户级安装；随仓库分发的用 <项目根>/skills/indextts2-tts
+SKILL_DIR="$HOME/.workbuddy/skills/indextts2-tts"     # 改成宿主实际安装位置：Claude Code 用 ~/.claude/skills/indextts2-tts；随仓库分发的用 <项目根>/skills/indextts2-tts
 python "$SKILL_DIR/scripts/tts_client.py" locate
 ```
 
@@ -138,76 +120,48 @@ python "$SKILL_DIR/scripts/tts_client.py" locate
 
 第 ③ 条要**原话给到用户**，别自己编替代方案——换别的 TTS、让他去 GitHub 下源码都不对，他要的是能跑起来的那个包。
 
-### 自动定位的顺序
+### 自动定位顺序与包根识别
 
-脚本按这个顺序找，**越靠前越可信**，命中即停：
+脚本依次查：环境变量 → 脚本位置向上 → cwd 向上 → 记忆文件 → 本地监听端口反查。
+目录里**同时**有 `server.py` 和 `indextts\` 才算包根，别选进 `runtime\`。完整顺序与目录示例见
+`references/cli.md`「定位细节」。
 
-1. `INDEXTTS_PROJECT_DIR` 环境变量
-2. 从脚本位置向上（skill 随包放进项目内时，向上第 3 层就是包根）
-3. 从 cwd 向上（用户把包目录当工作区打开）
-4. `~/.indextts2-tts/project.json`（`locate --set` 记住的路径；目录被移动/删除会自动失效）
-5. **从本地监听端口反查**：`netstat -ano` 取监听 PID → ctypes 读进程 exe → 沿目录向上找 `server.py`
-   （便携包是 `runtime\python.exe`，venv 是 `.venv\Scripts\python.exe`，逐级校验都撞得到）
-6. 全失败 → 退出码 3，回到上面三条路
+### 便携整合包用户（IndexTTS2.0_v3 这类分发包）
 
-第 5 条只认**监听行**（对端端口为 0），不会把浏览器/客户端那条 ESTABLISHED 连接误当成服务。
+没有 `.venv`，依赖全在 `runtime\`，可能也没装 `uv`。脚本已把 `runtime\python.exe` 排在启动第一位：
+让用户双击 `start_server.bat` 后跑 `locate` 即可，不用设路径；无人值守时再
+`set INDEXTTS_PROJECT_DIR` 钉死（示例见 `references/cli.md`）。判断是否找对看 `selftest` 的 `project_dir`。
 
-### 怎么认包根
-
-目录里**同时**有 `server.py` 和 `indextts\` 才算。整合包解压后长这样：
-
-```
-IndexTTS2.0_v3\
-  ├ server.py          ← 认准这一层
-  ├ indextts\
-  ├ runtime\
-  ├ checkpoints\
-  └ start_server.bat
-```
-
-别选进 `runtime\`——用户常犯的错就是看到 `python.exe` 以为那是根。
-
-## 便携整合包用户（IndexTTS2.0_v3 这类分发包）
-
-结构上和源码仓库**不一样**：**没有 `.venv`，依赖全在 `runtime\` 里，机器上也没装 `uv`**。
-脚本已把 `runtime\python.exe` 排在启动顺序第一位，定位走上面 Step 0 的三条路。
-
-**最省事**：让用户双击包根目录的 `start_server.bat`，等 `http://127.0.0.1:7860` 能打开之后，
-`locate` 会自动从端口反推出包根——**连 `INDEXTTS_PROJECT_DIR` 都不用设**。
-
-也可以直接把路径钉死（最适合无人值守）：
-
-```bash
-# Windows cmd
-set INDEXTTS_PROJECT_DIR=D:\IndexTTS2.0_v3
-python "%USERPROFILE%\.workbuddy\skills\indextts2-tts\scripts\tts_client.py" ensure
-```
-
-```bash
-# bash / Git Bash
-export INDEXTTS_PROJECT_DIR=/d/IndexTTS2.0_v3
-python "$HOME/.workbuddy/skills/indextts2-tts/scripts/tts_client.py" ensure
-```
-
-判断是否找对了看 `selftest`：`project_dir` 那项 `ok: true` 才算对（没设时它是 false，
-但其余检查照常通过，合成也不受影响）。
-
-两条纪律：
-
-1. **别用 `uv run` / `uv sync` 启动或"修"分发包**。依赖是冻结好的，uv 会在包根新建一个空 `.venv` 把路径搞乱。
-2. **别用 pip 往 `runtime\` 里装或升级任何包**。依赖错乱基本是解压不完整或被安全软件删过，
-   正确做法是重新解压一份干净包，不是继续 pip 修。
+两条纪律：**别用 `uv run` / `uv sync` 启动或"修"分发包**（会新建空 `.venv` 搞乱路径）；
+**别用 pip 往 `runtime\` 里装或升级包**（依赖错乱就重新解压干净包，不要继续 pip 修）。
 
 ## 标准流程
 
 脚本只用标准库，Python 3.10+ 即可，不需要装任何依赖。**用绝对路径调用，别依赖 cwd。**
 
 **开头就给用户一个整体预期**，别让他不知道自己在用什么、要等多久。
-本会话第一次响应按「开场」一节的 A/B 版说完，然后按 Step 0 → 6 走。
+本会话第一次响应按「开场」一节的 A/B 版说完，然后从 Step 0 开始：定位与服务启动是所有任务共用的开头，
+之后按下面「先选路径」进入对应分支。
 **每一步动手前先说一句，每步结束说一句结果**（硬规则 1）。
 
+### 先选路径
+
+| 要做的事 | 路径 |
+|---|---|
+| 单句 / 短段落出音 | `doctor` 体检 → 确认音色 → `synth` |
+| 长文 / 整篇 / 有声书 | `segments --out tasks.json` 预检 → `batch -f`（几十句一次跑完，**不要循环调 `synth`**） |
+| 视频配音等上游 Skill 调用 | `capabilities` 看能力边界 → `batch` 拿 manifest 逐句时长 → 转交音频（见「被其他 Skill 调用」） |
+| 建 / 换音色 | `presets` / `preset-save`；生成前必须让用户确认用哪个 |
+| 某个词读错 | `segments` 看 `numbers` → `glossary --add --zh` → 再 `segments` 复核 |
+| 语速不合适 | `tempo` 对已有音频变速，不重新合成 |
+| 改了一句要返工 | `batch --only <id>`；中断后续跑用 `--resume` |
+| 连不上 / 显存 / 变慢 | `health` → `status` → `doctor`，再查「陷阱」与 `references/pitfalls.md` |
+
+四条全程不变：**定位只做一次**、**不等模型加载**（直接 `synth` / `batch` 触发）、**绝不并行生成**、
+**合成前确认音色和读音**。命令参数看下文各 Step 与「子命令速查」，这里只说顺序。
+
 ```bash
-SKILL_DIR="$HOME/.workbuddy/skills/indextts2-tts"     # 用户级安装；随仓库分发的用 <项目根>/skills/indextts2-tts
+SKILL_DIR="$HOME/.workbuddy/skills/indextts2-tts"     # 改成宿主实际安装位置：Claude Code 用 ~/.claude/skills/indextts2-tts；随仓库分发的用 <项目根>/skills/indextts2-tts
 CLIENT="$SKILL_DIR/scripts/tts_client.py"
 python "$CLIENT" presets
 ```
@@ -216,6 +170,7 @@ Windows cmd：
 
 ```bat
 set SKILL_DIR=%USERPROFILE%\.workbuddy\skills\indextts2-tts
+:: 上一行改成宿主实际安装位置后再跑
 python "%SKILL_DIR%\scripts\tts_client.py" presets
 ```
 
@@ -314,6 +269,9 @@ python "$CLIENT" segments --text-file 长文.txt --out tasks.json --preset "胡�
 - 词表是**服务端全局**的：加之前确认不会误伤别的项目；只想改这一次就直接改写稿子本身。
 - 文本 ≤ 20 字且不含数字/英文缩写时可以跳过这一步；`synth` 仍会在输出 JSON 里带回 `preview`。
 - `batch` **不逐条**做预览。长文/多句请先用本步的 `segments` 看全文读法，再生成清单。
+- **读音验收就到这里为止，不要用 ASR 回测成片音频**：语音识别输出的是归一文本，`五千零七十` 和
+  `五零七零` 都会识别成 `5070`，验不出实际读法。只有下游还要剪停顿（`silenceremove`）、担心首字被削掉时，
+  抽听一句即可。原理见 `references/pitfalls.md` §10。
 
 ### Step 4 — 合成
 
@@ -395,105 +353,25 @@ python "$CLIENT" selftest        # 服务/状态/预设/示例音色/输出目�
 
 ### 显存不够时（8G 卡必读）
 
-现象有两种，别当成两个问题：**报错**是 `CUDA out of memory`；**不报错**是生成突然慢十倍
-（Windows 静默借了共享显存）。后者更容易被误判成卡死。
-
-```bash
-python "$CLIENT" model              # 先看：模型有没有加载、现在是否正在生成
-python "$CLIENT" unload             # 释放显存。生成中会被拒（409），这是有意的
-python "$CLIENT" unload --force     # 确认要打断当前生成再卸
-```
-
-顺序建议：先 `model` 看 `generating`，别在别人正在跑的时候手一抖 `--force`。
-卸载后下一次合成要重新加载模型（首次 30~60s），这是省显存换来的代价，不是故障。
-
-真正的长期解法是调配置，不用反复卸载：
-
-```bash
-python "$CLIENT" model-config --diffusion-steps 20        # 下次生成生效，质量略降
-python "$CLIENT" model-config --w2v-fp16 off              # 只写配置 → 还得下面这一步
-python "$CLIENT" model-restart --w2v-fp16 on --diffusion-steps 20   # 一步改完并重建
-```
-
-**最容易踩的坑**：`model-config` 改精度开关（`--fp16/--w2v-fp16/...`）不会立刻生效，
-它只是写进配置——已加载的模型还是旧精度。要生效必须 `model-restart`（30~60s）。
-`--diffusion-steps` / `--cfg-rate` 是例外，下一次生成直接生效。脚本会在 stderr 把这两种情况分开说明。
+两种表现：报错 `CUDA out of memory`，或不报错但慢十倍（Windows 静默借共享显存）。
+先 `model` 看是否在生成，再用 `unload`（生成中 409）或调配置。**`model-config` 改精度开关只写配置，
+必须 `model-restart` 才生效**；`--diffusion-steps` / `--cfg-rate` 下次生成就生效。
+完整命令与踩坑见 `references/pitfalls.md` §9。
 
 ## 子命令速查
 
-| 命令 | 用途 |
-|---|---|
-| `locate [--set PATH \| --forget]` | 定位项目根；退出码 3 = 需要用户从三条路里选一条。`--set` 校验后记住路径 |
-| `ensure` | 探活；没在跑则启动并等待就绪（失败会打日志尾部） |
-| `health` | `GET /health`。连得上输出 `{ok, origin, health}`；**连不上额外带 `reason` + `detail` + `hints`**（见下方「health 说不上话时怎么看」） |
-| `status [--json]` | 模型状态 + 显存/内存/CPU 仪表（默认人话，`--json` 给原始响应） |
-| `model [--json]` | 模型自己的配置（精度开关 / 扩散步数 / CFG）+ **是否正在生成**。不占 GPU |
-| `model-load` | **显式触发加载**（30~60s）。正常不需要：`synth`/`batch`/`doctor` 首次请求会自动加载；只在“必须先加载好再干别的”的编排里用。生成中 409 |
-| `model-config --diffusion-steps 20 --cfg-rate 0.6` | 改运行配置，不重建模型。**采样参数下次生成生效；精度开关只写配置，要重启才生效** |
-| `model-restart [--diffusion-steps N] [--w2v-fp16 on\|off]` | 按当前配置重建模型（可顺带改配置），30~60s；生成中服务端 409，无 force 通道 |
-| `unload [--force]` | 卸载模型释放显存。生成中服务端会拒绝（409）；`--force` 才打断当前生成 |
-| `presets` / `preset <名>` | 预设列表 / 单个预设详情 |
-| `preset-save --name X --audio Y [--overwrite]` | 把一段参考音频存成命名音色（可带 `--emo-mode/--emo-text/--emo-vector` 与采样参数）；同名默认拒绝，`--overwrite` 才覆盖 |
-| `examples` | 内置示例音色清单（名字可直接喂给 `--voice`） |
-| `choose` | tty 下交互选预设；非 tty 打印候选并以退出码 2 退出 |
-| `segments --text "..." [--out tasks.json]` | 分段预览（不合成）：每段 `text` 是**模型实际读法**，另带 `normalized_text` 与 `numbers`（数字 `原文→读法`）；`--out` 可直接产出 batch 能吃的清单（配 `--preset/--voice/--rate` 写进 defaults） |
-| `synth ...` | 合成（见上）；默认带回 `preview` 分段/数字读法，`--no-preview` 关闭 |
-| `tempo --file X --rate 1.2` | 保音高变速，不重新合成、不占 GPU |
-| `stop <job_id> [--keep-model]` | 停止任务；`--keep-model` 保留已加载模型 |
-| `last [--open]` | 找回最近一次生成 |
-| `history` | 本次服务运行的生成历史（内存态，重启即清） |
-| `glossary [--add X --zh Y] [--delete X] [--clear --yes]` | 术语词汇表增删查；`--clear` 会清空全部术语，必须再带 `--yes` |
-| `doctor [--no-synth] [--force] [--preset X] [--voice Y]` | 端到端能力体检（真合成一句 + 变速 + 显存/磁盘余量），退出码 0 = 可以开工；结果缓存 30 分钟 |
-| `capabilities` | 机器可读能力清单：音色、情感模式、限制、命令表、退出码语义（给上游 Skill 用） |
-| `api [--json] [--strict]` | **接口对账**：拉服务端 `openapi.json`，和脚本已适配的接口清单比对。列出"服务端有但没适配"与"脚本在调但服务端没有"，并按 longform/timeline 分层归类 |
-| `batch [-f tasks.json] [--resume\|--resume-any] [--only id] [--rate 1.1] [--fail-fast]` | 批量合成；`--resume` 按**内容指纹**跳过（文本/音色/参数/变速没变才跳），`--only` 只重跑指定句，manifest 逐条落盘，单条失败不中断 |
-| `selftest` | 只读自检（不合成） |
-| `--version`（全局） | 打印 skill 版本，如 `indextts2-tts 1.2.5` |
+26 个子命令的完整清单、脚本**不**做什么、`health` 连不上时四种 `reason` 的处理、定位细节，
+都在 `references/cli.md`；任何命令的即时参数用 `python "$CLIENT" <命令> --help`。
+预设整理、历史清理、长篇台本/时间轴、`/jobs/*` 不在脚本范围，需要时直接打 HTTP，别 fiddle 脚本。
 
-### 这个脚本**不**做什么
-
-- 预设的删除 / 改名 / 复制（`DELETE /presets/{name}`、`/rename`、`/duplicate`）：AI 判断不了
-  哪个音色该留、该叫什么名字，这类整理归人。
-- 历史清理（`DELETE /history*`、`POST /history/config`）：不可回溯，不交给 agent。
-- 长篇台本工作台（`/lf/*`，81 个接口）和多轨时间轴（`/lf/tl/*`，31 个接口）：那是 WebUI 的
-  编辑工程层（素材处理、分轨混音、工程存档），和"文字出语音"不是一层。
-- `GET /jobs/*`：都强制要 `client_id`，那是浏览器标签页生成的，脚本拿不到，调了也是 400。
-
-需要这些能力时直接打 HTTP（字段见 `references/api.md`），不要 fiddle 脚本。
-不确定整合包升级后有没有新接口、或路径有没有变，跑 `api` 对账——这是唯一的漂移探针。
-
-### health 说不上话时怎么看
-
-连不上时 `health` 会带 `reason`，**四种原因的处理办法完全不同，别一句"服务挂了"糊过去**：
-
-| `reason` | 含义 | 该做什么 |
-|---|---|---|
-| `connection_refused` | 端口没人监听 | 服务没启动 → 让用户双击 `start_server.bat`，或跑 `ensure`；也可能是 `INDEXTTS_URL` 端口写错 |
-| `timeout` | 有人监听但 5 秒没应答 | 进程在但转不过来（刚启动没绑好路由，或正被一次生成占满），等 30~60s 再探；**不是模型加载**（懒加载发生在 `/tts` 内部，不会让探活超时） |
-| `http_error` | 端口有 HTTP 服务，但它不是 IndexTTS2 | 端口被别的程序占了（`detail` 里能看到对方返回什么），换端口或停掉占用进程 |
-| `dns_error` | 主机名解析不了 | 改用 IP，或检查网络/代理 |
-
-`hints` 里已经写好了对应的下一步，**原样转给用户即可**，不要自己另编排查步骤。
-`detail` 超过 160 字会被截断并带 `…`——那是别的 Web 服务返回的 HTML，不是本项目的信息。
-
-退出码：`0`=成功，`1`=失败，`2`=**需要先确认预设/音色**（见到 2 必须停下来问），`3`=**需要用户提供项目位置**（见到 3 必须把三条路摆给用户，见 Step 0）。
-headless 模式下 2 和 3 会**额外在 stdout 给结构化 JSON**（`need` + 候选），供上游程序化决策——见「被其他 Skill 调用」。
+退出码：`0`=成功，`1`=失败，`2`=需要先确认预设/音色（必须停下来问），`3`=需要用户提供项目位置
+（把三条路摆给用户）。headless 下 2/3 会在 stdout 给结构化 JSON（`need` + 候选）。
 
 ## 改脚本之后怎么自测
 
-`tests/test_client.py` 用标准库起一个假服务（`/health`、`/tts` 的 SSE、`/audio/tempo` 全有），
-**不需要 GPU、不需要真服务，10 秒跑完**：
-
-```bash
-python tests/test_client.py          # 47 项：续跑指纹、id 冲突、manifest、--only、旧代码页编码、
-                                     #      存音色同名保护、unload 409、模型配置键校验、openapi 对账、
-                                     #      health 失败原因分类、doctor summary 的两个时间、
-                                     #      懒加载提示 / model-load / 分段数字读法预览…
-```
-
-覆盖的都是"改一行就可能悄悄坏掉"的契约：退出码、stdout JSON 字段、`--resume` 语义、
-manifest 落盘、中文在 cp936/cp1252 管道下的输出。改完脚本先跑它，再用真实整合包跑
-一次 `doctor --force` 做验收——前者保证逻辑没崩，后者保证真机能出声。
+`python tests/test_client.py`：47 项离线回归（假服务、无 GPU、约 10 秒），覆盖退出码、
+stdout JSON、`--resume` 指纹、manifest、中文编码管道。改完先跑它，再用真实整合包跑
+`doctor --force` 验收。细节见 `references/testing.md`。
 
 ## 关键事实
 
@@ -520,69 +398,31 @@ manifest 落盘、中文在 cp936/cp1252 管道下的输出。改完脚本先跑
 | `references/api.md` | 全部 HTTP 端点、SSE 事件字段、状态码语义、预设目录结构 |
 | `references/parameters.md` | `/tts` 全部表单字段、四种情感模式、采样参数与调参建议 |
 | `references/pitfalls.md` | 实测踩坑清单与排查路径（含沙箱/代理/中文路径） |
-| `tests/test_client.py` | 离线回归测试（假服务、无 GPU），改脚本后先跑这个 |
+| `references/cli.md` | 26 个命令全表、脚本边界、health 失败分类、定位顺序 |
+| `references/integration.md` | 上游对接：batch 清单/manifest、断点续跑、并发、示例 |
+| `references/testing.md` | 改脚本后的离线回归与真机验收 |
 
 ## 结果不对怎么查（音色 / 读音 / 时长）
 
-合成**成功了**，但用户说"不像"、"念错了"、"不对"。这三类占绝大多数，而且都不是 bug。
+合成**成功了**但"不像 / 念错 / 时长不对"，三类都不是 bug，**先查输入**：
 
-### 一、音色不像 / 有杂音 / 带回声
-
-**先看参考音频，九成问题在这。** 这个模型是零样本克隆：参考音频里有什么，输出就带什么。
-
-| 参考音频的问题 | 输出会怎样 | 怎么办 |
-|---|---|---|
-| 背景有音乐、噪声、他人说话 | 每句话都掺进那点噪声 | 换一段**干净的**，或用前端分离人声 |
-| 有房间回声、混响 | 输出发闷、像在浴室里说话 | 换近场录音（手机贴脸录也行） |
-| 太短（< 3 秒） | 音色飘、前后不一致 | 5~15 秒、连续说完整句子 |
-| 太长（> 60 秒）或情绪起伏大 | 音色被后半段带偏 | 截取最典型的一段 |
-| 是变声器/AI 处理过的 | 电子味，越学越假 | 用原始人声 |
-| 采样率低、音量过小 | 底噪被放大 | 换 16 kHz 以上、音量正常的 |
-
-正确做法：**单人、无 BGM、无混响、5~15 秒、情绪平稳**。达不到就先把音频处理好再合成，
-换参数（`emo_weight`、`temperature`）解决不了输入的问题——只会让效果更不稳定。
-
-### 二、读音不对（多音字 / 数字 / 英文缩写）
-
-"重庆"读成 chóng qìng、"5090显卡"读成"五千零九十显卡"、iPhone 读成 i-p-h-o-n-e ——
-这是文本规范化的局限，**不是模型坏**。用术语表把它改写成"读出来就是对的"写法：
-
-```bash
-# 先在生成前看模型会怎么读（numbers 里直接给 原文→读法）
-python "$CLIENT" segments --text-file 稿子.txt
-
-# 读法不对 → 用同音汉字覆盖
-python "$CLIENT" glossary --add "重庆" --zh "虫庆"
-python "$CLIENT" glossary --add "5090" --zh "五零九零"
-python "$CLIENT" glossary                  # 看当前词表
-python "$CLIENT" glossary --delete "重庆"  # 删掉
-```
-
-- 术语**紧贴中文也能命中**：`5090显卡`、`TTS技术` 这类写法直接加 `5090` / `TTS` 即可，
-  不需要把整句写进词表。
-- `--zh` 填**同音汉字**，不是拼音 —— 词表是在送进模型前做文本替换。
-- **词表是服务端的、全局的**：`POST /api/v1/glossary` 写进
-  `<模型目录>/glossary.yaml`，由服务端 normalizer 在每次规范化时统一替换。
-  也就是说改了以后**前端页面、别的 Skill、别的项目一起变**，不是"只影响我自己"。
-- 因此：加词前想一下会不会影响别人；改完让用户知道这是全局改动。换机器/换包的词表各是各的。
-- 别写太短的词（`"C"`、`"了"`），会产生连锁误伤，详见 `references/pitfalls.md`。
-
-### 三、时长不对 / 内容缺或多
-
-| 现象 | 先查什么 |
+| 现象 | 先做什么 |
 |---|---|
-| 明显比预期短，结尾被切断 | `mel_capped=true`（静默截断）。切短文本，或调大 `--max-mel-tokens` |
-| 读出多余的句子、重复 | 文本本身有重复；或分段 token 太大（`--seg-tokens` 调小到 80~100） |
-| 整段变成静音 | 参考音频几乎无声或损坏；换音色再试一次 |
-| 语速太快/太慢但音色正常 | **别重新合成**，用 `tempo --rate` 保音高变速（Step 4b） |
+| 音色不像 / 带杂音回声 | 换参考音频：单人、无 BGM、无混响、5~15 秒、情绪平稳 |
+| 多音字 / 数字 / 缩写读错 | `segments` 看 `numbers` → `glossary --add --zh 同音汉字` → 复核 |
+| 偏短 / 结尾被切 | 看 `mel_capped`；切短文本或调大 `--max-mel-tokens` |
+| 重复 / 多出句子 | `--seg-tokens` 调到 80~100 |
+| 语速不对但音色正常 | `tempo --rate` 变速，**不要重新合成** |
 
-判断"时长是否合理"：中文约 **3~6 字/秒**（含标点停顿）。100 字的稿子出来 8 秒或 60 秒都不正常。
+词表是**服务端全局**的，改了会影响前端、别的 Skill 和别的项目——加词前想一下会不会误伤，
+改完告诉用户这是全局改动。时长参考：中文约 3~6 字/秒（含标点停顿）。
+逐条诊断、参考音频问题表、术语表边界规则见 `references/pitfalls.md` §10。
 
 ## 陷阱（高频，先看这几条）
 
 1. **SSE 不能用 EventSource**：`/tts` 是 POST + multipart，EventSource 发不了 body。必须「POST 后逐行读流」。
 2. **首次请求超时要给足**：模型加载 30~60s + 推理，客户端超时别低于 300s。
-3. **不要起第二个实例**：先 `health` 探活。`ensure` 只认 `INDEXTTS_URL`，**端口写错它会在那个端口再起一个实例**（两个实例各自加载模型，8G 卡必炸）；占着端口却返回 502 的往往是别的程序或代理，不是本项目服务。
+3. **不要起第二个实例**：先 `health` 探活。`ensure` 只认 `INDEXTTS_URL`，**端口写错它会在那个端口再起一个实例**（两个实例各自加载模型，8G 卡必炸）；占着端口却返回 502 的往往是别的程序或代理，不是本项目服务。对 `/api/v1/tts` 这类只收 POST 的接口发 GET 会回 **405**，也只代表端口有人应答，不代表服务没起来。
 4. **URL 中文编码**：输出文件名默认取文本前 15 字（中文），手工下载必须 percent-encode；但预设详情接口返回的 URL **已是编码态**，不能再编一次（`%`→`%25` 会 404）。脚本已分别处理。
 5. **`/stop` 的代价**：默认会卸载并重建模型，下次生成重新付 30~60s。能等就跑完；确实要停就带 `keep_model=1`。
 6. **`mel_capped=true` 是静默截断**：不会报错，只是音频变短。
@@ -647,85 +487,14 @@ python "$CLIENT" glossary --delete "重庆"  # 删掉
 `health.model_loaded`。`health` 返回 `model_loaded:false` 只代表“还没人请求过”，
 不代表加载失败或正在进行。
 
-### batch 的输入输出
+### batch 的输入输出、返工与并发
 
-输入（`-f tasks.json`；省略或 `-` 读 stdin）：
+清单格式（`defaults` + `items`）、manifest 字段（含对齐时间轴要用的 `duration`）、
+`--resume` / `--only` 的指纹规则、并发纪律和一段最小对接示例，见 `references/integration.md`。
 
-```json
-{
-  "defaults": { "preset": "胡桃", "rate": 1.0 },
-  "items": [
-    { "id": "line_001", "text": "第一句台词。" },
-    { "id": "line_002", "text": "第二句要快一点。", "rate": 1.15 },
-    { "id": "line_003", "text_file": "line3.txt", "emo_mode": 3, "emo_text": "愤怒地质问" }
-  ]
-}
-```
+三条底线：
 
-- `id` 决定输出文件名，也是 manifest 里回指的唯一键。**必须唯一**：同一个 id（或归一化后
-  同名，如 `第1句/开场` 与 `第1句:开场`）会写同一个 `.wav`，后一条静默覆盖前一条。
-  客户端在合成前就拦下并退出码 1（`reason: duplicate_ids`），不会让你拿到两份一样的音频。
-- `defaults` 会被每项覆盖；`text` 与 `text_file` 二选一（后者容忍 BOM）。
-  **`text_file` 的相对路径按清单文件所在目录解析**，不是 cwd——上游从别的工作目录用
-  `-f /abs/tasks.json` 调用时不会踩空。
-- `rate` 是合成后的**保音高变速**，不重新推理。统一调语速用它，别去改 `length_penalty`（不线性）。
-
-输出（stdout 一行 JSON，同时**逐条落盘**到 `<outdir>/<日期>/manifest.json`）：
-
-```json
-{"ok":false,"skill_version":"1.2.5","source":"tasks.json","manifest":".../manifest.json",
- "count":3,"done":2,"skipped":0,"failed":1,"not_run":0,"interrupted":false,
- "filtered_out":0,"only":null,"total_audio_seconds":7.2,"failed_ids":["line_003"],
- "items":[{"id":"line_001","ok":true,"out":"...","duration":2.41,"sample_rate":22050,"rate":1.0},
-          {"id":"line_003","ok":false,"error":"..."}]}
-```
-
-- **`duration` 是给对齐时间轴用的**：服务端 `done` 事件不含时长，客户端读 wav 头量。
-- 单条失败不中断，跑完再汇总；`--fail-fast` 改成遇错即停。
-- **manifest 每完成一条就刷新**：进程被杀/Ctrl-C 时前面条目的时长与路径都还在，
-  只是 `"interrupted": true`、`ok: false`。
-- 退出码：`0`=全部成功，`1`=有失败或被中断（看 `failed_ids` / `interrupted`）。
-
-### 返工与断点续跑
-
-```bash
-python "$CLIENT" batch -f tasks.json --resume          # 只重跑"内容变了"的
-python "$CLIENT" batch -f tasks.json --only line_012   # 只重跑指定句
-```
-
-`--resume` 判的是**内容指纹**（文本 + 预设/音色 + emo 参数 + rate），不是"文件在不在"：
-
-| 情况 | 行为 |
-|---|---|
-| 指纹一致 | 跳过，`skipped: true`、`reason: "unchanged"`，`duration` 从文件读 |
-| 文本/音色/emo/rate 改过 | **重新生成**（这是"改稿后配音"的正确行为） |
-| wav 读不出时长（上次写一半） | 重新生成，不复用坏文件 |
-| 旧版本留下的文件，没指纹记录 | 重新生成一次（宁可多跑一句，也不交付旧音频） |
-| 加 `--resume-any` | 老语义：文件存在就跳过，不看内容 |
-
-全部命中时**连服务都不探活**，秒回。返工只改一句就用 `--only <id>`，比整批传一遍快。
-
-### 并发
-
-服务端全局单锁串行推理，**不要并行跑多个 `batch` / `synth`**。上游有多轨需求就并成一个列表交给
-`batch`——它在一个进程里串行跑完，锁只抢一次。
-
-### 上游对接示例
-
-```python
-env = {**os.environ, "INDEXTTS_HEADLESS": "1"}
-
-caps = json.loads(run([py, client, "capabilities"], env=env).stdout)
-if not caps["ok"]:
-    return "TTS 服务不可用（先跑 doctor / locate）"
-
-tasks = {"defaults": {"preset": "胡桃"},
-         "items": [{"id": s.id, "text": s.text} for s in script]}
-m = json.loads(run([py, client, "batch", "-f", "-"],
-                   input=json.dumps(tasks), env=env).stdout)
-
-for it in m["items"]:
-    if it["ok"]:
-        timeline.place(it["id"], it["out"], it["duration"])
-```
+- 一次 `batch` 跑完，**不循环 `synth`、不并行多个 `batch`**；
+- `id` 必须唯一，撞车时改自己的 id，**不要自动改名重试**；
+- 退出码 `0`=全成，`1`=有失败或被中断，看 `failed_ids` / `interrupted`。
 

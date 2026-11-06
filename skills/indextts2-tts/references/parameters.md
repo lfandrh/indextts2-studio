@@ -1,6 +1,10 @@
 # `/tts` 参数参考
 
-`POST /api/v1/tts`，`multipart/form-data`。下表是完整字段集（27 个），默认值取自服务端函数签名。
+`POST /api/v1/tts`，`multipart/form-data`。下面列出本 skill 会用到的 28 个字段（含单独说明的
+`scenario_id`），默认值取自服务端函数签名。
+
+另有 4 个字段没有命令行封装：`seed`（复现种子，同时喂 `use_random` 与 torch 采样）、
+`cand_group` / `cand_index` / `cand_total`（前端多候选互相关联）。需要时按服务端 `openapi.json` 直传。
 
 ## 1. 必传
 
@@ -8,6 +12,9 @@
 |---|---|---|
 | `text` | string | 合成文本。全空白 → 400；> 10000 字 → 413；> 2000 字只警告 |
 | `spk_audio` | file | 音色参考音频。≤ 32 MB，wav/mp3/flac/ogg/opus；`/status.ffmpeg` 为 true 时另收 m4a/aac/wma（转成 WAV），**魔数嗅探**校验真实格式。视频不能直接传给 `/tts`——前端会先走 `POST /audio/extract` 抽成 WAV（见 api.md） |
+
+可选：`scenario_id`（表单字符串）指定术语场景。不传 = 默认场景（全部全局启用规则），旧客户端行为不变；
+传不存在的 id → 400。请求开始时取场景快照，生成途中改规则 / 切场景只影响下一次。
 
 ## 2. 情感控制（四选一，由 `emo_mode` 决定）
 
