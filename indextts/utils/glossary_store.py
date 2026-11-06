@@ -440,6 +440,11 @@ class GlossaryStore:
             if isinstance(value, dict):
                 zh = str(value.get("zh") or "").strip()
                 en = str(value.get("en") or "").strip()
+            elif isinstance(value, (list, tuple, set)):
+                self._warn(
+                    f"术语「{term}」的读法不是文本（{type(value).__name__}），已跳过"
+                )
+                continue
             elif value is None:
                 zh = en = ""
             else:
