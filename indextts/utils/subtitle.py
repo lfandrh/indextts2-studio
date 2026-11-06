@@ -14,6 +14,7 @@ HTTP 与落盘编排在 server.py，算法都在这里。
 import json
 import os
 import re
+from bisect import bisect_right
 from difflib import SequenceMatcher
 
 WORD_SEP = "▁"  # sentencepiece 的词首标记
@@ -219,11 +220,15 @@ def segment_texts(original: str, seg_token_lists):
     return tile(pts), "proportional"
 
 
-def cumulative_slices(seg_samples, sampling_rate, interval_ms):
+def cumulative_slices(seg_samples, sampling_rate, interval_ms, gaps_samples=None):
     """每段样本数 + 段间静音 -> 每段在成品音频里的起止秒。
 
     与 infer_v2 的拼接严格同式：``sil_dur = int(sr * ms / 1000)``，
     段与段之间插入静音，【最后一段之后不补】。200ms@22050 = 4410 采样。
+
+    gaps_samples：逐段插入的样本数（长度 = len(seg_samples)-1）。给了就按它算，
+    因为段头/段尾裁过边之后每处接缝的实际长度可能不同，用单一个 interval_ms
+    会让字幕比音频偏几十毫秒——这种偏差用户能在剪辑软件里看出来。
     """
     if sampling_rate <= 0 or not seg_samples:
         return []
@@ -234,7 +239,11 @@ def cumulative_slices(seg_samples, sampling_rate, interval_ms):
     for i, n in enumerate(seg_samples):
         n = max(0, int(n))
         out.append((cur / sampling_rate, (cur + n) / sampling_rate))
-        cur += n + (gap if i < total - 1 else 0)
+        if i < total - 1:
+            if gaps_samples is not None and i < len(gaps_samples):
+                cur += n + max(0, int(gaps_samples[i]))
+            else:
+                cur += n + gap
     return out
 
 
@@ -351,3 +360,189 @@ def load_sidecar(path: str):
     if not isinstance(data.get("segments"), list):
         return None
     return data
+
+
+# ---- 句级字幕：ASR token 时间戳 -> 用户原文切句 ----------------------------
+# 段边界本来就是物理精确的，段内却没有时间点。按字数插值等于假设每个字一样快，
+# 数字读法、英文、标点停顿会让它越偏越远，所以这里只借 ASR 从成品波形读出的
+# token 时间戳，【不做任何估算】。ASR 输出是归一文本（同音字、数字读法都会被
+# 抹平），因此字幕正文永远用用户原文，ASR 串只用来算字符位置的映射。
+#
+# 本模块依旧是纯标准库：不 import torch / onnxruntime / sherpa_onnx。
+# 识别与解码编排在 indextts/utils/asr_align.py，HTTP 与落盘在 server.py。
+
+# 句末标点。刻意不含半角句点 "."："IndexTTS2.0" 这种小数点不能当句子边界。
+SENTENCE_PUNCT = "。！？!?；;，、,：:\n"
+# ASR 归一串与原文差太多时（大段数字展开 / 术语全变），映射出来的切点不可信。
+ASR_MIN_MATCH_RATIO = MIN_MATCH_RATIO
+
+
+def _asr_chars_with_ends(tokens):
+    """ASR token 流 -> (可读串, 每个 token 消费完时的字符下标)。
+
+    sherpa-onnx 的 Paraformer 词表里英文是 BPE，续词 token 以 ``@@`` 结尾；
+    去掉后缀后才能与原文对齐。``ends[i]`` 对应 ``timestamps[i]``。
+    """
+    parts = []
+    ends = []
+    total = 0
+    for tok in tokens or []:
+        sym = tok[:-2] if tok.endswith("@@") else tok
+        parts.append(sym)
+        total += len(sym)
+        ends.append(total)
+    return "".join(parts), ends
+
+
+def _anchor_orig_to_asr(original: str, asr: str):
+    """「原文字符位置 -> ASR 串字符位置」的分段线性映射，返回 (映射函数, 相似度)。
+
+    是 ``_anchor_map`` 的镜像：那边把规范化串位置映回原文，这里反过来。
+    ``_fold_case`` 只折叠 ASCII 大小写、长度不变，difflib 的下标才能映射回去。
+    数字读法展开会让两串长度不同，只能靠匹配块插值，不能按字符下标硬取。
+    """
+    if not original or not asr:
+        return None, 0.0
+    if max(len(original), len(asr)) > MAX_ALIGN_CHARS:
+        return None, 0.0
+    matcher = SequenceMatcher(None, _fold_case(original), _fold_case(asr), autojunk=False)
+    pts = []
+    for block in matcher.get_matching_blocks():
+        pts.append((block.a, block.b))
+        pts.append((block.a + block.size, block.b + block.size))
+    pts.sort()
+    clean = []
+    for a, b in pts:
+        if clean and clean[-1][0] == a:
+            clean[-1] = (a, max(b, clean[-1][1]))
+        elif clean and b < clean[-1][1]:
+            continue
+        else:
+            clean.append((a, b))
+    if len(clean) < 2:
+        return None, matcher.ratio()
+    tail_a, tail_b = clean[-1]
+
+    def map_pos(x: int) -> int:
+        if x <= clean[0][0]:
+            return max(0, clean[0][1] - (clean[0][0] - x))
+        for i in range(1, len(clean)):
+            a1, b1 = clean[i]
+            if x <= a1:
+                a0, b0 = clean[i - 1]
+                span = a1 - a0
+                if span <= 0:
+                    return b1
+                return int(round(b0 + (x - a0) / span * (b1 - b0)))
+        return tail_b + (x - tail_a)
+
+    return map_pos, matcher.ratio()
+
+
+def split_sentences(text: str):
+    """在用户原文上按标点切句，返回 [(句子首字符下标, 句子文本), ...]。
+
+    标点归上一句；「。！」这种连续标点并入前一句，不产生只有标点的空句；
+    末尾没有标点的残余也算一句。
+    """
+    out = []
+    start = 0
+    for i, ch in enumerate(text):
+        if ch in SENTENCE_PUNCT:
+            part = text[start:i + 1]
+            if part.strip():
+                lead = len(part) - len(part.lstrip())
+                piece = part.strip()
+                only_punct = all(c in SENTENCE_PUNCT or c.isspace() for c in piece)
+                if only_punct and out:
+                    out[-1] = (out[-1][0], out[-1][1] + piece)
+                else:
+                    out.append((start + lead, piece))
+            start = i + 1
+    tail = text[start:]
+    if tail.strip():
+        lead = len(tail) - len(tail.lstrip())
+        out.append((start + lead, tail.strip()))
+    return out
+
+
+def sentences_from_segment(seg, tokens, timestamps):
+    """一段 -> 句级 cue 列表。返回 ``(cues, method)``。
+
+    ``tokens`` / ``timestamps`` 是 ASR 对【这一段裁出来的波形】的解码结果，
+    时间戳相对段首、单位秒。``seg`` 是 ``{start, end, text}``（绝对秒）。
+
+    ``method == "asr"`` 表示时间来自音频实测；``"segment"`` 表示本段降级成
+    整段一条（ASR 未装 / 时间戳为空 / 对齐率过低 / 切不出句），时间仍是
+    物理段边界，绝不会变成估算值。
+    """
+    text = (seg.get("text") or "").strip()
+    start = float(seg.get("start") or 0.0)
+    end = float(seg.get("end") or 0.0)
+    fallback = ([{"start": start, "end": end, "text": text}], "segment")
+    if not text or end <= start:
+        return ([], "segment") if not text else fallback
+
+    tokens = list(tokens or [])
+    try:
+        ts = [float(x) for x in (timestamps or [])]
+    except (TypeError, ValueError):
+        return fallback
+    if not tokens or len(ts) != len(tokens) or len(ts) < 2:
+        return fallback
+    if any(ts[i] > ts[i + 1] for i in range(len(ts) - 1)):
+        return fallback
+
+    asr, ends = _asr_chars_with_ends(tokens)
+    if not asr or not ends or ends[-1] <= 0:
+        return fallback
+    mapper, ratio = _anchor_orig_to_asr(text, asr)
+    if mapper is None or ratio < ASR_MIN_MATCH_RATIO:
+        return fallback
+    sents = split_sentences(text)
+    if not sents:
+        return fallback
+    if len(sents) == 1:
+        # 一段本来就是一句，句级 == 段级，没必要硬造切点
+        return [{"start": start, "end": end, "text": sents[0][1]}], "asr"
+
+    starts = []
+    for j, (pos, _sent) in enumerate(sents):
+        if j == 0:
+            t = start  # 段首用物理边界，最稳；后续句子才借 ASR 时间戳
+        else:
+            p = max(0, min(mapper(pos), max(0, ends[-1] - 1)))
+            ti = min(bisect_right(ends, p), len(ts) - 1)
+            t = start + ts[ti]
+        if starts:
+            t = max(t, starts[-1] + 0.05)  # 不许后一句早于前一句
+        t = min(t, end - 0.05 * (len(sents) - j))  # 保证每句都有正时长
+        starts.append(t)
+
+    cues = []
+    for j, (_pos, sent) in enumerate(sents):
+        cue_end = starts[j + 1] if j + 1 < len(sents) else end
+        if cue_end <= starts[j]:
+            continue
+        cues.append({
+            "start": round(starts[j], 4),
+            "end": round(cue_end, 4),
+            "text": sent,
+        })
+    return (cues, "asr") if cues else fallback
+
+
+def cues_from_sidecar(data):
+    """sidecar -> 字幕条目：优先句级，没有 sentences 就自动退回段级。
+
+    旧缓存（只有 segments）、ASR 未启用、或整份对齐失败时都走段级，
+    「昨天还能导、今天就 404」不会发生。导出格式化一行都不用改。
+    """
+    if not isinstance(data, dict):
+        return []
+    sentences = data.get("sentences")
+    if isinstance(sentences, list) and sentences:
+        cues = cues_from_segments(sentences)
+        if cues:
+            return cues
+    return cues_from_segments(data.get("segments"))

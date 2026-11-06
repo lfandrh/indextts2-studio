@@ -285,12 +285,12 @@
         <div class="pitem">
           <label for="gapMs">段间停顿 <span>interval_silence</span></label>
           <div class="nrow">
-            <input type="number" id="gapMs" min="10" max="500" step="1" value="200" aria-label="段间停顿毫秒数">
-            <button class="rdef" type="button" data-pid="gapMs" aria-label="段间停顿恢复默认值" title="恢复默认值 200"><svg class="ico" aria-hidden="true"><use href="#i-restore"></use></svg></button>
+            <input type="number" id="gapMs" min="200" max="500" step="1" value="300" aria-label="段间停顿毫秒数">
+            <button class="rdef" type="button" data-pid="gapMs" aria-label="段间停顿恢复默认值" title="恢复默认值 300"><svg class="ico" aria-hidden="true"><use href="#i-restore"></use></svg></button>
           </div>
         </div>
       </div>
-      <div class="hint-line">段间停顿只在文本被切成多段时生效（单段无效）；每多一段就多一个这样的停顿。</div>
+      <div class="hint-line">段间停顿只在文本被切成多段时生效（单段无效）；每多一段就多一个这样的停顿。最低 200ms：每段开头/结尾各留 100ms 自然收尾，再短就没有语音余韵了。</div>
       <button class="linkbtn" id="resetParams" type="button">恢复推荐默认值</button>
     </details>
 
@@ -453,8 +453,9 @@
         </button>
         <span class="dl-name mono" id="subName"></span>
       </div>
-      <!-- 字幕面板：每条一行，点一行从该句起播。时间是引擎给出的每段物理边界，
-           不是按字数估的；粒度是「一段一条」，段内不再切句 -->
+      <!-- 字幕面板：每条一行，点一行从该句起播。时间是引擎给出的物理边界，
+           不是按字数估的。优先句级（每句一条）；ASR 不可用时回退段级，
+           原因由 app.js 依据 /status 与 sidecar.align_method 显示在下方提示条 -->
       <div class="sub-panel" id="subPanel" hidden>
         <div class="sub-head">
           <span class="sub-grain" id="subGrain"></span>

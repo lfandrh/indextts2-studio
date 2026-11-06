@@ -101,7 +101,7 @@ from indextts.utils.server_helpers import (
 # torch 的情况下被单测钉住；HTTP 与落盘编排留在本文件。
 from indextts.utils.subtitle import (
     SIDECAR_VERSION,
-    cues_from_segments,
+    cues_from_sidecar,
     format_srt,
     format_vtt,
     load_sidecar,
@@ -343,6 +343,9 @@ class LazyTTS:
                             use_w2v_fp16=self.init_kwargs.get("use_w2v_fp16", True),
                             use_qwen_fp16=self.init_kwargs.get("use_qwen_fp16", True),
                             gpt_batch_size=self.init_kwargs.get("gpt_batch_size", 0),
+                            # 段头/段尾各保留多少空白（毫秒）。0 = 关闭裁剪，退回旧行为。
+                            # 默认 100 对应「段间停顿下限 200」，两者必须一起改。
+                            edge_trim_ms=self.init_kwargs.get("edge_trim_ms", 100),
                         )
                         t.normalizer = self.normalizer
                         t.tokenizer = self.tokenizer
@@ -633,6 +636,13 @@ def _clamp_seg_tokens(value: int) -> int:
 #   - 调用方通常把自己一整套配置原样透传，1e-7 量级的浮点误差不该让整个
 #     生成失败。夹到边界 + 记一条 warning，任务仍能正常出结果。
 # 每段 token 仍是 400，因为它越界会直接抛 range() 错误（见 _clamp_seg_tokens）。
+# 段间停顿（interval_silence）的合法区间与默认值。
+# 下限 200 不是拍脑袋：infer_v2 会把每段头/尾多余空白各裁到 edge_trim_ms=100ms
+# 再拼接，头尾已经占了 200ms，比这更短的接缝物理上做不到（只能倒扣）。
+# 与其静默返回一个用户没设过的值，不如在这里抬到下限，并让前端滑块也以 200 起。
+INTERVAL_SILENCE_MIN = 200
+INTERVAL_SILENCE_MAX = 500
+INTERVAL_SILENCE_DEFAULT = 300
 GEN_PARAMS = (
     # (表单字段, 下界, 上界, 是否整数, 默认值)
     ("emo_weight", 0.0, 1.0, False, 0.65),
@@ -1366,6 +1376,17 @@ def status():
     data["audio_max_mb"] = AUDIO_MAX_BYTES // 1048576
     data["video_exts"] = list(VIDEO_EXTS) if _ffmpeg_bin() else []
     data["video_max_mb"] = VIDEO_MAX_BYTES // 1048576
+    # 句级字幕能力自检：只看运行时包与权重文件，不加载 233MB 模型。
+    # 前端据此区分「这台机器缺 ASR」和「这份旧音频生成时还没启用」，
+    # 二者都表现为段级字幕，但给用户的下一步完全不同。
+    try:
+        from indextts.utils.asr_align import align_status
+        data["subtitle_align"] = align_status()
+    except Exception:
+        data["subtitle_align"] = {
+            "available": False, "reason": "error", "runtime": False,
+            "weights": False, "derived_ready": False,
+        }
     return data
 
 
@@ -1810,7 +1831,7 @@ def do_tts(
     num_beams: int = Form(3),
     repetition_penalty: float = Form(10.0),
     max_mel_tokens: int = Form(1500),
-    interval_silence: int = Form(200),      # 段间停顿（毫秒）
+    interval_silence: int = Form(INTERVAL_SILENCE_DEFAULT),  # 段间停顿（毫秒），下限见常量区
     file_naming: str = Form("title_time"),   # title_time / title / default
     # 多候选（F3）：同一轮生成的几条各自是一次普通 /tts，靠这三个字段互相关联。
     # 旧前端不传 → 空组、单条，行为与改动前逐字节一致。
@@ -1850,12 +1871,13 @@ def do_tts(
             "这个上限只是防止误粘贴卡死服务；正常长文请分几次生成。",
         )
     # 段间停顿。infer_v2 原本把它写死成 200ms，这里放开给调用方。
-    # 下限 10 而不是 0：完全不留停顿时多段文本会连成一串，听起来像漏气。
+    # 下限 200：infer_v2 每段头/尾各保留 100ms 自然收尾，头尾已经占了 200ms，
+    #   用户设 100 物理上做不到（只能倒扣）。老客户端仍可能传 10~199，一律抬到 200。
     # 上限 500：再大就不是「停顿」而是「朗读课文」了，超出请分段生成。
-    # 注意：签名已是 int = Form(200)，非数字输入在进函数体前就被 FastAPI 以
+    # 注意：签名已是 int = Form(...)，非数字输入在进函数体前就被 FastAPI 以
     # 422 拒绝，和其它 int 参数（max_text_tokens_per_segment 等）行为一致，
     # 这里只需要夹一下范围，不需要再转一次。
-    interval_silence = max(10, min(500, interval_silence))
+    interval_silence = max(INTERVAL_SILENCE_MIN, min(INTERVAL_SILENCE_MAX, interval_silence))
     # 8 个生成参数统一夹取（区间与前端滑块同口径，见 GEN_PARAMS 上方注释）。
     # 这里必须在建 job 之前完成：越界值一旦进了推理线程，报错就与输入无关了。
     _gen = _clamp_gen_params({
@@ -2191,6 +2213,7 @@ def do_tts(
                     getattr(model, "segment_slices", None),
                     interval_silence,
                     len(str(text or "")),
+                    wav_path=out_path,
                 )
                 record_event({
                     "type": "done",
@@ -2695,7 +2718,7 @@ def presets_create(
     repetition_penalty: float = Form(10.0),
     max_mel_tokens: int = Form(1500),
     max_text_tokens_per_segment: int = Form(120),
-    interval_silence: int = Form(200),
+    interval_silence: int = Form(INTERVAL_SILENCE_DEFAULT),
     prompt_audio: UploadFile | None = File(None),
     emo_audio: UploadFile | None = File(None),
     overwrite: bool = Form(False),
@@ -2746,7 +2769,7 @@ def presets_create(
             "max_mel_tokens": _gen["max_mel_tokens"],
             # 与 do_tts 同款校验：以前只 int() 不查范围，越界值照样入库
             "max_text_tokens_per_segment": _clamp_seg_tokens(max_text_tokens_per_segment),
-            "interval_silence": max(10, min(500, int(interval_silence))),
+            "interval_silence": max(INTERVAL_SILENCE_MIN, min(INTERVAL_SILENCE_MAX, int(interval_silence))),
         },
     }
 
@@ -3609,29 +3632,52 @@ def _number_readings(normalizer, text: str, glossary=None, cascade=None):
     return items, truncated
 
 
-# ---- 字幕（段级） -----------------------------------------------------------
+# ---- 字幕（段级 / 句级） -----------------------------------------------------
 # 时间是【物理】的：成品音频 = 各段波形 + 段间静音拼接，引擎在拼接前把每段的
 # 样本数记进 model.segment_slices（见 infer_v2._record_segment_slices），这里
 # 只负责存盘与出文件。算法与格式化都在 indextts/utils/subtitle.py（纯标准库）。
 #
+# 段内本来没有时间点。装上 ASR 运行时后，会拿成品 wav 再跑一遍 Paraformer，
+# 从波形里读出 token 时间戳，把段切成句级（utils/asr_align.py）。ASR 不可用、
+# 超时、对齐失败时逐段降级回段级：字幕是附属产物，绝不能让生成报错。
+#
 # 必须在生成结束的那一刻存：过了这刻只剩成品 wav 的总时长，每段边界再也算不出来。
 # 所以每次生成都顺手落一份 sidecar（几 KB），用户点不点导出都一样。
 
-def _subtitle_save(wav_name: str, text_source: str, segments, interval_ms, chars: int) -> bool:
-    """把本次生成的段边界快照写进 data/subtitles/<同名>.json；失败只返回 False。"""
+def _subtitle_align(wav_path, segments):
+    """尽量把段级快照切成句级；任何异常都返回 (None, 原因)，不影响生成。"""
+    try:
+        import importlib
+        aligner = importlib.import_module("indextts.utils.asr_align")
+        return aligner.align_sidecar(wav_path, segments)
+    except Exception as exc:
+        logger.warning("字幕句级对齐跳过，改用段级：%s", exc)
+        return None, "error"
+
+
+def _subtitle_save(wav_name: str, text_source: str, segments, interval_ms, chars: int,
+                   wav_path=None) -> bool:
+    """把本次生成的字幕快照写进 data/subtitles/<同名>.json；失败只返回 False。"""
     if not segments:
         # 引擎没记上（段数对不上 / 内部异常）：没有字幕可用，前端据此说明原因。
         return False
+    sentences, align_method = _subtitle_align(wav_path, segments)
     data = {
         "version": SIDECAR_VERSION,
         "file": os.path.basename(wav_name),
-        "granularity": "segment",
+        # 只有真的拿到句级结果才标 sentence；ASR 没装 / 全部降级时与旧版
+        # 逐字节一致，旧缓存、旧前端、旧单测都不受影响。
+        "granularity": "sentence" if sentences else "segment",
+        "align_method": align_method,
         "text_source": text_source or "",
         "interval_ms": int(interval_ms or 0),
         "chars": int(chars or 0),
         "created_at": time.time(),
         "segments": segments,
     }
+    if sentences:
+        # version 仍是 1：segments 原样保留，旧代码读到也只当段级用。
+        data["sentences"] = sentences
     if not save_sidecar(sidecar_path(SUBTITLE_DIR, wav_name), data):
         logger.warning("字幕缓存写入失败：%s（音频已生成成功，不影响播放）", wav_name)
         return False
@@ -3655,16 +3701,16 @@ def _subtitle_load_or_404(name: str) -> dict:
 
 @api.get("/subtitle", include_in_schema=False)
 def subtitle_get(file: str = ""):
-    """段级字幕条目（前端字幕面板用）。纯读盘 + 纯计算，不占推理锁。"""
+    """字幕条目（前端字幕面板用）。句级优先、旧缓存自动回退段级；不占推理锁。"""
     data = _subtitle_load_or_404(file)
-    segments = data["segments"]
     return JSONResponse({
         "file": data["file"],
         "granularity": data.get("granularity") or "segment",
+        "align_method": data.get("align_method") or "",
         "text_source": data.get("text_source") or "",
         "created_at": data.get("created_at"),
-        "segments": segments,
-        "cues": cues_from_segments(segments),
+        "segments": data["segments"],
+        "cues": cues_from_sidecar(data),
     })
 
 
@@ -3679,7 +3725,7 @@ def subtitle_export(file: str = "", fmt: str = "srt"):
     if fmt not in ("srt", "vtt"):
         raise HTTPException(400, f"字幕格式只支持 srt / vtt，收到 {fmt}")
     data = _subtitle_load_or_404(file)
-    cues = cues_from_segments(data["segments"])
+    cues = cues_from_sidecar(data)
     if not cues:
         raise HTTPException(404, "这份音频的字幕条目是空的（文本被全部过滤）")
     if fmt == "srt":

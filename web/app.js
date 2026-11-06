@@ -316,7 +316,7 @@ function applyDraft(draft) {
     if (draft.repPen != null) $("repPen").value = draft.repPen;
     if (draft.maxMel != null) $("maxMel").value = draft.maxMel;
     if (draft.segTokens != null) $("segTokens").value = draft.segTokens;
-    if (draft.gapMs != null) $("gapMs").value = draft.gapMs;
+    if (draft.gapMs != null) $("gapMs").value = Math.max(GAP_MS_MIN, Number(draft.gapMs) || GAP_MS_MIN);
     if (Array.isArray(draft.emoVector)) setVecInputs(draft.emoVector);
   }
   syncDraftUi();
@@ -1227,7 +1227,10 @@ const PARAM_BY_ID = Object.fromEntries(PARAMS.map((p) => [p.id, p]));
 // 锁定范围 = 「高级参数」折叠里的 9 项（do_sample 开关 + 8 个数值）；
 // segTokens 属于"怎么切句"，不锁。
 const LOCKED_IDS = ["doSample", ...PARAMS.filter((p) => p.lock).map((p) => p.id)];
-const DEFAULTS = { emoWeight: 0.65, temperature: 0.8, topP: 0.8, topK: 30, numBeams: 3, maxMel: 1500, segTokens: 120, repPen: 10, lenPen: 0, gapMs: 200, doSample: true };
+// gapMs 下限 200 与服务端 INTERVAL_SILENCE_MIN 同口径：infer_v2 会把每段头/尾多余
+// 空白各裁到 100ms，头尾已占 200ms，再短的接缝物理上做不到。
+const GAP_MS_MIN = 200;
+const DEFAULTS = { emoWeight: 0.65, temperature: 0.8, topP: 0.8, topK: 30, numBeams: 3, maxMel: 1500, segTokens: 120, repPen: 10, lenPen: 0, gapMs: 300, doSample: true };
 
 // 前 5 项参数是 range + 配套的 <id>Num 数字框；repPen / lenPen / gapMs 天生就是
 // number 输入，本身即数字框，此时 numEl 直接返回它自己。
@@ -2060,6 +2063,10 @@ const VIDEO_MIMES = [
   "video/webm", "video/x-msvideo", "video/x-flv",
 ];
 let serverFfmpeg = false;                 // 服务端有没有 ffmpeg
+// /status 下发的「当前这台机器能不能出句级字幕」，与某份 sidecar 里记录的
+// align_method（生成时的历史结果）不是一回事：能力修好了但旧音频仍是段级，
+// 提示语要说「重新生成」，而不是继续报「缺组件」。
+let subtitleAlignState = null;
 let supportedAudioExts = AUDIO_EXTS.slice();
 let supportedAudioMimes = AUDIO_MIMES.slice();
 let supportedVideoExts = [];
@@ -2105,6 +2112,7 @@ function updateAudioHint() {
    避免用户刚选完就被清空。 */
 function applyAudioCapability(status) {
   serverFfmpeg = !!status.ffmpeg;
+  subtitleAlignState = status.subtitle_align || null;
   const raw = Array.isArray(status.audio_exts) ? status.audio_exts : null;
   const exts = raw && raw.length
     ? raw.filter((e) => typeof e === "string" && e.startsWith("."))
@@ -3446,6 +3454,40 @@ function subShowNote(msg) {
   el.hidden = !msg;
 }
 
+/* 段级字幕的「为什么」：/status 给的是当前能力，sidecar 的 align_method 是
+   生成那一刻的历史结果。两者分开说，才不会出现「组件明明装好了，界面还
+   一直提示缺组件」这种误导。 */
+const SUB_ALIGN_REASON = {
+  runtime_missing: "缺少 ASR 运行时 sherpa-onnx",
+  model_missing: "缺少 Paraformer 权重（checkpoints/paraformer-zh-en-ts/）",
+  load_failed: "ASR 模型加载失败（检查 MSVC v14 x64 运行库与权重完整性）",
+  no_audio: "成品音频不可读",
+  bad_audio: "成品音频格式异常",
+  unavailable: "没拿到可用的 ASR 时间戳",
+  error: "对齐组件异常",
+};
+
+/* 返回 {badge, note}：badge 是 subGrain 上的短后缀，note 是下方提示条全文。 */
+function subAlignHint(d) {
+  if (d.granularity === "sentence") {
+    return d.align_method === "mixed"
+      ? { badge: "", note: "部分段落没能切句，这几段仍按整段显示；时间依旧来自真实音频边界。" }
+      : { badge: "", note: "" };
+  }
+  const st = subtitleAlignState;
+  if (st && st.available === false) {
+    const why = SUB_ALIGN_REASON[st.reason] || `对齐不可用（${st.reason}）`;
+    return { badge: " · 句级不可用", note: `这份音频是段级字幕：${why}。补齐后重新生成一次即可变成一句一条。` };
+  }
+  const hist = d.align_method ? SUB_ALIGN_REASON[d.align_method] : "";
+  return {
+    badge: " · 句级未启用",
+    note: hist
+      ? `这份音频生成时${hist}，已回退段级；重新生成一次即可获得句级字幕。`
+      : "这份音频生成时还没启用句级对齐，重新生成一次即可变成一句一条。",
+  };
+}
+
 // 与 selStopTick 同一套收尾：监听器挂在 <audio> 上，换音频/清空时必须显式移除
 function subDetach() {
   if (subTick) { player.removeEventListener("timeupdate", subTick); subTick = null; }
@@ -3489,9 +3531,14 @@ async function loadSubCues() {
     const r = await apiFetch(`/subtitle?file=${encodeURIComponent(file)}`);
     const d = await r.json();
     subCues = d.cues || [];
-    $("subGrain").textContent = `${subCues.length} 条 · 段级（每段一条） · 文本：`
+    const subGrain = d.granularity === "sentence"
+      ? "句级（每句一条）" : "段级（每段一条）";
+    const hint = subAlignHint(d);
+    const grainEl = $("subGrain");
+    grainEl.textContent = `${subCues.length} 条 · ${subGrain}${hint.badge} · 文本：`
       + (SUB_TEXT_SOURCE[d.text_source] || "用户原文");
-    subShowNote("");
+    grainEl.title = hint.note || grainEl.textContent;
+    subShowNote(hint.note);
     renderSubList();
     return true;
   } catch (e) {
@@ -3885,8 +3932,10 @@ function applyPresetToForm(j) {
   if (adv.repetition_penalty != null) $("repPen").value = adv.repetition_penalty;
   if (adv.max_mel_tokens != null) $("maxMel").value = adv.max_mel_tokens;
   if (adv.max_text_tokens_per_segment != null) $("segTokens").value = adv.max_text_tokens_per_segment;
-  // 旧预设没有 interval_silence 字段，保持当前值不动（不强行回默认值）
-  if (adv.interval_silence != null) $("gapMs").value = adv.interval_silence;
+  // 旧预设没有 interval_silence 字段，保持当前值不动（不强行回默认值）。
+  // 有字段但小于当前下限（改动前允许 10~199）时抬到下限，否则界面会显示一个
+  // 提交后被服务端悄悄改成 200 的值——那正是「设了没反应」的观感来源。
+  if (adv.interval_silence != null) $("gapMs").value = Math.max(GAP_MS_MIN, Number(adv.interval_silence) || GAP_MS_MIN);
   if (j.emo_text != null) $("emoText").value = j.emo_text || "";
   // emo_random 一直有存，此前漏了回填
   if (j.emo_random != null) $("emoRandom").checked = !!j.emo_random;

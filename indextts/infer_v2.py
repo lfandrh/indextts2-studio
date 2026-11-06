@@ -7,6 +7,7 @@ import json
 import re
 import time
 import librosa
+import numpy as np
 import torch
 import torchaudio
 from torch.nn.utils.rnn import pad_sequence
@@ -62,7 +63,7 @@ class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
             use_s2mel_fp16=False, use_w2v_fp16=False, use_qwen_fp16=True, aux_paths=None,
-            gpt_batch_size=0, gpt_batch_max_gib=0.0
+            gpt_batch_size=0, gpt_batch_max_gib=0.0, edge_trim_ms=100
     ):
         """
         Args:
@@ -85,6 +86,10 @@ class IndexTTS2:
                 批处理会把 `行数 × beam 数 × max_mel_tokens` 条 cache 同时留在显存里，8G 卡上
                 b=4（12 行 beam）跑满 1500 token 要 2.2GB，实测被 Windows 显存换页拖到每步
                 ~370ms（比不批处理慢 8 倍），所以按预算反推最大行数并自动降级。
+            edge_trim_ms (int): 每段音频头/尾各保留多少毫秒的空白（默认 100）。模型每段
+                输出都自带 0.1~0.4s 的开头/收尾空白，不裁的话用户设的 interval_silence
+                只占接缝的四分之一，「设 200 听到 800」。0 = 关闭裁剪，退回旧行为。
+                裁剪后接缝 = max(interval_silence, 2*edge_trim_ms)，见 _trim_edge_blank。
         """
         # Ensure auxiliary models are available
         if aux_paths is None:
@@ -122,6 +127,9 @@ class IndexTTS2:
         # 拼 batch 后每行每 token 的成本会明显下降，详见 docs/PERFORMANCE_zh.md。
         self.gpt_batch_size = int(gpt_batch_size or 0)
         self.gpt_batch_max_gib = float(gpt_batch_max_gib or 0.0)
+        # 段头/段尾空白保留量：0 = 不裁（旧行为）。>0 时接缝下限被动抬高到 2×该值，
+        # 因为头尾已经各占了这么多，再想更短只能倒扣（做不到）。
+        self.edge_trim_ms = max(0, int(edge_trim_ms or 0))
         # 最近一次生成实际怎么批的（mode/rows/groups/降级原因），/model/state 透给前端。
         # 只在生成时才知道真实行数（取决于当时的空闲显存与段数），所以不能只靠参数回显。
         self.gpt_batch_last = None
@@ -385,6 +393,63 @@ class IndexTTS2:
         code_lens = torch.tensor(code_lens, dtype=torch.long, device=device)
         return codes, code_lens
 
+    def _trim_edge_blank(self, wav, sampling_rate, keep_ms=None, rel=0.03):
+        """裁掉段头/段尾多余的空白，每侧只留 keep_ms（默认取 self.edge_trim_ms）。
+
+        返回 (波形, 实际留头样本数, 实际留尾样本数)。
+
+        为什么必须裁：模型每段是【独立生成】的，它不知道上下文，念完最后一个字会
+        继续拖几个静音 token 才收尾，开口前也会先空一段。实测 14 段里头部空白
+        269~429ms、尾部 73~444ms（差 6 倍）。这些空白不是我们插的，但用户听得见，
+        于是「设 200 听到 800」——用户设的那 200ms 只占接缝四分之一。
+
+        判据：10ms 分帧算 RMS，取本段最大帧能量的 3% 当阈值。用相对阈值而不是
+        固定 dB，是因为不同音色的整体响度差很多，固定阈值必然误判。实测阈值从
+        2% 调到 10%，切点只漂 10~50ms——语音结束到静音是一条干净的断崖。
+
+        保底：
+        - keep_ms<=0、全静音段、过短段：原样返回（绝不凭空造静音）；
+        - 只能变短不能变长：本来空白就不足 keep 的段，有多少留多少。
+        """
+        keep = int(getattr(self, "edge_trim_ms", 0) or 0) if keep_ms is None else max(0, int(keep_ms))
+        if keep <= 0 or wav is None or wav.numel() == 0:
+            return wav, 0, 0
+        mono = wav[0].to(torch.float32).cpu().numpy()
+        hop = max(1, int(sampling_rate * 0.01))
+        nf = mono.shape[0] // hop
+        if nf < 4:  # 不足 40ms，没有可判断的静音结构
+            return wav, 0, 0
+        frames = mono[: nf * hop].reshape(nf, hop)
+        rms = np.sqrt((frames * frames).mean(axis=1))
+        peak = float(rms.max())
+        if peak <= 0:  # 整段纯数字零
+            return wav, 0, 0
+        voiced = np.nonzero(rms > max(peak * rel, 1e-6))[0]
+        if voiced.size == 0:
+            return wav, 0, 0
+        voiced_lo = int(voiced[0]) * hop
+        voiced_hi = (int(voiced[-1]) + 1) * hop
+        pad = int(sampling_rate * keep / 1000.0)
+        lo = max(0, voiced_lo - pad)
+        hi = min(mono.shape[0], voiced_hi + pad)
+        head = voiced_lo - lo
+        tail = hi - voiced_hi
+        if lo == 0 and hi >= mono.shape[0]:
+            return wav, head, tail  # 本来就没多余空白
+        return wav[:, lo:hi].contiguous(), head, tail
+
+    @staticmethod
+    def seam_gaps(seam_ms, sampling_rate, head_kept, tail_kept):
+        """每处接缝要插入的样本数 = 目标接缝 - 段尾实际保留 - 下段段头实际保留。
+
+        head_kept / tail_kept 是 _trim_edge_blank 返回的实际保留量（空白不够时
+        会小于 edge_trim_ms）。逐段算而不是用固定值，就是为了让「空白本来就不足」
+        的那处接缝不会明显短一截——用户设 300 就该听到 300。
+        """
+        n = int(sampling_rate * max(0, int(seam_ms)) / 1000.0)
+        return [max(0, n - int(tail_kept[i]) - int(head_kept[i + 1]))
+                for i in range(min(len(head_kept), len(tail_kept)) - 1)]
+
     def interval_silence(self, wavs, sampling_rate=22050, interval_silence=200):
         """
         Silences to be insert between generated segments.
@@ -403,30 +468,37 @@ class IndexTTS2:
         sil_dur = int(sampling_rate * interval_silence / 1000.0)
         return torch.zeros(channel_size, sil_dur)
 
-    def insert_interval_silence(self, wavs, sampling_rate=22050, interval_silence=200):
+    def insert_interval_silence(self, wavs, sampling_rate=22050, interval_silence=200,
+                                gaps_samples=None):
         """
         Insert silences between generated segments.
         wavs: List[torch.tensor]
+        gaps_samples: 每两个相邻段之间要插入的样本数（长度 = len(wavs)-1）。
+            给了就按它逐段插——段头/段尾已经各自留了空白，用固定长度会让
+            「空白原本就短」的那处接缝明显短一截。None = 旧行为，所有接缝同一个值。
         """
-
-        if not wavs or interval_silence <= 0:
+        if not wavs:
+            return wavs
+        if gaps_samples is None and interval_silence <= 0:
             return wavs
 
         # get channel_size
         channel_size = wavs[0].size(0)
-        # get silence tensor
-        sil_dur = int(sampling_rate * interval_silence / 1000.0)
-        sil_tensor = torch.zeros(channel_size, sil_dur)
+        if gaps_samples is None:
+            sil_dur = int(sampling_rate * interval_silence / 1000.0)
+            gaps_samples = [sil_dur] * max(0, len(wavs) - 1)
 
         wavs_list = []
         for i, wav in enumerate(wavs):
             wavs_list.append(wav)
             if i < len(wavs) - 1:
-                wavs_list.append(sil_tensor)
+                n = max(0, int(gaps_samples[i])) if i < len(gaps_samples) else 0
+                wavs_list.append(torch.zeros(channel_size, n))
 
         return wavs_list
 
-    def _record_segment_slices(self, wavs, seg_token_lists, text, sampling_rate, interval_silence):
+    def _record_segment_slices(self, wavs, seg_token_lists, text, sampling_rate, interval_silence,
+                               gaps_samples=None):
         """把「每段在成品音频里的起止秒 + 对应的原文片段」存进 self.segment_slices。
 
         字幕靠这个快照把文本对齐到时间轴。时间是【物理】的：成品 = 各段波形 +
@@ -445,7 +517,7 @@ class IndexTTS2:
                                len(wavs), len(seg_token_lists))
                 return
             seg_samples = [int(w.shape[-1]) for w in wavs]
-            boundaries = cumulative_slices(seg_samples, sampling_rate, interval_silence)
+            boundaries = cumulative_slices(seg_samples, sampling_rate, interval_silence, gaps_samples)
             texts, method = segment_texts(text, seg_token_lists)
             if len(texts) != len(boundaries):
                 logger.warning("Subtitle skipped: %d texts vs %d boundaries",
@@ -684,7 +756,7 @@ class IndexTTS2:
     def infer(self, spk_audio_prompt, text, output_path,
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
-              use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
+              use_emo_text=False, emo_text=None, use_random=False, interval_silence=300,
               verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0,
               glossary=None, cascade=None, **generation_kwargs):
         # more_segment_before 是上游 quick_streaming_tokens 的别名：保持形参名
@@ -722,7 +794,7 @@ class IndexTTS2:
     def infer_generator(self, spk_audio_prompt, text, output_path,
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
-              use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
+              use_emo_text=False, emo_text=None, use_random=False, interval_silence=300,
               verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0,
               glossary=None, cascade=None, **generation_kwargs):
         print(">> starting inference...")
@@ -877,11 +949,18 @@ class IndexTTS2:
         repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
         max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
         sampling_rate = 22050
+        # 目标接缝（毫秒）= max(用户设的, 头尾保留量之和)。
+        # 段头/段尾各留 edge_trim_ms 时，比 2×该值更短的目标做不到——头尾已经占了
+        # 这么多，再想更短只能倒扣。所以 UI 的最小值也必须是 2×edge_trim_ms。
+        _seam_ms = max(int(interval_silence or 0), 2 * int(getattr(self, "edge_trim_ms", 0) or 0))
         # s2mel CFM 参数：允许通过 generation_kwargs 覆盖实例默认值
         diffusion_steps = generation_kwargs.pop("diffusion_steps", getattr(self, "diffusion_steps", 25))
         inference_cfg_rate = generation_kwargs.pop("inference_cfg_rate", getattr(self, "inference_cfg_rate", 0.7))
 
         wavs = []
+        # 每段裁剪后实际保留的头部/尾部空白样本数（接缝要按这俩精算，见下方拼接段）
+        _head_kept = []
+        _tail_kept = []
         gpt_gen_time = 0
         gpt_forward_time = 0
         s2mel_time = 0
@@ -1122,19 +1201,37 @@ class IndexTTS2:
             if verbose:
                 print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
             # wavs.append(wav[:, :-512])
-            wavs.append(wav.cpu())  # to cpu before saving
+            # 裁掉段头/段尾多余空白再入列：模型每段自带 0.1~0.4s 静音，不裁的话
+            # 用户设的 interval_silence 只占接缝四分之一。必须在这里（append 之前）
+            # 裁，因为 _record_segment_slices 用的是 wavs 里的真实段长——裁完字幕
+            # 时间轴自动跟着变短，不需要额外补偿。
+            wav_cpu = wav.cpu()
+            wav_cpu, _kept_head, _kept_tail = self._trim_edge_blank(wav_cpu, sampling_rate)
+            _head_kept.append(_kept_head)
+            _tail_kept.append(_kept_tail)
+            wavs.append(wav_cpu)  # to cpu before saving
             if stream_return:
-                yield wav.cpu()
+                yield wav_cpu
                 if silence is None:
-                    silence = self.interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
+                    # 流式拿不到「下一段头留了多少」，只能按两侧各留满 padding 算固定值；
+                    # 非流式路径逐段精算，接缝严格等于设定值。
+                    silence = self.interval_silence(
+                        wavs, sampling_rate=sampling_rate,
+                        interval_silence=max(0, _seam_ms - 2 * int(getattr(self, "edge_trim_ms", 0) or 0)))
                 yield silence
         end_time = time.perf_counter()
 
+        # 每处接缝的插入量 = 目标接缝 - 段尾实际保留 - 下段段头实际保留。
+        # 逐段算而不用固定值：空白本来就不足 edge_trim_ms 的段实际保留会偏小，
+        # 固定插入会让那一处接缝明显短一截。这样算出来用户设多少就听到多少。
+        _gap_samples = self.seam_gaps(_seam_ms, sampling_rate, _head_kept, _tail_kept)
+
         # 段边界要在插入段间静音【之前】记录：insert_interval_silence 会返回把静音
         # 张量也塞进去的新列表，那时 len 和样本数都不是「每段音频」的口径了。
-        self._record_segment_slices(wavs, segments, text, sampling_rate, interval_silence)
+        self._record_segment_slices(wavs, segments, text, sampling_rate, _seam_ms, _gap_samples)
 
-        wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
+        wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate,
+                                           interval_silence=_seam_ms, gaps_samples=_gap_samples)
         if not wavs:
             # 调试细节只进内部日志；用户只需知道「为什么没有音频」
             if os.environ.get("INDEXTTS_DEBUG_BATCH"):
