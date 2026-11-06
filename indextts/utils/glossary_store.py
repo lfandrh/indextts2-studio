@@ -49,7 +49,58 @@ _PINYIN_TONE_PATTERN = (
     r"(?:[aeiouüv]|[ae]i|u[aio]|ao|ou|i[aue]|[uüv]e|[uvü]ang?|uai|"
     r"[aeiuv]n|[aeio]ng|ia[no]|i[ao]ng)|ng|er)([1-5])"
 )
+_PINYIN_TONE_RE = re.compile(_PINYIN_TONE_PATTERN, re.IGNORECASE)
 _EMAIL_RE = re.compile(r"^[a-zA-Z0-9]+@[a-zA-Z0-9]+\.[a-zA-Z]+$")
+
+
+def valid_pinyin_tone(text: str, match) -> bool:
+    """正则命中的这一段该不该按「拼音+声调」保护。
+
+    PINYIN_TONE_PATTERN 是为词表校验写的（要能匹配 A5、E1、XUAN4 这些
+    拼音 token），直接拿来扫正文过于宽松，实测误伤：
+
+        v2.1.3    ->  v2 当成「韵母 v + 第二声」，2 被吞
+        A4 纸     ->  A4 当成「a + 第四声」，4 被吞
+        win10     ->  win1 当成「wen 之类」，1 被吞
+        京A12345  ->  A1 被保护，1 被吞
+
+    误伤的后果不是「读得不准」，而是数字直接消失，所以按真实拼音的
+    书写规则再筛一遍。判定放在这里而不是 front.py：术语弹窗的试读
+    （/glossary/test -> detect_lang）必须和主链路同口径，两处各写一份
+    迟早会漂移。
+    """
+    letters = match.group(1) or ""
+    if not letters:
+        return False
+    low = letters.lower()
+
+    # 拼音音节没有以 v / ü 开头的（女=nv、绿=lv、鱼=yu），v2 必是版本号
+    if low[0] in "vü":
+        return False
+
+    # 单个元音 + 数字：真拼音只有 a/o/e，且用户输入是小写（e2、o2）。
+    # 写成大写单字母的（A4、E3、O2）在中文正文里一律是型号编号。
+    if len(low) == 1 and letters.isupper():
+        return False
+
+    # 声母 w 只接 a/o/u/e（wa wo wu we wen wang），没有 wi- 音节，
+    # 所以 win7 / win10 / wifi5 都是系统名，不是拼音
+    if low[0] == "w" and (len(low) < 2 or low[1] not in "aoue"):
+        return False
+
+    # 声调数字后面还跟着数字、或跟着「.数字」→ 版本号/编号（v2.1.3、10.5.2）
+    tail = text[match.end():match.end() + 2]
+    if tail and tail[0].isdigit():
+        return False
+    if len(tail) > 1 and tail[0] in ".．" and tail[1].isdigit():
+        return False
+
+    return True
+
+
+def has_pinyin_tone(text: str) -> bool:
+    """文本里有没有真拼音声调（型号、版本号、系统名不算）。"""
+    return any(valid_pinyin_tone(text, m) for m in _PINYIN_TONE_RE.finditer(text))
 
 
 class GlossaryValidationError(ValueError):
@@ -136,7 +187,10 @@ def detect_lang(text: str) -> str:
         return "zh"
     if _EMAIL_RE.match(text):
         return "zh"
-    if re.search(_PINYIN_TONE_PATTERN, text, re.IGNORECASE):
+    # 早先这里用裸正则判断，A4 paper / win10 build 这类纯英文会命中
+    # "A4"/"win1" 被判成中文，术语试读就取错了读法列（主链路的
+    # use_chinese 早已按真拼音判断，两处口径必须一致）。
+    if has_pinyin_tone(text):
         return "zh"
     return "en"
 

@@ -63,7 +63,8 @@ class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
             use_s2mel_fp16=False, use_w2v_fp16=False, use_qwen_fp16=True, aux_paths=None,
-            gpt_batch_size=0, gpt_batch_max_gib=0.0, edge_trim_ms=100
+            gpt_batch_size=0, gpt_batch_max_gib=0.0, edge_trim_ms=100,
+            adaptive_pause=True,
     ):
         """
         Args:
@@ -130,6 +131,10 @@ class IndexTTS2:
         # 段头/段尾空白保留量：0 = 不裁（旧行为）。>0 时接缝下限被动抬高到 2×该值，
         # 因为头尾已经各占了这么多，再想更短只能倒扣（做不到）。
         self.edge_trim_ms = max(0, int(edge_trim_ms or 0))
+        # 自适应停顿：句末边界用用户设定的 interval_silence，硬切边界（超长句被迫
+        # 从中间断开）只用一半——半句话中间不该出现整句那么长的空隙。
+        # 关掉则所有接缝同一个值，回到只看 interval_silence 的行为。
+        self.adaptive_pause = bool(adaptive_pause)
         # 最近一次生成实际怎么批的（mode/rows/groups/降级原因），/model/state 透给前端。
         # 只在生成时才知道真实行数（取决于当时的空闲显存与段数），所以不能只靠参数回显。
         self.gpt_batch_last = None
@@ -438,17 +443,54 @@ class IndexTTS2:
             return wav, head, tail  # 本来就没多余空白
         return wav[:, lo:hi].contiguous(), head, tail
 
+    # 硬切边界（长句超过 max_text_tokens_per_segment 被迫从中间断开）的停顿系数。
+    # 半句话中间不该出现整句那么长的空隙，但也不能没有——听感上还是要有换气，
+    # 所以取用户设定值的一半，并受 2×edge_trim_ms 下限约束。
+    HARDCUT_PAUSE_RATIO = 0.5
+
     @staticmethod
-    def seam_gaps(seam_ms, sampling_rate, head_kept, tail_kept):
+    def seam_targets(segments, base_ms, edge_trim_ms=0, adaptive=True):
+        """每处接缝的目标停顿时长（毫秒），长度 = len(segments) - 1。
+
+        句末边界（段尾是句号/问号/感叹号，允许后面跟引号）用 base_ms；
+        硬切边界用 base_ms * HARDCUT_PAUSE_RATIO。两者都不低于
+        2×edge_trim_ms——段首段尾各留的余韵已经占掉这么多，再短做不到。
+        adaptive=False 时所有接缝都用 base_ms，回到旧行为。
+        """
+        count = max(0, len(segments) - 1)
+        if count == 0:
+            return []
+        floor_ms = 2 * int(edge_trim_ms or 0)
+        base = max(0, int(base_ms or 0))
+        hard = max(int(round(base * IndexTTS2.HARDCUT_PAUSE_RATIO)), floor_ms)
+        sentence_ms = max(base, floor_ms)
+        if not adaptive:
+            return [sentence_ms] * count
+        marks = set(TextTokenizer.punctuation_marks_tokens)
+        return [
+            sentence_ms if TextTokenizer._ends_sentence(segments[i], marks) else hard
+            for i in range(count)
+        ]
+
+    @staticmethod
+    def seam_gaps(seam_ms, sampling_rate, head_kept, tail_kept, seam_ms_list=None):
         """每处接缝要插入的样本数 = 目标接缝 - 段尾实际保留 - 下段段头实际保留。
 
         head_kept / tail_kept 是 _trim_edge_blank 返回的实际保留量（空白不够时
         会小于 edge_trim_ms）。逐段算而不是用固定值，就是为了让「空白本来就不足」
         的那处接缝不会明显短一截——用户设 300 就该听到 300。
+
+        seam_ms_list 给了就逐处用自己的目标值（自适应停顿），没给就都用 seam_ms。
         """
-        n = int(sampling_rate * max(0, int(seam_ms)) / 1000.0)
-        return [max(0, n - int(tail_kept[i]) - int(head_kept[i + 1]))
-                for i in range(min(len(head_kept), len(tail_kept)) - 1)]
+        count = min(len(head_kept), len(tail_kept)) - 1
+        out = []
+        for i in range(max(0, count)):
+            target = seam_ms
+            if seam_ms_list is not None and i < len(seam_ms_list):
+                target = seam_ms_list[i]
+            n = int(sampling_rate * max(0, int(target)) / 1000.0)
+            out.append(max(0, n - int(tail_kept[i]) - int(head_kept[i + 1])))
+        return out
 
     def interval_silence(self, wavs, sampling_rate=22050, interval_silence=200):
         """
@@ -953,6 +995,13 @@ class IndexTTS2:
         # 段头/段尾各留 edge_trim_ms 时，比 2×该值更短的目标做不到——头尾已经占了
         # 这么多，再想更短只能倒扣。所以 UI 的最小值也必须是 2×edge_trim_ms。
         _seam_ms = max(int(interval_silence or 0), 2 * int(getattr(self, "edge_trim_ms", 0) or 0))
+        # 每处接缝的目标值（句末 = _seam_ms，硬切 = 一半）。循环前就算好：
+        # 流式路径要逐段 yield，拿不到"下一段头留了多少"，但边界类型是已知的。
+        _seam_targets = self.seam_targets(
+            segments, _seam_ms,
+            getattr(self, "edge_trim_ms", 0),
+            getattr(self, "adaptive_pause", True),
+        )
         # s2mel CFM 参数：允许通过 generation_kwargs 覆盖实例默认值
         diffusion_steps = generation_kwargs.pop("diffusion_steps", getattr(self, "diffusion_steps", 25))
         inference_cfg_rate = generation_kwargs.pop("inference_cfg_rate", getattr(self, "inference_cfg_rate", 0.7))
@@ -1212,19 +1261,23 @@ class IndexTTS2:
             wavs.append(wav_cpu)  # to cpu before saving
             if stream_return:
                 yield wav_cpu
-                if silence is None:
-                    # 流式拿不到「下一段头留了多少」，只能按两侧各留满 padding 算固定值；
-                    # 非流式路径逐段精算，接缝严格等于设定值。
-                    silence = self.interval_silence(
-                        wavs, sampling_rate=sampling_rate,
-                        interval_silence=max(0, _seam_ms - 2 * int(getattr(self, "edge_trim_ms", 0) or 0)))
+                # 流式拿不到「下一段头留了多少」，只能按两侧各留满 padding 算；
+                # 非流式路径逐段精算，接缝严格等于设定值。
+                # 目标值按本段边界类型取（句末 / 硬切），逐段重算而不是全程一个值。
+                _cur_target = (_seam_targets[seg_idx]
+                               if seg_idx < len(_seam_targets) else _seam_ms)
+                silence = self.interval_silence(
+                    wavs, sampling_rate=sampling_rate,
+                    interval_silence=max(0, _cur_target - 2 * int(getattr(self, "edge_trim_ms", 0) or 0)))
                 yield silence
         end_time = time.perf_counter()
 
         # 每处接缝的插入量 = 目标接缝 - 段尾实际保留 - 下段段头实际保留。
         # 逐段算而不用固定值：空白本来就不足 edge_trim_ms 的段实际保留会偏小，
         # 固定插入会让那一处接缝明显短一截。这样算出来用户设多少就听到多少。
-        _gap_samples = self.seam_gaps(_seam_ms, sampling_rate, _head_kept, _tail_kept)
+        # 目标值本身也逐处不同：句末边界用用户设定值，硬切边界只用一半。
+        _gap_samples = self.seam_gaps(_seam_ms, sampling_rate, _head_kept, _tail_kept,
+                                      _seam_targets)
 
         # 段边界要在插入段间静音【之前】记录：insert_interval_silence 会返回把静音
         # 张量也塞进去的新列表，那时 len 和样本数都不是「每段音频」的口径了。

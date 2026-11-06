@@ -643,6 +643,9 @@ def _clamp_seg_tokens(value: int) -> int:
 INTERVAL_SILENCE_MIN = 200
 INTERVAL_SILENCE_MAX = 500
 INTERVAL_SILENCE_DEFAULT = 300
+# 段头/段尾各保留的余韵（毫秒）。infer_v2 的默认值，预览接口在模型未加载时
+# 也要能算出「这处会停多久」，所以必须在这里有一份。
+EDGE_TRIM_MS_DEFAULT = 100
 GEN_PARAMS = (
     # (表单字段, 下界, 上界, 是否整数, 默认值)
     ("emo_weight", 0.0, 1.0, False, 0.65),
@@ -3527,6 +3530,7 @@ def segments_preview(
     text: str = Form(""),
     max_text_tokens_per_segment: int = Form(120),
     scenario_id: str | None = Form(None),
+    interval_silence: int = Form(INTERVAL_SILENCE_DEFAULT),
 ):
     # 这个接口只吃表单。以前 JSON body 也回 200：text 取到默认值 ""，于是返回
     # {"segments": []}——看起来像"这段文本被切出了 0 段"，而且顺手绕过了下面的
@@ -3583,11 +3587,35 @@ def segments_preview(
         glossary=snapshot.glossary if snapshot else None,
         cascade=snapshot.cascade if snapshot else None,
     )
+    # 预览这次会听到什么样的停顿：句末边界用用户设定值，硬切（长句被迫从中间
+    # 断开）只用一半。前端据此在合成前就能看出「这里为什么停得短」。
+    from indextts.infer_v2 import IndexTTS2
+    from indextts.utils.front import TextTokenizer
+
+    interval_silence = max(INTERVAL_SILENCE_MIN, min(INTERVAL_SILENCE_MAX,
+                                                     int(interval_silence)))
+    pause_base = max(interval_silence, 2 * EDGE_TRIM_MS_DEFAULT)
+    # 模型没加载时拿不到实例上的 adaptive_pause，预览按默认开启算：
+    # 关掉自适应只影响时长数字，不影响分段本身。
+    pause_targets = IndexTTS2.seam_targets(
+        segs, pause_base, EDGE_TRIM_MS_DEFAULT, True
+    )
+    end_marks = set(TextTokenizer.punctuation_marks_tokens)
+
+    def _seg_item(i, s):
+        return {
+            "index": i,
+            "text": tokens_to_readable(s)[0],
+            "tokens": len(s),
+            "boundary": ("sentence"
+                         if TextTokenizer._ends_sentence(s, end_marks) else "hardcut"),
+            # 最后一处没有接缝，停顿为 0
+            "pause_ms": int(pause_targets[i]) if i < len(pause_targets) else 0,
+        }
+
     return JSONResponse({
-        "segments": [
-            {"index": i, "text": tokens_to_readable(s)[0], "tokens": len(s)}
-            for i, s in enumerate(segs)
-        ],
+        "segments": [_seg_item(i, s) for i, s in enumerate(segs)],
+        "interval_silence": interval_silence,
         "normalized_text": normalized_text,
         "numbers": numbers,
         "numbers_truncated": truncated,
