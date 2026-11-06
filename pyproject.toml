@@ -78,6 +78,11 @@ server = [
   "python-multipart>=0.0.9",
   # 使用指南页：服务端把 web/guide/guide.md 渲染成 HTML（前端不加第三方脚本）
   "markdown>=3.5",
+  # 句级字幕：生成完成时用 CPU Paraformer 读 token 时间戳切句。纯 CPU、自带
+  # ONNX 运行时，不依赖 torch/CUDA。缺这个包会静默降级回段级字幕，所以列进
+  # server extra 而不是单独的可选组；权重仍需随包分发，见
+  # checkpoints/paraformer-zh-en-ts/NOTICE.md。
+  "sherpa-onnx==1.13.8",
 ]
 test = [
   "pytest>=7.0",
