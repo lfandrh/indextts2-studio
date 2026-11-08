@@ -81,7 +81,7 @@
 | 文本导入 | 点「导入文本」或把 `.txt` / `.md` 拖进文本框：自动识别 UTF-8 / UTF-16 / GB18030，拦截二进制与 >2 MB 文件，内容按码点截到 10000 字；导入会替换现有文本，按 `Ctrl+Z` 可撤回 |
 | 多候选生成 | 候选数 1 / 2 / 3：同一段文本串行跑多条，候选条并排试听、连播、点卡片采用；某条失败只标红那一张并可单独重试，停止只中止当前条，已完成的保留 |
 | 导出与保存 | 结果可下载 WAV 或 MP3（160 kbps，浏览器内编码，不占显卡、不需要 ffmpeg）；也可「保存到目录」直接写到服务所在电脑的指定文件夹，同名自动加序号、失败自动退回浏览器下载 |
-| 段级字幕导出 | 生成时同步记录每段音频的真实样本边界，结果区可预览字幕列表并导出 SRT / WebVTT；时间是成品音频的物理时间（含段间停顿），点一条从该句起播；正文自动锚回用户原文；旧音频无缓存时整行隐藏 |
+| 句级字幕导出 | 生成结束后用本机 CPU 跑一次 Paraformer，从成品波形读出 token 真实时间戳，把每段切成**一句一条**；正文锚回用户原文，不会被识别结果改写。ASR 运行时 / 权重缺失或对齐失败时自动回退成一段一条并写明原因（详见使用指南 3.7）。结果区可预览、点条起播、导出 SRT / WebVTT；时间对应未剪辑成品音频，旧音频无缓存时整行隐藏 |
 | 声纹波形播放 | 参考音频与生成结果都渲染波形，点击 / 拖动定位播放位置 |
 | 任务管理 | 排队位次提示、排队可取消、生成中可停止（独立终态，不记为失败）、刷新页面自动找回本页签任务 |
 | 生成历史 | 右侧边栏记录本次运行，最多保留 20 条并落盘 `data/history.json`（重启仍在）；被挤出条目的音频在「自动清理」开启时一并删除，点击回填播放器 |
@@ -230,7 +230,7 @@ FastAPI + uvicorn，纯后端（不再内嵌 UI），负责推理调度、任务
 | 模型 | `GET /model`、`POST /model/config`、`/model/load`、`/model/unload`、`/model/restart` |
 | 生成 | `POST /tts`（SSE 流式，可选表单 `scenario_id`）、`/tts/{id}/cancel`、`/tts/{id}/stop`、`/jobs/current`、`/jobs/{id}` |
 | 音频 | `GET /audio/{name}`、`POST /audio/tempo`（保音高变速，纯 CPU、不占推理锁）、`POST /audio/extract`（视频抽音轨 / 浏览器解不了的 wma 转 WAV，需要 ffmpeg） |
-| 字幕 | `GET /subtitle`（段级条目与预览）、`GET /subtitle/export?fmt=srt\|vtt`；都是前端专用接口，`include_in_schema=False`，纯读盘 + 纯计算、不占推理锁 |
+| 字幕 | `GET /subtitle`（句级优先、旧缓存自动回退段级的条目与预览）、`GET /subtitle/export?fmt=srt\|vtt`；都是前端专用接口，`include_in_schema=False`，纯读盘 + 纯计算、不占推理锁 |
 | 历史 | `GET /history`、`POST /history/config`、`DELETE /history`、`DELETE /history/{id}` |
 | 预设 | `GET/POST /presets`、`/presets/{name}`、`/presets/{name}/audio/{kind}`、`DELETE`、`/rename`、`/duplicate` |
 | 保存目录 | `GET/PUT /prefs/save-dir`、`POST /prefs/save-dir/pick`、`/prefs/save-dir/open`、`POST /save-dir/outputs/{name}`、`POST /save-dir/upload` |
@@ -248,10 +248,12 @@ FastAPI + uvicorn，纯后端（不再内嵌 UI），负责推理调度、任务
 ```
 index-tts/
 ├── server.py              # FastAPI 服务（推理调度 + 任务 + 文件接口）
-├── start_server.bat       # 一键启动（顶部是加速配置区）
-├── stop_server.bat        # 按端口停止服务
-├── web/                   # 前端：index.html / app.js / edit.js / clip.js / tip.js / style.css / fonts/ / lame-1.2.1.min.js
-├── docs/                  # 本地开发文档（不入库：功能总表 / 性能记录 / 工程笔记）
+├── start_server.bat       # 一键启动（单窗口前台运行、关窗即停服；顶部是加速配置区）
+├── stop_server.bat        # 按端口停止服务（只停命令行含 server.py 的进程）
+├── diagnose.py            # 启动失败中文诊断 + logs/last_error.txt 取证包（两个 .bat 的中文提示依赖；随仓库交付）
+├── web/                   # 前端：index.html / app.js / edit.js / clip.js / tip.js / style.css / fonts/ / lame-1.2.1.min.js / guide/（使用指南）
+├── logs/                  # 运行时日志：server.log / server_bg.log / last_error.txt（启动失败取证包；不入库）
+├── docs/                  # 开发文档：压测记录随仓库提供，功能总表 / 工程笔记仅本机维护
 ├── skills/indextts2-tts/  # Agent Skill：纯标准库 TTS 客户端（见「AI Agent Skill」一节）
 ├── tools/ffmpeg/bin/      # 可选 ffmpeg（不入库，打包时放入；没有也能跑基础五种音频格式）
 ├── indextts/              # 模型与推理链路（infer_v2.py 为核心）
@@ -259,7 +261,7 @@ index-tts/
 ├── examples/              # 内置示例音频与文本
 ├── prompts/               # 参考音频缓存（按内容 md5 命名）
 ├── outputs/               # 生成结果（启动时清理 14 天以上的旧文件）
-└── data/                  # 运行时状态：history.json / ui_state.json / subtitles/（段级字幕 sidecar）
+└── data/                  # 运行时状态：history.json / ui_state.json / subtitles/（字幕 sidecar，句级优先、回退段级）
 ```
 
 ---
@@ -317,13 +319,24 @@ checkpoints/
 
 ### 4. 启动
 
-双击 **`start_server.bat`**，脚本会自动结束旧实例、等待端口就绪并打开浏览器：
+双击 **`start_server.bat`**（Windows），脚本会先检查项目文件是否完整，再结束 7860 上**确实属于本项目**的旧实例，
+然后**只开一个命令行窗口、在前台运行服务**，端口就绪后打开浏览器：
 
 ```
 http://127.0.0.1:7860
 ```
 
-停止服务：双击 **`stop_server.bat`**。其他平台可用 `uv run --extra server python server.py`（启动脚本本身是 Windows 批处理）。
+**关掉这个窗口就是停止服务**，不会再留后台进程，也不用再跑停止脚本。
+要按端口停服也可以双击 **`stop_server.bat`**（`stop_server.bat 7861` 指定端口）。
+其他平台用 `uv run --extra server python server.py`。
+
+**启动失败时窗口会用中文写明原因**，并同时把「结构化环境信息 + 中文说明 + 完整未截断的原始报错」
+存到 `logs/last_error.txt`。把这个文件整份发给 AI 就能排查，不用在控制台里拖选文字。
+日志默认按 UTF-8 读、不猜编码：若混入非 UTF-8 字节，报告会如实标注、把坏字节显示成 `\xNN`，
+并另附一份字节级原文，不会把中文悄悄解成乱码。
+脚本只给诊断和建议命令，**不会偷偷装依赖、改文件或自动修复**。
+规则清单与脚本注释见项目根目录 `diagnose.py` 顶部说明（它是两个 `.bat` 的运行时依赖，打包时别落下）；
+窗口输出示例、环境变量与逐条排障见[使用指南](web/guide/guide.md) 1.1 / 1.4 / 8.1。
 
 ---
 
@@ -337,7 +350,7 @@ http://127.0.0.1:7860
 
 **导出**：结果区可切 WAV / MP3（160 kbps，在浏览器内编码）；「下载」走访客自己的浏览器，「保存到目录」则写到运行服务那台电脑的指定文件夹，同名不覆盖，失败会自动退回浏览器下载。
 
-**字幕（SRT / WebVTT）**：生成时自动记录每段音频的物理边界，结果区出现「SRT / VTT · 字幕列表 · 导出字幕」。粒度是**一段一条**（不按字数估算，也不在段内再切句）；时间对应**未剪辑**的生成音频，裁剪或变速后不再对齐。SRT 带 UTF-8 BOM（中文 Windows 上的播放器 / 剪辑软件不会当 ANSI 读成乱码），VTT 按规范纯 UTF-8。正文会锚回你输入的原文，规范化失败时退回「按段长比例」或「模型词元还原」并在面板里标明。字幕缓存与音频同生共死；字幕功能上线前的旧音频没有缓存，重新生成一次即可。
+**字幕（SRT / WebVTT）**：生成完成后结果区出现「SRT / VTT · 字幕列表 · 导出字幕」。默认**一句一条**：生成结束时用本机 CPU 跑一次 Paraformer，从成品波形读出 token 的真实时间戳，再按标点切回你写的原文（字幕正文不会被识别结果改写）；段与段的边界本来就是引擎记下的精确样本数，时间不按字数估算。若本机缺 ASR 运行时 / 权重，或这次没拿到可用时间戳，会**自动回退成一段一条**，并在字幕面板写明原因与补法，音频照常生成、不报错；个别段没切成功时只有那几段按整段显示。时间对应**未剪辑**的生成音频，裁剪或变速后不再对齐。SRT 带 UTF-8 BOM（中文 Windows 上的播放器 / 剪辑软件不会当 ANSI 读成乱码），VTT 按规范纯 UTF-8。字幕缓存与音频同生共死；句级功能上线前的旧音频、以及当时降级过的音频，重新生成一次即可。句级对齐所需组件与权重见使用指南 3.7。
 
 **长文本**：文本超过 2000 字会给黄色提示，超过 10000 字才硬性拦截。分句预览下方可调「分句最大 Token」，段数越多每段的固定开销越高，太长建议分段生成再拼接。
 
@@ -450,8 +463,11 @@ xcopy /E /I skills\indextts2-tts "%USERPROFILE%\.workbuddy\skills\indextts2-tts"
 - **GPU / 显存仪表显示 `--`？** 设备名显示 `--` 表示没读到 NVIDIA 显卡信息。程序会依次尝试进程内 NVML、`nvidia-smi`、老式安装目录（`C:\Program Files\NVIDIA Corporation\NVSMI\`），三条都失败才留空；常见原因是本机不是 N 卡，或服务启动时驱动还没就绪（15 秒后会自动重试，重启服务即可）。仪表缺失只影响显示，不影响推理。
 - **显存不够？** 启动脚本默认已开启 `--fp16 --s2mel_fp16 --w2v_fp16` 与 25 步扩散；仍吃紧就确认 `w2v_fp16` 是开的（省约 1GB），再把扩散步数降到 10~16、CFG 调到 0，并关掉其它吃显存的程序。
 - **长文本很慢？** 耗时大头是 GPT 自回归解码（实测约占 73%）：最直接的提速是开「分段批处理」（≥2 段时端到端约 1.4~1.6×，GPT 段约 1.7~2.0×），其次调扩散步数与 CFG 强度，调完即时生效，不用重启模型。
-- **端口被占用？** 启动脚本会自动清理 7860 端口的旧进程；如需换端口，编辑 `start_server.bat` 中的 `--port` 参数。
-- **想让局域网其它设备访问？** 用 `--host 0.0.0.0` 启动，但接口没有鉴权且包含文件删除能力，只在可信网络里这么做。
+- **端口被占用？** 启动脚本只结束**命令行里确实是本项目 `server.py`** 的旧进程；占用端口的若是别的程序，脚本会拒绝强杀并打印占用者（`netstat -ano | findstr :7860`），避免误关你正在用的软件。换端口直接 `start_server.bat 7861`，不用改脚本。
+- **启动就退出 / 一直没反应？** 失败时窗口会**停住并打印中文原因**（按任意键才关闭），不会再一闪而过；服务进程一退出就立刻诊断，不再空等 120 秒的死端口。看窗口提示和 `logs/last_error.txt`。常见原因会被直接点名：项目源码缺失（装依赖没用）、项目内模块文件缺失、缺 Python 依赖、没找到 Python/uv、日志被旧的后台实例独占、配置文件或权重找不到、显存不足、权限不足。识别不了就老实说「原因未识别」，附上完整原始日志，不瞎猜。
+- **日志里有 `\xd6\xd0` 之类的字符 / 中文像乱码？** 说明日志文件混进了非 UTF-8 字节（常见于别的程序往同一份日志里写了 GBK 内容）。诊断器不会猜编码：合法的 UTF-8 中文原样保留，坏字节显示成可见可逆的 `\xNN`；`logs/last_error.txt` 的标题会写明「已按 … 呈现」，并在 `[4]` 段附上原始字节（base64）供 AI 精确还原，不会再谎称「未修改」。若整份日志本来就是 GBK，可显式指定 `--log-encoding gb18030`（或设 `INDEXTTS_LOG_ENCODING=gb18030`）让中文正常显示。
+- **关掉窗口服务还在吗？** 不会。服务在窗口前台运行，控制台销毁会带走它；关窗后 7860 应立即释放。如果你手上还有**旧版脚本**留下的后台服务（窗口标题 `IndexTTS2-server`），用 `stop_server.bat` 收掉一次即可，之后新版不再产生这类残留。
+- **想让局域网其它设备访问？** `start_server.bat` 固定只绑 `127.0.0.1`，不带 `--host` 参数；需要局域网时请改用命令行直接启动服务：`uv run --extra server python server.py --host 0.0.0.0 --port 7860`（整合包把 `uv run ...` 换成对应的 `runtime\python.exe server.py ...`）。但接口没有鉴权且包含文件删除能力，只在可信网络里这么做。
 - **支持哪些参考音频格式？** 基础 wav / mp3 / flac / ogg / opus，单个 ≤ 32 MB。检测到 ffmpeg（仓库内 `tools/ffmpeg/bin/`、与 `server.py` 同级的 `bin/`，或系统 PATH）后，上传框里会多出 m4a / aac / wma，以及 mp4/mov/m4v/mkv/webm/avi/flv 视频；服务端会把它们转成 WAV。没有 ffmpeg 也能正常使用基础五种格式。
 - **wma / 视频拖进去之后呢？** wma 浏览器解不了、视频本身也不是音频，选中后都会先由服务端转成 22.05kHz 单声道 WAV（视频只取前 10 分钟），之后播放、裁剪、生成、存预设与普通 wav 完全一致。转换失败会提示具体原因（例如视频没有音轨），并保留上一份可用的参考音频。
 - **换音色后效果不对？** 参考音频 3~10 秒最稳；超过 15 秒只会取前 15 秒，页面会有提示。切到「情感参考音频」模式时，情感音频和音色音频是两份不同的文件。
