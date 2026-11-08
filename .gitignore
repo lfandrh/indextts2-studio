@@ -28,12 +28,20 @@ desktop.ini
 /cache/
 /checkpoints/*
 !/checkpoints/*.yaml
+# 术语规则库是每个用户自己的数据（含场景与启用状态），不进仓库。
+# 放在 !*.yaml 之后才能生效：缺这个文件时 glossary_store 会从
+# glossary.yaml 自动迁移出一个空库，所以别人 clone 后照样能跑。
+/checkpoints/glossary_rules.yaml
 /outputs/
 # 服务端运行时产物：参考音频缓存与日志，仅本机使用
 /prompts/
 /logs/
 # 服务端运行时状态（如 ui_state.json 里的参数锁定），每次运行都会变，不入库
 /data/
+# 模型加速配置（fp16 开关、diffusion_steps、gpt_batch_size 等）由「保存配置」写盘，
+# 内容取决于本机显卡；入库会把某台机器的参数带给所有人（显存小的机器可能直接 OOM）。
+# 缺这个文件时 _model_cfg_load() 走 FileNotFoundError 分支，用命令行默认值。
+/model_config.json
 # BigVGAN CUDA 扩展的本地编译产物（torch.utils.cpp_extension 生成）
 /indextts/s2mel/modules/bigvgan/alias_free_activation/cuda/build/
 
