@@ -800,12 +800,14 @@ class IndexTTS2:
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=300,
               verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0,
-              glossary=None, cascade=None, **generation_kwargs):
+              glossary=None, cascade=None, max_sentences_per_segment=1, **generation_kwargs):
         # more_segment_before 是上游 quick_streaming_tokens 的别名：保持形参名
         # 不变以免影响现有调用方，但这里用关键字传入——以前按位置塞进去，
         # 参数名/语义错配，值被静默改作他用。
         # glossary/cascade 是请求级快照（None = 沿用实例上的术语表），
         # 生成过程中改规则不会影响本次任务。
+        # max_sentences_per_segment：一段最多装几整句。1=一句一段（默认，停顿最可控），
+        # N>1=段数减少、部分句号停顿交回模型。只影响切段，不影响其它参数。
         if stream_return:
             return self.infer_generator(
                 spk_audio_prompt, text, output_path,
@@ -814,7 +816,9 @@ class IndexTTS2:
                 use_emo_text, emo_text, use_random, interval_silence,
                 verbose, max_text_tokens_per_segment, stream_return,
                 quick_streaming_tokens=more_segment_before,
-                glossary=glossary, cascade=cascade, **generation_kwargs
+                glossary=glossary, cascade=cascade,
+                max_sentences_per_segment=max_sentences_per_segment,
+                **generation_kwargs
             )
         else:
             try:
@@ -825,7 +829,9 @@ class IndexTTS2:
                     use_emo_text, emo_text, use_random, interval_silence,
                     verbose, max_text_tokens_per_segment, stream_return,
                     quick_streaming_tokens=more_segment_before,
-                    glossary=glossary, cascade=cascade, **generation_kwargs
+                    glossary=glossary, cascade=cascade,
+                    max_sentences_per_segment=max_sentences_per_segment,
+                    **generation_kwargs
                 ))[0]
             except IndexError:
                 print(">> ERROR: inference produced no audio (generator yielded nothing)",
@@ -838,7 +844,7 @@ class IndexTTS2:
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=300,
               verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0,
-              glossary=None, cascade=None, **generation_kwargs):
+              glossary=None, cascade=None, max_sentences_per_segment=1, **generation_kwargs):
         print(">> starting inference...")
         self._set_gr_progress(0, "starting inference...")
         if verbose:
@@ -967,7 +973,11 @@ class IndexTTS2:
         self.text_normalize_fallback = None
         text_tokens_list = self.tokenizer.tokenize(text, glossary=glossary, cascade=cascade)
         self.text_normalize_fallback = getattr(self.normalizer, "normalize_fallback", None)
-        segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment, quick_streaming_tokens = quick_streaming_tokens)
+        segments = self.tokenizer.split_segments(
+            text_tokens_list, max_text_tokens_per_segment,
+            quick_streaming_tokens=quick_streaming_tokens,
+            max_sentences_per_segment=max_sentences_per_segment,
+        )
         segments_count = len(segments)
 
         text_token_ids = self.tokenizer.convert_tokens_to_ids(text_tokens_list)

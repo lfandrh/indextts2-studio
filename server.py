@@ -1826,6 +1826,9 @@ def do_tts(
     use_random: bool = Form(False),
     seed: int | None = Form(None),       # 可选复现种子：同时喂 use_random 的 random 与 torch 采样
     max_text_tokens_per_segment: int = Form(120),
+    # 一段最多装几整句：1=一句一段（默认）；2/3=合并，段数减少但段内句号的
+    # 停顿交回模型。只影响切段粒度，不改其它参数。
+    max_sentences_per_segment: int = Form(1),
     do_sample: bool = Form(True),
     top_p: float = Form(0.8),
     top_k: int = Form(30),
@@ -1904,6 +1907,13 @@ def do_tts(
     # 夹取要放在 warn 之前：提示里的段数必须和 /segments 预览用同一个上限，
     # 否则用户会看到「预览 36 段、提示 21 段」这种自相矛盾的数字。
     max_text_tokens_per_segment = _clamp_seg_tokens(max_text_tokens_per_segment)
+    # 一段最多装几整句：非数字/越界一律 400，不静默换成别的值
+    try:
+        max_sentences_per_segment = int(max_sentences_per_segment)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"max_sentences_per_segment 必须是整数：{max_sentences_per_segment!r}")
+    if not 1 <= max_sentences_per_segment <= 8:
+        raise HTTPException(400, f"max_sentences_per_segment 超出范围（1~8）：{max_sentences_per_segment}")
     # 在请求线程取一次快照：生成途中切场景/改规则不影响本次任务。
     glossary_snapshot = _glossary_snapshot(scenario_id)
     text_warn = None
@@ -1920,7 +1930,8 @@ def do_tts(
                 cascade=glossary_snapshot.cascade if glossary_snapshot else None,
             )
             est_segs = len(tts.tokenizer.split_segments(
-                _tokens, max_text_tokens_per_segment=max_text_tokens_per_segment))
+                _tokens, max_text_tokens_per_segment=max_text_tokens_per_segment,
+                max_sentences_per_segment=max_sentences_per_segment))
         except Exception as e:
             logger.warning("long-text warn: tokenizer unavailable (%s)", e)
         if est_segs:
@@ -2182,6 +2193,7 @@ def do_tts(
                 use_random=use_random,
                 verbose=cmd_args.verbose,
                 max_text_tokens_per_segment=max_text_tokens_per_segment,
+                max_sentences_per_segment=max_sentences_per_segment,
                 do_sample=do_sample,
                 top_p=top_p,
                 top_k=top_k if top_k > 0 else None,
@@ -3529,6 +3541,7 @@ def segments_preview(
     request: Request,
     text: str = Form(""),
     max_text_tokens_per_segment: int = Form(120),
+    max_sentences_per_segment: int = Form(1),
     scenario_id: str | None = Form(None),
     interval_silence: int = Form(INTERVAL_SILENCE_DEFAULT),
 ):
@@ -3564,7 +3577,11 @@ def segments_preview(
         glossary=snapshot.glossary if snapshot else None,
         cascade=snapshot.cascade if snapshot else None,
     )
-    segs = tts.tokenizer.split_segments(tokens, max_text_tokens_per_segment=max_text_tokens_per_segment)
+    segs = tts.tokenizer.split_segments(
+        tokens,
+        max_text_tokens_per_segment=max_text_tokens_per_segment,
+        max_sentences_per_segment=max(1, min(8, int(max_sentences_per_segment or 1))),
+    )
 
     # 词元拼回可读文本的实现在 indextts/utils/subtitle.py，与字幕共用一份。
     # 这里以前是 `"".join(seg).replace("▁", "")`：英文词元带词首标记（▁I ▁LOVE），

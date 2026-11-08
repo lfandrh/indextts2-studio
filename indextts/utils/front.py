@@ -636,6 +636,7 @@ class TextTokenizer:
         max_text_tokens_per_segment: int,
         quick_streaming_tokens: int = 0,
         sentence_boundary_split: bool = True,
+        max_sentences_per_segment: int = 1,
     ) -> List[List[str]]:
         """
         将tokenize后的结果按特定token进一步分割
@@ -648,6 +649,11 @@ class TextTokenizer:
         sentence_boundary_split=True（默认）时，以句末标点结尾的段不再与邻段
         合并，「一句话一段」。设 False 恢复旧的逐字合并行为——那时只要相邻两段
         合计不超上限就会粘在一起，多句话被连成一段，段内停顿由模型自由发挥。
+
+        max_sentences_per_segment 只在 sentence_boundary_split=True 时起作用：
+        1（默认）= 严格一句一段；N>1 = 一段最多装 N 句，段数减少但段内句号
+        的停顿交回模型。切成段的数量直接决定 s2mel/bigvgan/prefill 跑几次，
+        所以这是速度与「停顿可控粒度」之间的取舍。
         """
         if max_text_tokens_per_segment < 1:
             raise ValueError(
@@ -731,8 +737,16 @@ class TextTokenizer:
         sentence_end_tokens = (
             set(TextTokenizer.punctuation_marks_tokens) if sentence_boundary_split else set()
         )
+        # 每段最多装几「句」：1（默认）= 一句一段；2/3 允许把相邻的整句并进同一段。
+        # 合并后该段内部的句号停顿由模型自己给（实测约 0.55s，见
+        # docs/SEGMENTATION_PAUSE_DIAGNOSIS_2026-11-04），只有段与段之间才受
+        # interval_silence 控制。所以这是一个「速度 / 停顿可控粒度」的取舍，
+        # 不是纯优化：调大能减少段数（每段一次 s2mel + bigvgan + prefill），
+        # 但一部分句号会退回模型自由发挥。
+        max_sentences = max(1, int(max_sentences_per_segment or 1))
         merged_segments = []
         tail_done = []      # 与 merged_segments 一一对应：该段是否已经「说完」
+        sent_count = []     # 与 merged_segments 一一对应：该段里有几个整句
         quote_open = False  # 按出现顺序配对引号：True 表示现在在引号内部
         total_token = 0
         for segment in segments:
@@ -750,23 +764,28 @@ class TextTokenizer:
             done = TextTokenizer._ends_sentence(
                 segment, sentence_end_tokens, last_quote_closes
             )
-            # 上段已经说完就换段；否则（上段是半句）允许继续合并。
-            # 反过来不限：本段收尾是句号、上段是逗号时仍要合并，否则
-            # 「老张推开门的时候，」会孤零零成为一段。
-            if not merged_segments or tail_done[-1]:
+            # 上段已经说完、且已经装够 max_sentences 句，就换段；
+            # 上段是半句、或句数还没装满，允许继续合并。
+            if not merged_segments or (
+                tail_done[-1] and sent_count[-1] >= max_sentences
+            ):
                 merged_segments.append(segment)
                 tail_done.append(done)
+                sent_count.append(1 if done else 0)
                 continue
             if len(merged_segments[-1]) + len(segment) <= max_text_tokens_per_segment and total_token > quick_streaming_tokens:
                 merged_segments[-1] = merged_segments[-1] + segment
                 tail_done[-1] = done
+                sent_count[-1] += 1 if done else 0
             # 或小于最大长度限制的一半，则合并
             elif len(merged_segments[-1]) + len(segment) <= max_text_tokens_per_segment / 2:
                 merged_segments[-1] = merged_segments[-1] + segment
                 tail_done[-1] = done
+                sent_count[-1] += 1 if done else 0
             else:
                 merged_segments.append(segment)
                 tail_done.append(done)
+                sent_count.append(1 if done else 0)
         return merged_segments
 
     # 引号、括号在 tokenize 后一律变成裸 "'"（中文 “”「」、英文 "、全角括号
@@ -841,12 +860,14 @@ class TextTokenizer:
         "▁...", # ellipsis
     ]
     def split_segments(self, tokenized: List[str], max_text_tokens_per_segment=120,
-                       quick_streaming_tokens=0, sentence_boundary_split=True) -> List[List[str]]:
+                       quick_streaming_tokens=0, sentence_boundary_split=True,
+                       max_sentences_per_segment=1) -> List[List[str]]:
         return TextTokenizer.split_segments_by_token(
             tokenized, self.punctuation_marks_tokens,
             max_text_tokens_per_segment=max_text_tokens_per_segment,
             quick_streaming_tokens=quick_streaming_tokens,
             sentence_boundary_split=sentence_boundary_split,
+            max_sentences_per_segment=max_sentences_per_segment,
         )
 
 
