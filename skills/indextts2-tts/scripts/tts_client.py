@@ -7,7 +7,7 @@
 
 用法示例：
     python tts_client.py locate                                  # 定位项目根（找不到则给三条路，退出码 3）
-    python tts_client.py locate --set "D:\\IndexTTS2.0_v3"        # 用户给的路径：校验后记住
+    python tts_client.py locate --set "<盘符>:\\IndexTTS2.0_v3"  # 用户给的路径：校验后记住
     python tts_client.py ensure                                  # 确保服务在跑（没跑就后台拉起）
     python tts_client.py health                                  # 探活
     python tts_client.py status                                  # 模型状态 + GPU 仪表
@@ -1174,8 +1174,8 @@ skill 本身只是调用客户端，不含模型与代码，所以必须先确�
 请让用户在下面三条里选一条，不要自己猜路径：
 
   ① 用户手上有整合包 —— 直接把路径发过来
-       把整合包根目录贴出来（例如 D:\\IndexTTS2.0_v3），然后执行：
-         python tts_client.py locate --set "D:\\IndexTTS2.0_v3"
+       把整合包根目录贴出来（例如 <盘符>:\\IndexTTS2.0_v3），然后执行：
+         python tts_client.py locate --set "<盘符>:\\IndexTTS2.0_v3"
        校验通过后路径会被记住（~/.indextts2-tts/project.json），以后不用再给。
 
   ② 用户不想翻目录 —— 先把服务启动，我自动定位

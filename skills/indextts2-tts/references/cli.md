@@ -99,13 +99,13 @@ IndexTTS2.0_v3\
 ```bat
 :: Windows cmd
 set SKILL_DIR=%USERPROFILE%\.workbuddy\skills\indextts2-tts
-set INDEXTTS_PROJECT_DIR=D:\IndexTTS2.0_v3
+set INDEXTTS_PROJECT_DIR=<盘符>:\IndexTTS2.0_v3
 python "%SKILL_DIR%\scripts\tts_client.py" ensure
 ```
 
 ```bash
 # bash / Git Bash
 export SKILL_DIR="$HOME/.workbuddy/skills/indextts2-tts"   # 改成宿主实际安装位置
-export INDEXTTS_PROJECT_DIR=/d/IndexTTS2.0_v3
+export INDEXTTS_PROJECT_DIR=/<盘符>/IndexTTS2.0_v3
 python "$SKILL_DIR/scripts/tts_client.py" ensure
 ```

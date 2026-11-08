@@ -199,7 +199,7 @@ def text_of(n: int) -> str:
 ```bash
 # 1) 起隔离实例（在 test-run/20261102-0715/instance 下执行；独立 data/、outputs/）
 cd test-run/20261102-0715/instance
-E:/code/git_code/index-tts/.venv/Scripts/python.exe server.py --port 7861
+<仓库根>/.venv/Scripts/python.exe server.py --port 7861
 
 # 2) 另开一个终端，在仓库根目录执行；跑全量 23 次（高负载在最后）
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe test-run/20261102-0715/gen-bench/bench.py

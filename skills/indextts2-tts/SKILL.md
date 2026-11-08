@@ -101,7 +101,7 @@ python "$SKILL_DIR/scripts/tts_client.py" locate
 （下面所有命令都复用这个 `SKILL_DIR`。）
 
 - **成功**：一行 JSON，带 `project_dir` 和 `source`（命中的是哪条规则）。**用一句话汇报后再往下走**：
-  > 找到了：`F:\...\IndexTTS2.0_v3`（服务已经在跑，从端口反推出来的）。
+  > 找到了：`<盘符>\...\IndexTTS2.0_v3`（服务已经在跑，从端口反推出来的）。
   不要贴 JSON，`source` 的值要翻译成人话（`环境变量` / `脚本位置向上` / `当前工作目录向上` /
   `记忆文件` / `端口反查` → "服务正在跑，从端口反推的"）。
 - **失败（退出码 3）**：stdout 是 `{"ok": false, "reason": "project_not_found"}`，stderr 会打出三条路。
