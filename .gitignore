@@ -32,6 +32,14 @@ desktop.ini
 # 放在 !*.yaml 之后才能生效：缺这个文件时 glossary_store 会从
 # glossary.yaml 自动迁移出一个空库，所以别人 clone 后照样能跑。
 /checkpoints/glossary_rules.yaml
+# 术语扁平表同样是个人的：它由 glossary_rules.yaml 派生，每次保存/启动重建都会
+# 重写，入库只会让每个人的本地术语互相覆盖。缺文件时按空库启动，第一次保存
+# 会自动把 flat / rules / settings 三个文件一起写出来（已实测）。
+# 与 rules 同理，必须写在 !*.yaml 之后，否则白名单会把它放回来。
+/checkpoints/glossary.yaml
+# 术语设置（cascade 级联开关、active_scenario 当前场景）也是本机偏好：
+# 面板上切一次场景就会被重写，入库会让每个人的场景选择互相覆盖。
+/checkpoints/glossary_settings.yaml
 /outputs/
 # 服务端运行时产物：参考音频缓存与日志，仅本机使用
 /prompts/
