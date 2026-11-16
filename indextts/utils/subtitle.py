@@ -12,6 +12,7 @@ HTTP 与落盘编排在 server.py，算法都在这里。
    会难看得没法用；本模块用模糊对齐把规范化串的切点映射回原文字符位置。
 """
 import json
+import math
 import os
 import re
 from bisect import bisect_right
@@ -19,6 +20,10 @@ from difflib import SequenceMatcher
 
 WORD_SEP = "▁"  # sentencepiece 的词首标记
 SIDECAR_VERSION = 1
+
+# 裁剪 / 变速之后仍值得显示的条目下限。再短就只是半口气，闪一下反而干扰；
+# 与句级切分里「每句至少留 0.05s」同口径（见 sentences_from_segment）。
+MIN_CUE_SEC = 0.05
 
 # 原文锚定的下限：规范化改动太大（大量数字转汉字、术语替换）时，
 # 对齐出来的切点不可信，退回词元重建的文本，至少字幕有内容。
@@ -264,6 +269,83 @@ def cues_from_segments(segments):
             continue
         cues.append({"start": start, "end": end, "text": text})
     return cues
+
+
+def remap_cues(cues, start=None, end=None, rate=1.0):
+    """把源时间轴的 cue 映射到「裁剪 + 变速」后的时间轴。
+
+    ``start`` / ``end`` 是源轴上要保留的区间（秒），``None`` 表示不裁；
+    ``rate`` 是变速倍率（>1 变快、时长变短）。映射关系：
+
+        先裁齐  t = clamp(t, start, end)
+        再映射  t' = (t - start) / rate
+
+    区间外的条目整条丢弃，跨界条目裁到区间内；裁剪态或变速时，映射后短于
+    ``MIN_CUE_SEC`` 的条目丢弃。**恒等调用（不裁不变速）原样返回**，不 round
+    也不过滤 —— 旧接口靠这一点保证字节一致，源字幕里本来就有的短段不该被
+    顺手删掉。
+
+    误差口径：变速按均匀时间缩放映射，与 atempo / audiotsm 的逐帧边界相比
+    误差在几十毫秒内（WSOLA 帧长 1024 样本，24kHz 约 42ms），对字幕足够。
+    调用方若拿得到成品音频的真实时长，用它反算倍率会比用户设定值更准。
+
+    返回新列表，不改输入；时间 round 4 位。``rate`` 非有限或 <= 0、
+    ``start`` / ``end`` 不成对或区间为空时抛 ``ValueError``。
+    """
+    if rate is None:
+        rate = 1.0
+    try:
+        rate = float(rate)
+    except (TypeError, ValueError):
+        raise ValueError("rate 必须是数字") from None
+    if not math.isfinite(rate) or rate <= 0:
+        raise ValueError("rate 必须是大于 0 的有限数")
+
+    if (start is None) != (end is None):
+        raise ValueError("start / end 必须成对出现")
+    if start is not None:
+        try:
+            start, end = float(start), float(end)
+        except (TypeError, ValueError):
+            raise ValueError("start / end 必须是数字") from None
+        if not (math.isfinite(start) and math.isfinite(end)):
+            raise ValueError("start / end 必须是有限数")
+        if start < 0 or start >= end:
+            raise ValueError("裁剪区间无效：需要 0 <= start < end")
+
+    # 恒等：不裁、不变速。原样复制，避免 round 改变段级 cue 的精度。
+    if start is None and rate == 1.0:
+        return [dict(c) for c in (cues or [])]
+
+    a = 0.0 if start is None else start
+    out = []
+    for cue in cues or []:
+        if not isinstance(cue, dict):
+            continue
+        try:
+            s = float(cue.get("start"))
+            e = float(cue.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(s) and math.isfinite(e)) or e <= s:
+            continue
+        if start is not None:
+            if e <= start or s >= end:
+                continue
+            if s < start or e > end:
+                s, e = max(s, start), min(e, end)
+        s = (s - a) / rate
+        e = (e - a) / rate
+        # 恒等调用上面已经短路返回，走到这里的必然经过裁剪或变速：两者都会把
+        # 短句压得更短，统一按最短可见时长过滤（原来那个
+        # ``and (start is not None or rate != 1.0)`` 在这里恒为真，删掉免得误读）。
+        if e - s < MIN_CUE_SEC:
+            continue
+        item = dict(cue)
+        item["start"] = round(s, 4)
+        item["end"] = round(e, 4)
+        out.append(item)
+    return out
 
 
 def _timestamp(seconds: float, decimal=",") -> str:

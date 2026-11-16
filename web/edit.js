@@ -4,11 +4,15 @@
  *  1. 三槽位状态 {trim, tempo, gain}，每个功能至多一条；撤销/重做用快照栈，
  *     不是"操作数组"——语义清晰，不会出现"撤销后速率变成别的值"。
  *  2. 固定处理顺序 trim → tempo → gain。trim 必须在源时间轴上（否则一改变速
- *     选区就失效）；tempo 在 gain 之前，这样上传服务端的音频峰值必然 ≤ 源峰值，
- *     16bit 不可能削波。
+ *     选区就失效）；tempo 在 gain 之前，这样交给音量服务的音频峰值必然 ≤ 源峰值。
+ *     变速与增益都由服务端 ffmpeg（atempo / volume）处理，浏览器只管裁剪；
+ *     没有 ffmpeg 时变速降级回 WSOLA、增益退回浏览器本地乘法，功能不失效。
  *  3. 波形永远画源音频（编辑台），结果另用一条只读细波形展示；结果条只在
  *     gain / tempo 有值时才出现——纯裁剪时源波形的选区高亮已经把信息表达完了。
  *  4. 拖动中不压快照，松手才定稿，否则拖一次滑块撤销要按几十次。
+ *  5. 变速要过网络，但界面不等它：拖动停顿就预热、松手时命中预热缓存；旧结果
+ *     继续播，只有超过 400ms 才给一个弱提示，滑块/撤销全程可操作。同倍率的
+ *     并发请求合并成一条，过期的渲染结果由 rev 丢弃。
  *
  * 依赖 app.js 的全局：$ / API / getAC / decodeNative / sizeCanvas / cssVar / encodeWav /
  * showActionError / player / PAUSE2 / PLAY2（本文件必须在其后加载）
@@ -18,7 +22,13 @@
 
   const HIST_MAX = 50;          // 快照栈上限
   const TEMPO_CACHE_MAX = 8;    // 变速结果缓存条数
+  const GAIN_CACHE_MAX = 8;     // 增益结果缓存条数（避免重复上传整段 WAV）
   const GAIN_DEBOUNCE = 80;     // ms，拖动增益时的重算节流
+  const TEMPO_PREFETCH_DELAY = 220;              // ms，拖动停顿后预热当前倍率
+  const TEMPO_HINT_DELAY = 400;                  // ms，超过才显示「处理中」，快请求完全无感
+  const TEMPO_PREFETCH_MAX = 8 * 1024 * 1024;    // 预热上传的 WAV 上限；大文件只在松手后算
+  const TEMPO_TIMEOUT = 45000;                   // ms，单次变速请求上限，卡死时宁可报错
+  const VOLUME_TIMEOUT = 15000;                  // ms，增益只是乘系数，超过即视为服务端卡死
   // 变速快捷档：并排布局后刻度放在滑轨下面的整行里，不再与滑轨等宽，
   // 所以它只是「点一下到位」的按钮组，不是标尺——档位不用再卡「均匀七档」，
   // 直接取最常用的六个（1.75× 留给拖动，滑轨步进 0.01 本来就能到）。
@@ -32,16 +42,26 @@
     hist: [],
     cursor: -1,
     rendered: null,             // 当前渲染结果
+    renderedSnap: null,         // 这份结果对应的 state 快照（字幕测倍率要认它）
     basePeak: 0,                // trim+tempo 后、gain 之前的峰值（算削波用）
     tempoCache: new Map(),
+    gainCache: new Map(),
     rev: 0,                     // 渲染序号，用于丢弃过期的异步结果
-    busy: false,
+    tempoInflight: new Map(),   // key -> { promise, ctrl }：同倍率并发只发一条请求
   };
   window.ED = ED;
 
   let curOutUrl = "";           // 当前挂在结果播放器上的 blob URL
   let curOutKey = "";           // 结果音频对应的状态指纹（相同就不重建，别打断正在播的音频）
   let gainLive = false;         // 增益拖动中：只更新视觉，不重建音频
+  let volumeRemote = true;      // 服务端 /audio/volume 可用；收到 503（无 ffmpeg）后永久走本地
+  let volumeWarned = false;     // 持续性 4xx 只记一次日志，别随着拖动刷屏
+  let volumeAbort = null;       // 取消上一次还在飞的增益请求，拖动时不堆积
+  let pendingCount = 0;         // 用户正在等的服务端请求数（不含后台预热）
+  let pendingTimer = 0;         // 延迟显示「处理中」的定时器
+  let prefetchTimer = 0;        // 拖动停顿后的预热定时器
+  let activeRenders = 0;        // 在飞的 render 数，下载/保存要等它归零
+  let settleWaiters = [];
 
   /* ---------------- 状态工具 ---------------- */
   const cloneState = (s) => ({
@@ -53,12 +73,52 @@
     a.tempo === b.tempo && a.gain === b.gain && String(a.trim) === String(b.trim);
 
   const srcDur = () => (ED.src ? ED.src.duration : 0);
-  const trimKey = () => (ED.state.trim ? ED.state.trim.map((v) => v.toFixed(4)).join("-") : "full");
+  const trimKeyOf = (trim) => (trim ? trim.map((v) => v.toFixed(4)).join("-") : "full");
+  const trimKey = () => trimKeyOf(ED.state.trim);
   const hasOps = () => !!(ED.state.trim || ED.state.tempo || ED.state.gain);
   // 结果条只在有增益/变速时出现（纯裁剪靠源波形上的选区高亮表达）
   const hasResult = () => !!(ED.state.tempo || ED.state.gain);
 
-  /* ---------------- 纯 DSP（全同步，34.9s 音频 < 5ms） ---------------- */
+  /* ---------------- 渲染调度 ---------------- */
+  function renderEnter() { activeRenders++; }
+  function renderLeave() {
+    activeRenders--;
+    if (activeRenders === 0 && settleWaiters.length) {
+      const waiters = settleWaiters;
+      settleWaiters = [];
+      for (const done of waiters) done();
+    }
+  }
+  /** 下载/保存前等一下：状态是即时生效的，ED.rendered 要等服务端回来才更新，
+   *  不等就会把「上一档倍率」的文件发出去。没有在飞渲染时同步 resolve。 */
+  ED.whenSettled = function () {
+    if (activeRenders === 0) return Promise.resolve();
+    return new Promise((done) => settleWaiters.push(done));
+  };
+
+  /* ---------------- 弱提示：只在确实慢的时候才让用户看见 ---------------- */
+  function pendingEnter() {
+    pendingCount++;
+    if (pendingCount === 1 && !pendingTimer) {
+      pendingTimer = setTimeout(() => {
+        pendingTimer = 0;
+        if (pendingCount > 0) {
+          el.tempoNote.classList.add("busy");
+          paintEstimate();
+        }
+      }, TEMPO_HINT_DELAY);
+    }
+  }
+  function pendingLeave() {
+    pendingCount = Math.max(0, pendingCount - 1);
+    if (pendingCount === 0) {
+      if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = 0; }
+      el.tempoNote.classList.remove("busy");
+      paintEstimate();
+    }
+  }
+
+  /* ---------------- 浏览器本地 DSP（裁剪 + 无 ffmpeg 时的增益降级） ---------------- */
   function sliceBuffer(buf, [s0, s1]) {
     const from = Math.floor(s0 * buf.length);
     const to = Math.floor(s1 * buf.length);
@@ -83,6 +143,70 @@
     return out;
   }
 
+  /* ---------------- 增益：服务端 ffmpeg volume，失败退回本地 ---------------- */
+  async function volumeBuffer(buf, db, tKey, rate) {
+    if (!volumeRemote) return gainBuffer(buf, db);
+    // 键必须由「产生 buf 的那次状态快照」算出，不能读实时 ED.state：多个渲染
+    // 重叠时实时 state 已经是下一档倍率，会把 1.5× 的音频缓存到 1.25× 的键上。
+    const key = (tKey || trimKey()) + "|" + (rate || 1).toFixed(3) + "|" + db.toFixed(3);
+    if (ED.gainCache.has(key)) return ED.gainCache.get(key);
+
+    // 拖动时旧的请求还没回来、新的已经发出去了：主动取消上一条，既省带宽
+    // 也避免先返回的旧结果覆盖（render 里的 rev 检查是第二道保险）。
+    if (volumeAbort) volumeAbort.abort();
+    const ctrl = new AbortController();
+    volumeAbort = ctrl;
+    // 与 tempoFetch 同款兜底：fetch 没有默认超时。服务端卡住时这个 await 永不
+    // 返回，render 就永远不结束，activeRenders 不归零，之后每次下载都吊死在
+    // whenSettled 上（表现为「点下载没反应」）。增益本来就等价于浏览器里的逐
+    // 样本乘法，超时直接本地算，用户无感，也不必弹错误。
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, VOLUME_TIMEOUT);
+    try {
+      const fd = new FormData();
+      fd.append("file", encodeWav(buf), "in.wav");
+      fd.append("db", String(db));
+      const r = await fetch(API + "/audio/volume", {
+        method: "POST", body: fd, signal: ctrl.signal,
+      });
+      if (r.status === 503) {           // 服务端没有 ffmpeg：确定性状态，别反复试
+        volumeRemote = false;
+        return gainBuffer(buf, db);
+      }
+      if (!r.ok) {
+        // 4xx/413 这类是持续性错误（格式不对、文件过大），只记一次：
+        // 此时增益仍由本地乘法完成，用户看不出差别，但日志里要能查到原因。
+        if (!volumeWarned) {
+          volumeWarned = true;
+          console.warn("服务端音量处理返回 HTTP " + r.status + "，已退回浏览器本地增益");
+        }
+        return gainBuffer(buf, db);
+      }
+      const out = await decodeNative(await r.arrayBuffer());
+      ED.gainCache.set(key, out);
+      while (ED.gainCache.size > GAIN_CACHE_MAX) {
+        ED.gainCache.delete(ED.gainCache.keys().next().value);
+      }
+      return out;
+    } catch (e) {
+      // AbortError 是「被更新的渲染取代」或超时，render() 的 rev 检查会静默丢掉；
+      // 其余（断网、解码失败）也静默退回本地增益 —— 这个操作本来就能在
+      // 浏览器里完成，不该弹一个「音频处理失败」吓用户。但异常本身要留痕，
+      // 否则用户报「加了增益没反应」时控制台一片空白，无从查起。
+      if (e && e.name !== "AbortError") {
+        console.warn("服务端音量处理失败，已退回浏览器本地增益：", e.message || e);
+      } else if (timedOut) {
+        console.warn(
+          "服务端音量处理超时（" + VOLUME_TIMEOUT / 1000 + "s），已退回浏览器本地增益"
+        );
+      }
+      return gainBuffer(buf, db);
+    } finally {
+      clearTimeout(timer);
+      if (volumeAbort === ctrl) volumeAbort = null;
+    }
+  }
+
   function peakOf(buf) {
     let p = 0;
     for (let c = 0; c < buf.numberOfChannels; c++) {
@@ -95,7 +219,7 @@
     return p;
   }
 
-  /* ---------------- 变速（服务端 audiotsm WSOLA，保音高） ---------------- */
+  /* ---------------- 变速（服务端 ffmpeg atempo，无 ffmpeg 降级 WSOLA） ---------------- */
   function cacheSet(key, val) {
     ED.tempoCache.set(key, val);
     while (ED.tempoCache.size > TEMPO_CACHE_MAX) {
@@ -103,15 +227,39 @@
     }
   }
 
-  async function tempoBuffer(buf, rate) {
-    const key = trimKey() + "|" + rate.toFixed(3);
-    if (ED.tempoCache.has(key)) return ED.tempoCache.get(key);
-    setBusy(true);
+  const tempoKey = (rate, tKey) => (tKey === undefined ? trimKey() : tKey) + "|" + rate.toFixed(3);
+
+  /** 换源/清空时撤销还没回来的预热与渲染请求，别让旧音频的结果写进新缓存。 */
+  function cancelTempo() {
+    clearTimeout(prefetchTimer);
+    prefetchTimer = 0;
+    for (const entry of ED.tempoInflight.values()) entry.ctrl.abort();
+    ED.tempoInflight.clear();
+  }
+
+  /** 换源/清空：撤回在飞请求并立刻熄灭提示，不留在新音频上。 */
+  function resetPending() {
+    cancelTempo();
+    if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = 0; }
+    pendingCount = 0;
+    el.tempoNote.classList.remove("busy");
+    // 只摘 class 不改文案的话，清空音频后备注会永久停在
+    // 「保音高 · 结果 2.67s · 处理中…」——颜色退了、字还在，像卡住了。
+    paintEstimate();
+  }
+
+  async function tempoFetch(key, buf, rate, ctrl) {
+    const fd = new FormData();
+    fd.append("file", encodeWav(buf), "in.wav");
+    fd.append("rate", String(rate));
+    // fetch 没有默认超时：服务端卡住时 activeRenders 永远不归零，之后的下载
+    // 也会一起挂住。给它一个上限，超时按普通错误走回滚，而不是静静转圈。
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, TEMPO_TIMEOUT);
     try {
-      const fd = new FormData();
-      fd.append("file", encodeWav(buf), "in.wav");
-      fd.append("rate", String(rate));
-      const r = await fetch(API + "/audio/tempo", { method: "POST", body: fd });
+      const r = await fetch(API + "/audio/tempo", {
+        method: "POST", body: fd, signal: ctrl.signal,
+      });
       if (!r.ok) {
         let d = "HTTP " + r.status;
         try { d = (await r.json()).detail || d; } catch (e) { /* 非 JSON 错误体 */ }
@@ -121,34 +269,108 @@
       const out = await decodeNative(await r.arrayBuffer());
       cacheSet(key, out);
       return out;
+    } catch (e) {
+      if (timedOut) throw new Error("变速超时（" + TEMPO_TIMEOUT / 1000 + "s 未返回）");
+      throw e;
     } finally {
-      setBusy(false);
+      clearTimeout(timer);
     }
   }
 
+  /** 同一 (裁剪, 倍率) 只发一条请求：拖动预热、松手渲染、连续撤销都命中同一个
+   *  Promise，不会重复上传整段 WAV，也不存在「两个请求各自结束、状态互相覆盖」。
+   *  silent=true 是后台预热，不计入「用户等待」，因此不触发弱提示。 */
+  function tempoBuffer(buf, rate, key, silent) {
+    key = key || tempoKey(rate);
+    if (ED.tempoCache.has(key)) return Promise.resolve(ED.tempoCache.get(key));
+    const hit = ED.tempoInflight.get(key);
+    if (hit) {
+      // 命中别人发起的请求：若是后台预热，现在有人真的在等了，把弱提示补上，
+      // 否则「预热发起、松手接力」这一路会一直没有任何等待反馈。
+      if (!silent && hit.silent) { hit.silent = false; pendingEnter(); }
+      return hit.promise;
+    }
+    const ctrl = new AbortController();
+    const entry = { promise: null, ctrl, silent: !!silent };
+    if (!entry.silent) pendingEnter();
+    entry.promise = (async () => {
+      try {
+        return await tempoFetch(key, buf, rate, ctrl);
+      } finally {
+        if (ED.tempoInflight.get(key) === entry) ED.tempoInflight.delete(key);
+        if (!entry.silent) pendingLeave();      // 中途被升级过也要配对
+      }
+    })();
+    ED.tempoInflight.set(key, entry);
+    return entry.promise;
+  }
+
+  /** 拖动停顿就把这一档先算好，松手时大概率直接命中缓存。
+   *  大文件跳过预热（拖动中反复上传几十 MB 比老实等一次还慢）。 */
+  function scheduleTempoPrefetch(rate) {
+    clearTimeout(prefetchTimer);
+    prefetchTimer = 0;
+    if (!ED.src || Math.abs(rate - 1) < 0.001) return;
+    const buf = ED.state.trim ? sliceBuffer(ED.src, ED.state.trim) : ED.src;
+    if (buf.length * buf.numberOfChannels * 2 + 44 > TEMPO_PREFETCH_MAX) return;
+    const key = tempoKey(rate);
+    if (ED.tempoCache.has(key) || ED.tempoInflight.has(key)) return;
+    prefetchTimer = setTimeout(() => {
+      prefetchTimer = 0;
+      // 预热失败不打扰用户：缓存没写上，松手后按正常路径再算一次。
+      // 但异常要进控制台——「每次都预热失败、松手又超时」这种系统性故障
+      // 如果不留痕，用户只会说「变速特别慢」，查起来没有任何线索。
+      tempoBuffer(buf, rate, key, true).catch((e) => {
+        if (!e || e.name !== "AbortError") {
+          console.warn("变速预热失败（松手后会重试）：", (e && e.message) || e);
+        }
+      });
+    }, TEMPO_PREFETCH_DELAY);
+  }
+
   /* ---------------- 渲染：按固定顺序重放状态 ---------------- */
-  /** @returns {Promise<boolean>} 是否渲染成功（供调用方决定是否回滚状态） */
-  async function render() {
+  /** @param {boolean} [quiet] 失败时不弹提示（用于回滚后的补偿重算，避免二次报错）
+   *  @returns {Promise<boolean>} 是否渲染成功（供调用方决定是否回滚状态） */
+  async function render(quiet) {
     if (!ED.src) return false;
     const rev = ++ED.rev;
-    let buf = ED.src;
+    renderEnter();
     try {
-      if (ED.state.trim) buf = sliceBuffer(buf, ED.state.trim);
-      if (ED.state.tempo && ED.state.tempo !== 1) {
-        buf = await tempoBuffer(buf, ED.state.tempo);
-        if (rev !== ED.rev) return true;          // 已被更新的渲染取代，不算失败
+      // 整个渲染期间只读这份快照：请求在飞时用户还能拖滑块/撤销，实时
+      // ED.state 随时会变成下一档，混着读会算出「1.5× 的音频 + 1.25× 的增益」。
+      const snap = cloneState(ED.state);
+      const tKey = trimKeyOf(snap.trim);
+      let buf = ED.src;
+      let basePeak = ED.basePeak;
+      try {
+        if (snap.trim) buf = sliceBuffer(buf, snap.trim);
+        if (snap.tempo && snap.tempo !== 1) {
+          buf = await tempoBuffer(buf, snap.tempo, tempoKey(snap.tempo, tKey));
+          if (rev !== ED.rev) return true;        // 已被更新的渲染取代，不算失败
+        }
+        // 峰值要在增益之前量（削波提示按「增益前的基准」算），但只在本次渲染
+        // 最终胜出时才写回 ED，否则被取代的旧渲染会短暂污染读数。
+        basePeak = peakOf(buf);                   // 变速会微调峰值，实测 0.41→0.35
+        if (snap.gain) {
+          buf = await volumeBuffer(buf, snap.gain, tKey, snap.tempo || 1);
+          if (rev !== ED.rev) return true;
+        }
+      } catch (e) {
+        if (rev !== ED.rev || (e && e.name === "AbortError")) return true;
+        if (!quiet) showActionError("音频处理失败: " + e.message);
+        return false;
       }
-      ED.basePeak = peakOf(buf);                  // 变速会微调峰值，实测 0.41→0.35
-      if (ED.state.gain) buf = gainBuffer(buf, ED.state.gain);
-    } catch (e) {
       if (rev !== ED.rev) return true;
-      showActionError("音频处理失败: " + e.message);
-      return false;
+      ED.basePeak = basePeak;
+      ED.rendered = buf;
+      ED.renderedSnap = snap;     // 谁读 ED.rendered，都得知道它对应哪组参数
+      // 等待期间状态又变了（典型是增益还在拖、或选区刚换）：先别画结论，
+      // 否则会出现「芯片写着 +6dB、播的还是 0dB」的一瞬；那次渲染马上会接上。
+      if (sameState(snap, ED.state)) paintResult();
+      return true;
+    } finally {
+      renderLeave();
     }
-    if (rev !== ED.rev) return true;
-    ED.rendered = buf;
-    paintResult();
-    return true;
   }
 
   /* ---------------- 结果呈现 ---------------- */
@@ -207,6 +429,10 @@
     curOutKey = key;
     const wasPlaying = !!outAudio.src && !outAudio.paused;
     const pos = outAudio.currentTime || 0;
+    // 换 src 前的总时长：变速会改总长，同一个绝对秒数在两档里不是同一句话，
+    // 直接 seek 回原秒数听起来像「跳了一下」，按内容比例换算才接得上。
+    const prevDur = Number.isFinite(outAudio.duration) ? outAudio.duration : 0;
+    const newDur = ED.rendered.duration;
     if (ED.blobUrl) URL.revokeObjectURL(ED.blobUrl);
     ED.blobUrl = URL.createObjectURL(encodeWav(ED.rendered));
     curOutUrl = ED.blobUrl;
@@ -215,7 +441,10 @@
       // 换 src 会把播放位置归零，续播前 seek 回去
       const resume = () => {
         outAudio.removeEventListener("loadedmetadata", resume);
-        if (outAudio.duration) outAudio.currentTime = Math.min(pos, outAudio.duration - 0.05);
+        const scaled = prevDur ? pos * (newDur / prevDur) : pos;
+        if (outAudio.duration) {
+          outAudio.currentTime = Math.max(0, Math.min(scaled, outAudio.duration - 0.05));
+        }
         outAudio.play().catch(() => {});
       };
       outAudio.addEventListener("loadedmetadata", resume);
@@ -292,23 +521,22 @@
     syncChips();
   }
 
-  // 变速请求在飞的时候，滑块和刻度按钮已被 setBusy 禁用，但 Ctrl+Z / Ctrl+Y
-  // 和 chip 上的删除 × 是绕过去的 —— 它们都会走到 render() 再发一次请求，
-  // 两个请求重叠时先返回的那个把 busy 清掉，后一个还在飞，用户就能继续拖。
+  // 请求在飞时照样允许撤销/重做/删操作：新 render 会共用同一条变速请求，
+  // 旧 render 的结果由 rev 丢弃，不会互相抢 UI，也就不需要禁用任何控件。
   function undo() {
-    if (ED.busy || ED.cursor <= 0) return;
+    if (ED.cursor <= 0) return;
     ED.cursor--;
     restore(ED.hist[ED.cursor]);
   }
 
   function redo() {
-    if (ED.busy || ED.cursor >= ED.hist.length - 1) return;
+    if (ED.cursor >= ED.hist.length - 1) return;
     ED.cursor++;
     restore(ED.hist[ED.cursor]);
   }
 
   function removeOp(kind) {
-    if (ED.busy || !ED.state[kind]) return;
+    if (!ED.state[kind]) return;
     ED.state[kind] = null;
     pushHistory();
     syncControls();
@@ -316,16 +544,6 @@
   }
 
   /* ---------------- UI 同步 ---------------- */
-  function setBusy(on) {
-    ED.busy = on;
-    el.tempoRange.disabled = on;
-    el.gainRange.disabled = on;                 // 变速在飞时拖增益会再发一次 /audio/tempo
-    if (el.gainMax) el.gainMax.disabled = on;
-    for (const b of el.ticks.children) b.disabled = on;
-    el.tempoNote.classList.toggle("busy", on);
-    if (on) el.tempoNote.textContent = "变速计算中…";
-  }
-
   /** 刻度高亮：当前倍率落在哪一档（拖动中也要跟着走） */
   function syncTicks() {
     const cur = Number(el.tempoRange.value) || 1;
@@ -360,13 +578,22 @@
     paintEstimate();
   }
 
-  // 变速拖动时即时反馈：结果时长纯前端可算，不必等服务端
-  function paintEstimate() {
-    if (ED.busy) return;
+  // 变速拖动时即时反馈：结果时长纯前端可算，不必等服务端。
+  // 服务端还在算时结果区也先显示估算值，免得「备注说 3.20s、结果条写 4.80s」
+  // 两个数打架；渲染完成后 paintResult() 再写回真实时长。
+  function paintEstimate(forceDur) {
     const rate = Number(el.tempoRange.value) || 1;
     const t = ED.state.trim;
     const base = t ? (t[1] - t[0]) * srcDur() : srcDur();
-    el.tempoNote.textContent = base ? "保音高 · 结果 " + (base / rate).toFixed(2) + "s" : "保音高";
+    const dur = base ? base / rate : 0;
+    const busy = el.tempoNote.classList.contains("busy");
+    el.tempoNote.textContent = (dur ? "保音高 · 结果 " + dur.toFixed(2) + "s" : "保音高")
+      + (busy ? " · 处理中…" : "");
+    // 回到 1.00× 时 hasResult() 会变 false，但结果条在这之前已经显示着，
+    // 所以这里不再用 hasResult() 过滤，否则会短暂停在上一档的时长上。
+    if (dur && (forceDur || activeRenders > 0)) {
+      el.outDur.textContent = dur.toFixed(2) + "s";
+    }
   }
 
   function syncChips() {
@@ -429,15 +656,18 @@
     ED.hist = [cloneState(ED.state)];
     ED.cursor = 0;
     ED.rendered = buffer;          // 无操作时结果即源
+    ED.renderedSnap = cloneState(ED.state);
     ED.basePeak = buffer ? peakOf(buffer) : 0;
     ED.rev++;
+    if (volumeAbort) { volumeAbort.abort(); volumeAbort = null; }
+    resetPending();
     ED.tempoCache.clear();
+    ED.gainCache.clear();
     if (ED.blobUrl) { URL.revokeObjectURL(ED.blobUrl); ED.blobUrl = ""; }
     curOutUrl = "";
     curOutKey = "";
     outAudio.pause();
     outAudio.removeAttribute("src");
-    setBusy(false);
     el.out.hidden = true;
     el.outFoot.hidden = true;
     // 结果区此刻是藏着的，但读数要跟着走：paintResult 只在有编辑动作时才被调用，
@@ -453,12 +683,16 @@
     ED.src = null;
     ED.srcUrl = "";
     ED.rendered = null;
+    ED.renderedSnap = null;
     ED.basePeak = 0;
     ED.state = { trim: null, tempo: null, gain: null };
     ED.hist = [];
     ED.cursor = -1;
     ED.rev++;
+    if (volumeAbort) { volumeAbort.abort(); volumeAbort = null; }
+    resetPending();
     ED.tempoCache.clear();
+    ED.gainCache.clear();
     if (ED.blobUrl) { URL.revokeObjectURL(ED.blobUrl); ED.blobUrl = ""; }
     curOutUrl = "";
     curOutKey = "";
@@ -490,6 +724,9 @@
 
   ED.getState = () => ED.state;
   ED.getRendered = () => ED.rendered;
+  // 这份 rendered 是按哪组参数算出来的。渲染在飞的 1~3s 里 ED.state 已经是新值、
+  // ED.rendered 还是上一档，拿它的时长去反算倍率会得到上一档的倍率。
+  ED.getRenderedSnap = () => ED.renderedSnap;
   ED.hasOps = hasOps;
   ED.hasResult = hasResult;
   ED.undo = undo;
@@ -525,15 +762,11 @@
     gainLive = true;
     paintPeak();                 // 峰值实时跟着滑块走，不等 debounce 后的 render
     clearTimeout(gainTimer);
-    // 忙碌时不能直接 render（会和还没返回的变速请求重叠，先返回者提前清 busy），
-    // 挂起重试，等变速算完再按最新增益重渲染
-    gainTimer = setTimeout(function retry() {
-      if (ED.busy) { gainTimer = setTimeout(retry, GAIN_DEBOUNCE); return; }
-      render();
-    }, GAIN_DEBOUNCE);
+    // 变速在飞时也可以重渲染：新 render 会共用同一条 tempo 请求（见 tempoBuffer），
+    // 旧 render 的结果由 rev 丢弃，不会互相覆盖。
+    gainTimer = setTimeout(() => { render(); }, GAIN_DEBOUNCE);
   });
   el.gainRange.addEventListener("change", () => {
-    if (ED.busy) return;      // 与刻度按钮/撤销同款：disabled 挡不住程序化 dispatchEvent
     clearTimeout(gainTimer);
     gainLive = false;
     pushHistory();
@@ -546,7 +779,7 @@
     el.gainRange.dispatchEvent(new Event("change"));
   });
 
-  // 刻度按钮：走和拖动完全相同的 input + change 两条事件，所以忙碌态、快照、
+  // 刻度按钮：走和拖动完全相同的 input + change 两条事件，所以快照、
   // 渲染、失败回滚都自动一致，不需要第二条代码路径。
   (function buildTicks() {
     for (const rate of TEMPO_TICKS) {
@@ -559,7 +792,6 @@
       b.setAttribute("aria-label", "变速 " + rate.toFixed(2) + " 倍");
       b.setAttribute("aria-pressed", "false");
       b.addEventListener("click", () => {
-        if (ED.busy) return;
         el.tempoRange.value = String(rate);
         el.tempoRange.dispatchEvent(new Event("input"));
         el.tempoRange.dispatchEvent(new Event("change"));
@@ -580,15 +812,18 @@
     syncFoldVals();
     syncTicks();
     paintEstimate();
+    scheduleTempoPrefetch(rate);   // 停顿 220ms 就预热，松手时请求已经在飞/已完成
   });
-  el.tempoRange.addEventListener("change", async () => {     // 松手才请求服务端
+  el.tempoRange.addEventListener("change", async () => {     // 松手定稿（结果可能已经在缓存里了）
     const prev = ED.state.tempo;
     const rate = Number(el.tempoRange.value);
     ED.state.tempo = Math.abs(rate - 1) < 0.001 ? null : rate;
     el.tempoVal.textContent = (ED.state.tempo || 1).toFixed(2) + "×";
     syncTicks();
+    syncChips();                 // 数值/时长/芯片立刻生效，音频随后悄悄替换
     const histLen = ED.hist.length;                          // 记下压栈前的长度
     pushHistory();
+    paintEstimate(true);        // 结果条时长也先按新倍率显示，别和备注打架
     if (!(await render())) {                                // 失败回滚，别留下一个假的 chip
       ED.state.tempo = prev;
       // 仅回滚 state 不回滚 hist，栈里会多出一条「幽灵快照」：
@@ -602,7 +837,13 @@
       syncFoldVals();                                        // 折叠态的摘要行也要同步，否则一直显示失败的那个值
       syncTicks();
       syncChips();
+      clearTimeout(prefetchTimer); prefetchTimer = 0;        // 别再预热那个失败的倍率
+      if (ED.rendered) el.outDur.textContent = ED.rendered.duration.toFixed(2) + "s";
       paintEstimate();
+      // 并发渲染下，上一档倍率的结果可能已被 rev 丢掉；回滚 state 之后要按
+      // 回滚后的状态重算一次，否则界面写 1.50×、播的却是更早的 1.00×。
+      // quiet：刚才已经报过错了，补算再失败不该再弹第二个提示。
+      render(true);
     }
   });
 

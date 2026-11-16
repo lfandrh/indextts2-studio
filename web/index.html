@@ -290,6 +290,10 @@
           </div>
         </div>
       </div>
+      <label class="switch segswitchrow" title="开启：每个句子单独成段，句间停顿更准确可控，但长文本段数变多、音色一致性会下降。关闭（默认）：按分句最大 Token 上限把相邻句子合并成一段，段数更少、整体音色更一致。">
+        <input type="checkbox" id="sentencePerSegment"><span class="tk"></span>每句一段 <span class="pname">sentence_boundary_split</span>
+      </label>
+      <div class="switchnote" id="sentencePerSegmentNote" hidden role="note" aria-live="polite">每句一段已开启 · 句间停顿更准确可控，但长文本段数变多，前后音色一致性会下降；追求整体音色统一时建议关闭。</div>
       <div class="hint-line">段间停顿只在文本被切成多段时生效（单段无效）；每多一段就多一个这样的停顿。最低 200ms：每段开头/结尾各留 100ms 自然收尾，再短就没有语音余韵了。长句超过单段上限被迫从中间断开时，那处停顿只取一半。</div>
       <button class="linkbtn" id="resetParams" type="button">恢复推荐默认值</button>
     </details>
@@ -439,7 +443,8 @@
         </div>
         <span class="dl-name mono" id="dlSrcName"></span>
       </div>
-      <!-- 字幕行：与上面两行同属「源音频出口」，作用于未剪辑的生成音频。
+      <!-- 字幕行：与上面两行同属「源音频出口」。默认导出源音频时间轴的字幕；
+           有裁剪 / 变速时自动切到映射后的时间轴，文件名跟着 _trim / _edit。
            没拿到段边界缓存时整行隐藏（旧音频 / 生成时没记上），不给人点出错误来 -->
       <div class="dl-row sub-row" id="subRow" hidden>
         <div class="fmtseg" id="subFmtSeg" role="group" aria-label="字幕格式">
@@ -453,6 +458,10 @@
         </button>
         <span class="dl-name mono" id="subName"></span>
       </div>
+      <!-- 剪辑态提醒：字幕行仍在源音频出口，但内容已按当前剪辑重算。
+           文案固定（不随参数变），避免 aria-live 在拖动变速时反复播报；
+           具体差异写在面板底部 #subPanelHint 里。 -->
+      <div class="switchnote" id="subEdNote" hidden role="note" aria-live="polite">字幕已按当前剪辑重新计算 · 与下载的音频同名配套</div>
       <!-- 字幕面板：每条一行，点一行从该句起播。时间是引擎给出的物理边界，
            不是按字数估的。优先句级（每句一条）；ASR 不可用时回退段级，
            原因由 app.js 依据 /status 与 sidecar.align_method 显示在下方提示条 -->
@@ -464,7 +473,7 @@
           </button>
         </div>
         <ol class="sub-list" id="subList"></ol>
-        <div class="trim-hint">点一条字幕可从该句开始播放 · 时间对应未剪辑的生成音频，裁剪或变速后不再对齐</div>
+        <div class="trim-hint" id="subPanelHint">点一条字幕可从该句开始播放 · 时间对应未剪辑的源音频；有剪辑时会自动切换</div>
       </div>
       <div class="capnote" id="subNote" hidden></div>
       <div class="capnote" id="melCapNote" hidden>⚠ 文本超过单段生成长度上限，结尾被截断——请减少每段 Token（分句上限）或调高「最大 mel tokens」后重新生成</div>
@@ -734,6 +743,25 @@
             <p><span class="qzb near">几乎无损</span>数值有微差，听感基本无区分</p>
             <p><span class="qzb drop">音质略变</span>有轻微差异，但提速明显</p>
             <p><span class="qzb warn">⚠ 实测更慢</span>开启后反而更慢，建议保持关闭</p>
+          </div>
+
+          <div class="cfg-group-h">显存运行策略 <span>需重启模型生效</span></div>
+          <div class="cfg-item">
+            <div class="cfg-head">
+              <span class="cfg-name">显存档位<b class="qinfo" title="按显卡总显存自动选档（<6GB 轻量 / 6~11.5GB 平衡 / ≥11.5GB 性能）。只决定辅助模型用完退不退、批行上限与单段 token 上限；不改精度、不改扩散步数、不改推理设备。切换后需重启模型才生效"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></b></span>
+              <span class="cfg-live mono" id="mmTierTag">–</span>
+            </div>
+            <select id="cfgVramTier" aria-label="显存运行策略档位">
+              <option value="auto">自动检测（推荐）</option>
+              <option value="4g">4G 轻量档（&lt; 6 GB）</option>
+              <option value="balanced">平衡优化档（6 ~ 11.5 GB）</option>
+              <option value="turbo">性能档（≥ 11.5 GB，常驻）</option>
+            </select>
+            <p class="cfg-desc" id="mmTierHint">自动按总显存选档；常用音色的条件向量会落盘缓存，命中时不再加载 w2v-bert。</p>
+          </div>
+          <div class="cfg-item">
+            <label class="switch"><input type="checkbox" id="cfgCondCacheEnabled"><span class="tk"></span>参考音频条件缓存<span class="qzb near">几乎无损</span><b class="qinfo" title="把参考音频算出的条件张量按内容哈希落盘。命中时跳过 w2v-bert / CAMPPlus 前向，8G 卡可省约 1GB 常驻显存、常用音色首包更快；关闭即回到原来的启动全量常驻加载（P0 行为）。权重或精度变化会自动让旧缓存失效"><svg class="ico" aria-hidden="true"><use href="#i-info"></use></svg></b></label>
+            <p class="cfg-desc">关闭 = 回退到原来的全量加载；切换后需重启模型生效</p>
           </div>
 
           <div class="cfg-group-h">精度 <span>需重启模型生效</span></div>

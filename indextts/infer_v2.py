@@ -1,5 +1,6 @@
 import os
 import sys
+import gc
 import logging
 from contextlib import nullcontext
 
@@ -21,6 +22,8 @@ from omegaconf import OmegaConf
 
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.maskgct_utils import build_semantic_model, build_semantic_codec
+from indextts.utils import cond_cache
+from indextts.utils import vram_tier as vram_tier_mod
 from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.front import TextNormalizer, TextTokenizer
 from indextts.utils.subtitle import cumulative_slices, segment_texts
@@ -65,6 +68,7 @@ class IndexTTS2:
             use_s2mel_fp16=False, use_w2v_fp16=False, use_qwen_fp16=True, aux_paths=None,
             gpt_batch_size=0, gpt_batch_max_gib=0.0, edge_trim_ms=100,
             adaptive_pause=True,
+            vram_tier="auto", cond_cache_enabled=False, reuse_spk_for_emo=False,
     ):
         """
         Args:
@@ -91,11 +95,26 @@ class IndexTTS2:
                 输出都自带 0.1~0.4s 的开头/收尾空白，不裁的话用户设的 interval_silence
                 只占接缝的四分之一，「设 200 听到 800」。0 = 关闭裁剪，退回旧行为。
                 裁剪后接缝 = max(interval_silence, 2*edge_trim_ms)，见 _trim_edge_blank。
+            vram_tier (str): 显存策略档位 ``auto/4g/balanced/turbo``。只决定辅助模型
+                用完退不退、批行上限与切段上限；**不改变任何模型的推理设备、精度、
+                扩散步数或批处理算法**。
+            cond_cache_enabled (bool): 启用参考音频条件向量的持久化缓存 + w2v-bert
+                懒加载。**库层默认 False**：CLI / webui / profile_vram / 单测等直接构造
+                IndexTTS2 的调用方保持「启动即全量加载」的旧行为；Web 服务由
+                server.py 依据 model_config.json 显式传 True。关掉即真回 P0 行为。
+            reuse_spk_for_emo (bool): ``emo_audio == spk_audio`` 时直接复用
+                ``spk_cond_emb``（省一次 w2v 前向，2.5 的做法）。**默认 False**：
+                两条路径的 16k 音频重采样口径不同，实测 ``max|diff| = 1.80``
+                （docs/probes/probe_cond_cache_diff.py），复用会明显改变
+                emo_cond_emb、违反默认无损约束。打开前请自行听感回归。
+                两种缓存模式（``cond_cache_enabled`` 开/关）下语义一致。
         """
         # Ensure auxiliary models are available
         if aux_paths is None:
             from indextts.utils.model_download import ensure_models_available
             aux_paths = ensure_models_available(model_dir)
+        self.aux_paths = aux_paths
+        self.w2v_bert_dir = aux_paths["w2v_bert"]
 
         if device is not None:
             self.device = device
@@ -139,6 +158,41 @@ class IndexTTS2:
         # 只在生成时才知道真实行数（取决于当时的空闲显存与段数），所以不能只靠参数回显。
         self.gpt_batch_last = None
 
+        # ---- VRAM Tier + 条件向量缓存（见 docs/VRAM_TIER_AND_COND_CACHE_PLAN_2026-11-15_zh.md）
+        self.cond_cache_enabled = bool(cond_cache_enabled)
+        self.reuse_spk_for_emo = bool(reuse_spk_for_emo)
+        self._tier = vram_tier_mod.resolve_vram_tier(vram_tier)
+        self.vram_tier = self._tier["requested"]
+        self.effective_tier = self._tier["effective"]
+        self.detected_vram_gb = self._tier["detected_vram_gb"]
+        self.w2v_offload_after_use = bool(self._tier["w2v_offload_after_use"])
+        self.offload_deep = bool(self._tier["offload_deep"])
+        self.tier_max_gpt_batch_rows = self._tier["max_gpt_batch_rows"]
+        self.tier_max_text_tokens_per_segment = self._tier["max_text_tokens_per_segment"]
+        self.cond_cfg_fp = None
+        if self.cond_cache_enabled:
+            # 指纹只纳入真正决定这 5 个缓存张量数值的权重与开关：
+            # w2v-bert 目录（决定 spk_cond_emb）、CAMPPlus（决定 style）、
+            # semantic_codec / s2mel（决定 prompt_condition）、w2v_stat（归一化）。
+            # gpt.pth / bigvgan / bpe.model / fp16 / qwen_fp16 都不参与，不能放进 key。
+            weight_parts = cond_cache.build_weight_fingerprint({
+                "w2v": self.w2v_bert_dir,
+                "stat": os.path.join(self.model_dir, self.cfg.w2v_stat),
+                "codec": self.aux_paths["semantic_codec"],
+                "camp": self.aux_paths["campplus"],
+                "s2mel": os.path.join(self.model_dir, self.cfg.s2mel_checkpoint),
+            })
+            weight_parts.update({
+                "w2v_fp16": str(self.use_w2v_fp16),
+                "s2mel_fp16": str(self.use_s2mel_fp16),
+                "dev": str(self.device).split(":")[0],
+                "prep": "cut15s/sr16k+22k/n_mels100/quant3",
+            })
+            self.cond_cfg_fp = cond_cache.compute_cfg_fp(weight_parts)
+            cond_cache.prune_global_cache()
+            print(f">> cond cache ON: cfg_fp={self.cond_cfg_fp} tier={self.effective_tier} "
+                  f"(detected {self.detected_vram_gb:.2f} GiB)")
+
         self.gpt = UnifiedVoice(**self.cfg.gpt)
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
         load_checkpoint(self.gpt, self.gpt_path)
@@ -151,21 +205,15 @@ class IndexTTS2:
 
         self.gpt.post_init_gpt2_config(kv_cache=True, half=self.use_fp16)
 
-        # Load w2v-bert-2.0 from pre-downloaded local dir
-        w2v_bert_dir = aux_paths["w2v_bert"]
-        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(w2v_bert_dir, local_files_only=True)
-        self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
-            os.path.join(self.model_dir, self.cfg.w2v_stat),
-            model_path=w2v_bert_dir)
-        self.semantic_model = self.semantic_model.to(self.device)
-        self.semantic_model.eval()
-        self.semantic_mean = self.semantic_mean.to(self.device)
-        self.semantic_std = self.semantic_std.to(self.device)
-        if self.use_w2v_fp16 and self.device.startswith(("cuda", "xpu", "mps")):
-            self.semantic_model = self.semantic_model.half()
-            # mean/std stay fp32 (a few MB, negligible): get_emb normalizes in
-            # float32 so the output dtype stays identical to the fp32 path.
-            print(">> w2v-bert converted to FP16")
+        # w2v-bert-2.0：归一化统计量两条路径共用，口径完全一致（保持 fp32，
+        # get_emb 用 feat.float() 归一化，输出 dtype 与旧路径逐位相同）。
+        self._load_w2v_stats()
+        if not self.cond_cache_enabled:
+            self._load_w2v_eager()   # P0 行为：启动即全量加载并常驻
+        else:
+            # 命中缓存时根本不加载 w2v；只有 miss 才 ensure_w2v_bert()。
+            self.extract_features = None
+            self.semantic_model = None
 
         semantic_codec = build_semantic_codec(self.cfg.semantic_codec)
         semantic_code_ckpt = aux_paths["semantic_codec"]
@@ -310,6 +358,104 @@ class IndexTTS2:
         if device_type not in ("cuda", "cpu", "xpu", "mps", "mtia"):
             device_type = "cpu"
         return torch.amp.autocast(device_type=device_type, enabled=True, dtype=torch.float16)
+
+    # ---- w2v-bert 生命周期 ------------------------------------------------
+    # 推理设备恒为 self.device。「offload 到 CPU」只指权重存放位置，绝不指
+    # 在 CPU 上做前向：infer_generator 把 input_features / attention_mask 钉在
+    # self.device，mean/std 也在 self.device，模型若在 CPU 会直接 device mismatch。
+
+    def _load_w2v_stats(self):
+        """只加载归一化统计量（fp32 小张量），eager / lazy 两条路径共用。"""
+        stat = torch.load(os.path.join(self.model_dir, self.cfg.w2v_stat),
+                          map_location="cpu")
+        self.semantic_mean = stat["mean"].to(self.device)
+        self.semantic_std = torch.sqrt(stat["var"]).to(self.device)
+
+    def _build_w2v_model(self):
+        """按原 __init__ 的口径构造 w2v（含 fp16 开关），搬到 self.device。"""
+        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(
+            self.w2v_bert_dir, local_files_only=True)
+        model, _, _ = build_semantic_model(
+            os.path.join(self.model_dir, self.cfg.w2v_stat),
+            model_path=self.w2v_bert_dir)
+        self.semantic_model = model.to(self.device).eval()
+        if self.use_w2v_fp16 and str(self.device).startswith(("cuda", "xpu", "mps")):
+            self.semantic_model = self.semantic_model.half()
+            print(">> w2v-bert converted to FP16")
+
+    def _load_w2v_eager(self):
+        """P0 行为：启动即全量加载 w2v 并常驻。关掉 cond_cache_enabled 走这里。"""
+        self._build_w2v_model()
+
+    def ensure_w2v_bert(self):
+        """把 w2v 放回 self.device；offload 过的权重必须先搬回，绝不做 CPU 前向。"""
+        if self.semantic_model is None:
+            self._build_w2v_model()
+            return
+        cur = next(self.semantic_model.parameters()).device
+        if torch.device(self.device) != cur:
+            self.semantic_model.to(self.device)
+
+    def offload_w2v_bert(self, deep=None):
+        """用完退显存。deep=False 权重留 CPU 内存（下次搬回秒级）；True 彻底释放。"""
+        if self.semantic_model is None:
+            return
+        deep = self.offload_deep if deep is None else bool(deep)
+        if deep:
+            self.semantic_model = None
+            self.extract_features = None
+            gc.collect()
+        else:
+            self.semantic_model.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _maybe_offload_w2v(self):
+        if self.cond_cache_enabled and self.w2v_offload_after_use:
+            self.offload_w2v_bert()
+
+    # ---- 参考音频条件提取 -------------------------------------------------
+    # 从 infer_generator 原样抽出，数值口径逐行不变。spk 与 emo 是两条独立
+    # 路径（16k 音频来源不同），不要合并，否则 emo_cond_emb 会静默改变。
+
+    def _extract_spk_conditioning(self, spk_audio_prompt, verbose=False):
+        audio, sr = self._load_and_cut_audio(spk_audio_prompt, 15, verbose)
+        audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
+        audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
+
+        inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+        input_features = inputs["input_features"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+        spk_cond_emb = self.get_emb(input_features, attention_mask)
+
+        _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+        ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
+        ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+        feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
+                                                 num_mel_bins=80,
+                                                 dither=0,
+                                                 sample_frequency=16000)
+        feat = feat - feat.mean(dim=0, keepdim=True)
+        style = self.campplus_model(feat.unsqueeze(0))
+
+        with self._autocast_s2mel():
+            prompt_condition = self.s2mel.models['length_regulator'](S_ref,
+                                                                     ylens=ref_target_lengths,
+                                                                     n_quantizers=3,
+                                                                     f0=None)[0]
+        return {
+            "spk_cond_emb": spk_cond_emb,
+            "prompt_condition": prompt_condition,
+            "style": style,
+            "ref_mel": ref_mel,
+        }
+
+    def _extract_emo_cond_emb(self, emo_audio_prompt, verbose=False):
+        emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt, 15, verbose, sr=16000)
+        emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+        emo_input_features = emo_inputs["input_features"].to(self.device)
+        emo_attention_mask = emo_inputs["attention_mask"].to(self.device)
+        return self.get_emb(emo_input_features, emo_attention_mask)
 
     @property
     def qwen_emo(self):
@@ -697,7 +843,7 @@ class IndexTTS2:
 
     def _precompute_segment_codes(self, spk_cond_emb, emo_cond_emb, emovec, token_id_lists,
                                   gen_params, batch_size=4, length_ratio=4.0, progress=None,
-                                  mode="manual"):
+                                  mode="manual", tier_max_rows=None):
         """非流式路径的段级批处理：把长度相近的若干段拼成一个 batch，一次 generate 出全部 mel codes。
 
         段越长解码步越多，而组内所有行必须一起跑到最慢那行结束，因此按文本长度排序后贪心分组
@@ -720,6 +866,10 @@ class IndexTTS2:
         _budget = self._gpt_batch_budget_bytes()
         if _budget > 0 and _bytes_per_row > 0:
             _max_rows = max(1, int(_budget // _bytes_per_row))
+            # w2v 懒加载后 free 变大 → 预算也会自动放宽，必须再受档位上限约束，
+            # 否则省下的显存会被 KV cache 吃掉（方案 v2 §3.3 差异 2 / 审查 M1）。
+            if tier_max_rows is not None:
+                _max_rows = min(_max_rows, int(tier_max_rows))
             if batch_size > _max_rows:
                 if os.environ.get("INDEXTTS_DEBUG_BATCH"):
                     logger.debug(f">> gpt batch rows clamped {batch_size} -> {_max_rows} "
@@ -800,7 +950,8 @@ class IndexTTS2:
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=300,
               verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0,
-              glossary=None, cascade=None, max_sentences_per_segment=1, **generation_kwargs):
+              glossary=None, cascade=None, max_sentences_per_segment=1,
+              sentence_boundary_split=True, **generation_kwargs):
         # more_segment_before 是上游 quick_streaming_tokens 的别名：保持形参名
         # 不变以免影响现有调用方，但这里用关键字传入——以前按位置塞进去，
         # 参数名/语义错配，值被静默改作他用。
@@ -808,6 +959,10 @@ class IndexTTS2:
         # 生成过程中改规则不会影响本次任务。
         # max_sentences_per_segment：一段最多装几整句。1=一句一段（默认，停顿最可控），
         # N>1=段数减少、部分句号停顿交回模型。只影响切段，不影响其它参数。
+        # sentence_boundary_split：True=句末标点收尾的段不合并（一句一段）；
+        # False=恢复按 max_text_tokens_per_segment 逐字合并的旧行为。
+        # 库层默认保持 True 以兼容 cli_v2 等不传该参数的调用方；Web 服务的
+        # 「每句一段」开关默认关闭，由 server.py 显式传 False。
         if stream_return:
             return self.infer_generator(
                 spk_audio_prompt, text, output_path,
@@ -818,6 +973,7 @@ class IndexTTS2:
                 quick_streaming_tokens=more_segment_before,
                 glossary=glossary, cascade=cascade,
                 max_sentences_per_segment=max_sentences_per_segment,
+                sentence_boundary_split=sentence_boundary_split,
                 **generation_kwargs
             )
         else:
@@ -831,6 +987,7 @@ class IndexTTS2:
                     quick_streaming_tokens=more_segment_before,
                     glossary=glossary, cascade=cascade,
                     max_sentences_per_segment=max_sentences_per_segment,
+                    sentence_boundary_split=sentence_boundary_split,
                     **generation_kwargs
                 ))[0]
             except IndexError:
@@ -844,7 +1001,8 @@ class IndexTTS2:
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=300,
               verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0,
-              glossary=None, cascade=None, max_sentences_per_segment=1, **generation_kwargs):
+              glossary=None, cascade=None, max_sentences_per_segment=1,
+              sentence_boundary_split=True, **generation_kwargs):
         print(">> starting inference...")
         self._set_gr_progress(0, "starting inference...")
         if verbose:
@@ -853,6 +1011,12 @@ class IndexTTS2:
                   f"emo_vector:{emo_vector}, use_emo_text:{use_emo_text}, "
                   f"emo_text:{emo_text}")
         start_time = time.perf_counter()
+
+        # 低显存档收紧单段 token 上限（只在档位显式给出上限时夹取）。
+        # 不另起一套按字符切段算法，复用主项目已有的 token 级切段体系。
+        if self.tier_max_text_tokens_per_segment is not None:
+            max_text_tokens_per_segment = min(int(max_text_tokens_per_segment),
+                                             int(self.tier_max_text_tokens_per_segment))
 
         if use_emo_text or emo_vector is not None:
             # we're using a text or emotion vector guidance; so we must remove
@@ -890,51 +1054,44 @@ class IndexTTS2:
 
         self._set_gr_progress(0.05, "reference audio processing...|ref")
 
-        # 如果参考音频改变了，才需要重新生成, 提升速度
-        if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
-            if self.cache_spk_cond is not None:
-                self.cache_spk_cond = None
-                self.cache_s2mel_style = None
-                self.cache_s2mel_prompt = None
-                self.cache_mel = None
-                torch.cuda.empty_cache()
-            audio,sr = self._load_and_cut_audio(spk_audio_prompt,15,verbose)
-            audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
-            audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
-
-            inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
-            input_features = inputs["input_features"]
-            attention_mask = inputs["attention_mask"]
-            input_features = input_features.to(self.device)
-            attention_mask = attention_mask.to(self.device)
-            spk_cond_emb = self.get_emb(input_features, attention_mask)
-
-            _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
-            ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
-            ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
-            feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
-                                                     num_mel_bins=80,
-                                                     dither=0,
-                                                     sample_frequency=16000)
-            feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
-            style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
-
-            with self._autocast_s2mel():
-                prompt_condition = self.s2mel.models['length_regulator'](S_ref,
-                                                                         ylens=ref_target_lengths,
-                                                                         n_quantizers=3,
-                                                                         f0=None)[0]
-
-            self.cache_spk_cond = spk_cond_emb
-            self.cache_s2mel_style = style
-            self.cache_s2mel_prompt = prompt_condition
-            self.cache_spk_audio_prompt = spk_audio_prompt
-            self.cache_mel = ref_mel
+        # ---- 参考音频条件向量：两套缓存策略 -------------------------------
+        # False = 原来的单条内存缓存（P0 行为，计算口径逐行不变）；
+        # True  = 持久化缓存，命中时完全不加载 w2v / 不跑 quantize / campplus。
+        if not self.cond_cache_enabled:
+            if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
+                if self.cache_spk_cond is not None:
+                    self.cache_spk_cond = None
+                    self.cache_s2mel_style = None
+                    self.cache_s2mel_prompt = None
+                    self.cache_mel = None
+                    torch.cuda.empty_cache()
+                spk_cond = self._extract_spk_conditioning(spk_audio_prompt, verbose)
+                spk_cond_emb = spk_cond["spk_cond_emb"]
+                style = spk_cond["style"]
+                prompt_condition = spk_cond["prompt_condition"]
+                ref_mel = spk_cond["ref_mel"]
+                self.cache_spk_cond = spk_cond_emb
+                self.cache_s2mel_style = style
+                self.cache_s2mel_prompt = prompt_condition
+                self.cache_spk_audio_prompt = spk_audio_prompt
+                self.cache_mel = ref_mel
+            else:
+                style = self.cache_s2mel_style
+                prompt_condition = self.cache_s2mel_prompt
+                spk_cond_emb = self.cache_spk_cond
+                ref_mel = self.cache_mel
         else:
-            style = self.cache_s2mel_style
-            prompt_condition = self.cache_s2mel_prompt
-            spk_cond_emb = self.cache_spk_cond
-            ref_mel = self.cache_mel
+            spk_hash = cond_cache.audio_hash(spk_audio_prompt)
+            # load(device=self.device) 已逐张量搬回计算设备（下游全在 self.device）
+            spk_cond = cond_cache.load("spk", spk_hash, self.cond_cfg_fp, device=self.device)
+            if spk_cond is None:
+                self.ensure_w2v_bert()
+                spk_cond = self._extract_spk_conditioning(spk_audio_prompt, verbose)
+                cond_cache.save("spk", spk_hash, self.cond_cfg_fp, spk_cond)
+            spk_cond_emb = spk_cond["spk_cond_emb"]
+            prompt_condition = spk_cond["prompt_condition"]
+            style = spk_cond["style"]
+            ref_mel = spk_cond["ref_mel"]
 
         if emo_vector is not None:
             weight_vector = torch.tensor(emo_vector, device=self.device)
@@ -949,22 +1106,38 @@ class IndexTTS2:
             emovec_mat = torch.sum(emovec_mat, 0)
             emovec_mat = emovec_mat.unsqueeze(0)
 
-        if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
-            if self.cache_emo_cond is not None:
-                self.cache_emo_cond = None
-                torch.cuda.empty_cache()
-            emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt,15,verbose,sr=16000)
-            emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
-            emo_input_features = emo_inputs["input_features"]
-            emo_attention_mask = emo_inputs["attention_mask"]
-            emo_input_features = emo_input_features.to(self.device)
-            emo_attention_mask = emo_attention_mask.to(self.device)
-            emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
-
-            self.cache_emo_cond = emo_cond_emb
-            self.cache_emo_audio_prompt = emo_audio_prompt
+        if self.reuse_spk_for_emo and emo_audio_prompt == spk_audio_prompt:
+            # 默认 emoMode=1 会把 emo_audio_prompt 设成 spk_audio_prompt，
+            # 复用可省掉一次 w2v 前向（2.5 同样做法）。两条路径的 16k 重采样
+            # 口径略有差异，严格逐位对比时可关掉 reuse_spk_for_emo。
+            # 判断必须放在缓存模式分支之前：挂在 cond_cache 分支链里会让
+            # 「eager 模式 + reuse 开」的组合静默不生效。
+            emo_cond_emb = spk_cond_emb
+        elif not self.cond_cache_enabled:
+            if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
+                if self.cache_emo_cond is not None:
+                    self.cache_emo_cond = None
+                    torch.cuda.empty_cache()
+                emo_cond_emb = self._extract_emo_cond_emb(emo_audio_prompt, verbose)
+                self.cache_emo_cond = emo_cond_emb
+                self.cache_emo_audio_prompt = emo_audio_prompt
+            else:
+                emo_cond_emb = self.cache_emo_cond
         else:
-            emo_cond_emb = self.cache_emo_cond
+            # emo 用自己的音频 hash 查**自己的**条目；绝不把 emo_cond_emb
+            # 塞进 spk 条目，否则同一音色换情绪音频会后写覆盖、串味且不报错。
+            emo_hash = cond_cache.audio_hash(emo_audio_prompt)
+            cached_emo = cond_cache.load("emo", emo_hash, self.cond_cfg_fp, device=self.device)
+            if cached_emo is None:
+                self.ensure_w2v_bert()
+                emo_cond_emb = self._extract_emo_cond_emb(emo_audio_prompt, verbose)
+                cond_cache.save("emo", emo_hash, self.cond_cfg_fp,
+                                {"emo_cond_emb": emo_cond_emb})
+            else:
+                emo_cond_emb = cached_emo["emo_cond_emb"]
+
+        # spk / emo 两个分支都可能 miss，w2v 要等两边都算完才能卸载
+        self._maybe_offload_w2v()
 
         self._set_gr_progress(0.1, "text processing...")
         # 文本规范化可能失败并退回原文（见 front.py normalize 的兜底），
@@ -977,6 +1150,7 @@ class IndexTTS2:
             text_tokens_list, max_text_tokens_per_segment,
             quick_streaming_tokens=quick_streaming_tokens,
             max_sentences_per_segment=max_sentences_per_segment,
+            sentence_boundary_split=sentence_boundary_split,
         )
         segments_count = len(segments)
 
@@ -1078,12 +1252,19 @@ class IndexTTS2:
             _gpt_batch_size = self._auto_gpt_batch_size(_gen_params)
             if os.environ.get("INDEXTTS_DEBUG_BATCH"):
                 logger.debug(f">> gpt batch auto rows={_gpt_batch_size}")
+        # VRAM Tier 上限对 auto 与手动 2~12 都生效。w2v 懒加载会多腾出 ~1G，
+        # 若不限行数，_auto_gpt_batch_size / 预算夹取会把批行抬到 12，省下的
+        # 显存立刻被 KV cache 吃掉、峰值反升（方案 v2 §3.3 差异 2）。
+        if self.tier_max_gpt_batch_rows is not None and _gpt_batch_size > 1:
+            _gpt_batch_size = min(int(_gpt_batch_size),
+                                  int(self.tier_max_gpt_batch_rows))
         if _gpt_batch_size > 1 and not stream_return and segments_count > 1:
             _batch_start = time.perf_counter()
             precomputed_codes = self._precompute_segment_codes(
                 spk_cond_emb, emo_cond_emb, emovec,
                 [self.tokenizer.convert_tokens_to_ids(sent) for sent in segments],
                 _gen_params, batch_size=_gpt_batch_size,
+                tier_max_rows=self.tier_max_gpt_batch_rows,
                 progress=lambda frac, desc: self._set_gr_progress(0.1 + 0.4 * frac, desc),
                 mode="auto" if _batch_requested < 0 else "manual",
             )

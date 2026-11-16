@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import contextlib
 import errno
+import functools
 import gc
 import hashlib
 import io
@@ -88,6 +89,8 @@ from indextts.utils.server_helpers import (
     estimated_minutes as _estimated_minutes,
     format_long_text_warn as _format_long_text_warn,
     AUDIO_MAX_BYTES,
+    _BASE_AUDIO_KINDS,
+    _FFMPEG_AUDIO_KINDS,
     SUPPORTED_AUDIO_EXTS,
     SUPPORTED_AUDIO_TEXT,
     FFMPEG_AUDIO_EXTS,
@@ -105,6 +108,7 @@ from indextts.utils.subtitle import (
     format_srt,
     format_vtt,
     load_sidecar,
+    remap_cues,
     save_sidecar,
     sidecar_path,
     tokens_to_readable,
@@ -184,6 +188,17 @@ parser.add_argument("--gpt_batch", type=int, default=0,
                          "-1 = auto by free VRAM, 2-12 = fixed rows. Only applies when the text "
                          "is split into >=2 segments. Measured ~1.5x end-to-end at 2 rows "
                          "(+0.5GiB); see docs/PERFORMANCE_zh.md section 6.3/6.4.")
+# 显存分档与条件向量缓存。注意：与本文件其它开关一样，model_config.json 在
+# import 期会覆盖命令行（现状优先级「配置文件 > CLI > 默认」），所以这两个
+# 参数只作为「配置文件缺失时」的默认值，运行时请改模型页或 /model/config。
+parser.add_argument("--vram_tier", type=str, default=None,
+                    choices=("auto", "4g", "balanced", "turbo"),
+                    help="VRAM tier policy: decides whether w2v-bert is offloaded after a "
+                         "cache miss and caps batch rows / segment tokens. Never changes "
+                         "model dtype, diffusion steps or inference device.")
+parser.add_argument("--cond_cache_enabled", action=argparse.BooleanOptionalAction, default=None,
+                    help="Persist reference-audio conditioning tensors and lazy-load w2v-bert. "
+                         "Disabling restores the original eager full-load behaviour (P0).")
 cmd_args = parser.parse_args()
 
 app = FastAPI(
@@ -238,6 +253,10 @@ class LazyTTS:
         # 开头把它们 pop 进局部变量），没必要为它去抢 GPU 锁。
         self._cfg_lock = threading.Lock()
         self.cfg = None
+        # 上次加载过的模型的显存档位快照。放在 LazyTTS 上而不是 _tts 上，
+        # 这样 unload()/rebuild() 销毁实例后 /model 仍能回显 effective_tier，
+        # 且启动阶段完全不需要 import torch（保持 startup torch-free）。
+        self._tier_snapshot = None
         # 规则库在启动时只读两个小 YAML，不加载 torch；管理接口因此能秒开。
         # store 抛异常（磁盘损坏等）不能让服务起不来：失败时按空库继续，
         # 具体原因会写进 warning 列表并在界面横幅提示。
@@ -346,6 +365,11 @@ class LazyTTS:
                             # 段头/段尾各保留多少空白（毫秒）。0 = 关闭裁剪，退回旧行为。
                             # 默认 100 对应「段间停顿下限 200」，两者必须一起改。
                             edge_trim_ms=self.init_kwargs.get("edge_trim_ms", 100),
+                            vram_tier=self.init_kwargs.get("vram_tier", "auto"),
+                            cond_cache_enabled=self.init_kwargs.get("cond_cache_enabled", False),
+                            # 实测复用会把 emo_cond_emb 改掉（max|diff|=1.80），
+                            # 默认保持关闭以守住「默认无损」；探针见 docs/probes/
+                            reuse_spk_for_emo=self.init_kwargs.get("reuse_spk_for_emo", False),
                         )
                         t.normalizer = self.normalizer
                         t.tokenizer = self.tokenizer
@@ -353,6 +377,11 @@ class LazyTTS:
                         t.inference_cfg_rate = self.init_kwargs.get("inference_cfg_rate", 0.7)
                         self.cfg = t.cfg
                         self._tts = t
+                        self._tier_snapshot = {
+                            "effective_tier": getattr(t, "effective_tier", "unknown"),
+                            "detected_vram_gb": getattr(t, "detected_vram_gb", 0.0),
+                            "cond_cfg_fp": getattr(t, "cond_cfg_fp", None),
+                        }
                         self._preview_cache = (0.0, None)
                         self._set_phase("ready")
                         logger.info("IndexTTS2 main model loaded.")
@@ -387,10 +416,29 @@ class LazyTTS:
         "s2mel_fp16": "use_s2mel_fp16",
         "w2v_fp16": "use_w2v_fp16",
         "qwen_fp16": "use_qwen_fp16",
+        "vram_tier": "vram_tier",
+        "cond_cache_enabled": "cond_cache_enabled",
     }
 
     def state(self):
         k = self.init_kwargs
+        t = self._tts
+        snap = self._tier_snapshot or {}
+        # cond_cache 模块顶层 import torch。只在模型至少加载过一次后才读计数，
+        # 保证服务启动（页面首屏 / import 期）不拉 torch。
+        hits = 0
+        if t is not None or snap:
+            try:
+                from indextts.utils import cond_cache
+                hits = int(cond_cache.stats().get("hits", 0))
+            except Exception:
+                hits = 0
+        effective = (getattr(t, "effective_tier", None)
+                     or snap.get("effective_tier") or "unknown")
+        detected = (getattr(t, "detected_vram_gb", None) if t is not None
+                    else snap.get("detected_vram_gb", 0.0))
+        cfg_fp = (getattr(t, "cond_cfg_fp", None) if t is not None
+                  else snap.get("cond_cfg_fp"))
         return {
             "loaded": self.loaded,
             "phase": self.phase,
@@ -402,6 +450,13 @@ class LazyTTS:
             "diffusion_steps": int(k.get("diffusion_steps", 25)),
             "inference_cfg_rate": float(k.get("inference_cfg_rate", 0.7)),
             "gpt_batch_size": int(k.get("gpt_batch_size", 0)),
+            "vram_tier": str(k.get("vram_tier", "auto")),
+            "cond_cache_enabled": bool(k.get("cond_cache_enabled", False)),
+            # 以下 4 项是**只读诊断字段**，不进 _MODEL_CONFIG_KEYS、不落盘。
+            "effective_tier": effective,
+            "detected_vram_gb": float(detected or 0.0),
+            "cond_cfg_fp": cfg_fp,
+            "cond_cache_hits": hits,
         }
 
     def gpt_batch_state(self):
@@ -452,8 +507,14 @@ class LazyTTS:
         with self._cfg_lock:
             for key, val in kw.items():
                 real = self._FLAG_MAP.get(key, key)
-                if key in ("fp16", "s2mel_fp16", "w2v_fp16", "qwen_fp16", "cudnn_benchmark"):
+                if key in ("fp16", "s2mel_fp16", "w2v_fp16", "qwen_fp16", "cudnn_benchmark",
+                           "cond_cache_enabled"):
                     val = bool(val)
+                elif key == "vram_tier":
+                    # 枚举归一：配置里一个错字不能让服务 500，也不能把脏值
+                    # 传进 IndexTTS2。模块本身不依赖 torch，import 期调用安全。
+                    from indextts.utils.vram_tier import normalize_tier
+                    val = normalize_tier(val)
                 elif key == "diffusion_steps":
                     val = int(max(1, min(50, val)))
                 elif key == "inference_cfg_rate":
@@ -529,6 +590,9 @@ tts = LazyTTS(
     inference_cfg_rate=cmd_args.inference_cfg_rate,
     cudnn_benchmark=cmd_args.cudnn_benchmark,
     gpt_batch_size=cmd_args.gpt_batch,
+    vram_tier=cmd_args.vram_tier or "auto",
+    cond_cache_enabled=(cmd_args.cond_cache_enabled
+                        if cmd_args.cond_cache_enabled is not None else True),
 )
 
 
@@ -724,6 +788,36 @@ def _ffmpeg_bin():
     return found
 
 
+# 便携包里的 ffmpeg.exe 是动态链接的 MSVC 程序：对方机器缺 VC++ 2015–2022 运行库
+# 时「文件在、跑不起来」，系统只会给 WinError 126/193 或 0xC0000135。这些原文对
+# 用户没有任何指导意义，统一翻成一句能照做的建议（见 _ffmpeg_launch_hint）。
+_VC_REDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+_DLL_FAILURE_CODES = frozenset({
+    -1073741515, 3221225781,   # 0xC0000135 STATUS_DLL_NOT_FOUND
+    -1073741511, 3221225785,   # 0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND
+})
+_DLL_FAILURE_NEEDLES = (
+    "winerror 126", "winerror 193", "找不到指定的模块", "不是有效的 win32",
+)
+
+
+def _ffmpeg_launch_hint(err) -> str:
+    """ffmpeg 起不来时返回一句可照做的修复建议；不属于这类错误则返回空串。
+
+    err 可以是 OSError（进程起不来）或 int（进程以异常码退出）。
+    """
+    code = err if isinstance(err, int) else getattr(err, "winerror", None)
+    text = "" if isinstance(err, int) else str(err)
+    low = text.lower()
+    if code in _DLL_FAILURE_CODES or any(k in low for k in _DLL_FAILURE_NEEDLES):
+        return (
+            "这台机器上的 ffmpeg 无法启动，通常是缺少系统运行库。"
+            "安装 Visual C++ 2015–2022 运行库（x64）后重启服务即可："
+            f"{_VC_REDIST_URL}"
+        )
+    return ""
+
+
 def _supported_audio_exts() -> list[str]:
     """本机实际能收的扩展名：基础白名单 +（有 ffmpeg 时的）转码格式。"""
     return list(SUPPORTED_AUDIO_EXTS) + (list(FFMPEG_AUDIO_EXTS) if _ffmpeg_bin() else [])
@@ -772,13 +866,21 @@ def _transcode_to_wav(
         try:
             proc = subprocess.run(cmd, capture_output=True, timeout=600)
         except (OSError, subprocess.SubprocessError) as e:
-            raise HTTPException(500, f"调用 ffmpeg 解码{label}失败: {e}")
+            hint = _ffmpeg_launch_hint(e)
+            raise HTTPException(
+                500, f"调用 ffmpeg 解码{label}失败: {e}" + (f"。{hint}" if hint else "")
+            )
     finally:
         try:
             os.remove(src)
         except OSError:
             pass
     if proc.returncode != 0 or not proc.stdout:
+        # 先判「ffmpeg 自己起不来」：缺运行库时返回码是 0xC0000135，把它当成
+        # 「文件已损坏」会让人去反复换文件，而真正该做的是装运行库。
+        hint = _ffmpeg_launch_hint(proc.returncode)
+        if hint:
+            raise HTTPException(500, hint)
         tail = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
         blob = "\n".join(tail)
         # ffmpeg 的原话是 "Output file does not contain any stream" / "matches no
@@ -794,6 +896,49 @@ def _transcode_to_wav(
             400,
             f"{label}无法解码成音频" + (f"（{tail[-1][:120]}）" if tail else ""),
         )
+    return proc.stdout
+
+
+def _ffmpeg_audio_filter(
+    data: bytes, afilter: str, action: str, *, timeout: float = 120, mono: bool = True
+) -> bytes:
+    """对「浏览器已解码的 16bit PCM WAV」施加 ffmpeg 音频滤镜，返回同规格 WAV。
+
+    与 _transcode_to_wav 分开：这里的输入必然是前端 encodeWav 产出的标准 WAV，
+    可以直接走管道，不必为 mp4 的 moov 落临时文件；出错文案也按「处理」而非
+    「解码」写。刻意不指定 -ar：保持源采样率，重采样仍交给推理侧/浏览器。
+
+    mono=True（默认）下混成单声道，与旧 WSOLA 引擎、前端单声道口径一致；
+    音量增益要传 mono=False —— 它只改振幅，没有理由丢声像，而且前端在
+    没有 ffmpeg 时用的 gainBuffer 是保留声道的，两条路径必须给同一份东西。
+
+    pcm_s16le 编码器会把超出 0dBFS 的采样截到满刻度（实测 +20dB 时峰值
+    1.0000、不回绕），与前端 gainBuffer 的硬截行为一致。
+
+    timeout 由调用方按前端 fetch 超时给：前端 45s 就放弃的请求，后端不该
+    再闷头跑两分钟——用户重试一次就多一个 ffmpeg 进程，越拖越卡。
+    """
+    ff = _ffmpeg_bin()
+    if not ff:
+        raise HTTPException(503, f"服务端没有 ffmpeg，无法{action}")
+    cmd = [ff, "-v", "error", "-nostdin", "-i", "pipe:0", "-vn", "-af", afilter]
+    if mono:
+        cmd += ["-ac", "1"]
+    cmd += ["-c:a", "pcm_s16le", "-f", "wav", "pipe:1"]
+    try:
+        proc = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, f"ffmpeg {action}超时（{timeout:.0f}s）")
+    except (OSError, subprocess.SubprocessError) as e:
+        hint = _ffmpeg_launch_hint(e)
+        raise HTTPException(
+            500, f"调用 ffmpeg {action}失败: {e}" + (f"。{hint}" if hint else "")
+        )
+    if proc.returncode != 0 or not proc.stdout:
+        tail = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        msg = f"ffmpeg {action}失败" + (f"（{tail[-1][:120]}）" if tail else "")
+        hint = _ffmpeg_launch_hint(proc.returncode)
+        raise HTTPException(500, msg + (f"。{hint}" if hint else ""))
     return proc.stdout
 
 
@@ -853,21 +998,47 @@ def _validate_audio_upload(data: bytes, label: str, *, allow_ffmpeg: bool = True
 
 
 def _prepare_ref_audio(data: bytes, label: str) -> bytes:
-    """参考音频落盘前的统一处理：能直接读的保持原字节，读不了的容器交给 ffmpeg 转 WAV。
+    """参考音频落盘前的统一处理：有 ffmpeg 就把白名单内所有格式解成 PCM WAV。
+
+    以前是「libsndfile 能直读的保持原字节，只有 m4a/aac/wma 才转码」，同一个
+    上传框里混着两套解码器，格式容错与前端可播放性都不一致。现在只要本机有
+    ffmpeg，白名单内所有格式一律由 ffmpeg 解成 16bit PCM WAV；没装则完整退回
+    旧行为（基础格式原样透传、m4a/aac/wma 拒收）。ffmpeg 在便携包里是可选件，
+    增量升级包不带二进制，不能让这批用户连普通 WAV 都传不上去。
+
+    刻意不指定 -ar / -ac：保持源采样率与声道，重采样继续由推理侧 librosa
+    (soxr_hq) 完成。实测强制转 22050Hz 单声道会改变送进模型的张量（相对误差
+    约 5e-4，来自 ffmpeg swr 与 soxr_hq 的算法差异），而保持原采样率时 16bit
+    PCM WAV 逐值等价、mp3/ogg 只有 1e-4 量级的 16bit 量化差。
 
     只放行白名单里的容器（见 server_helpers.audio_kind）：webm/mp4 视频/amr 这类
-    即使 ffmpeg 能解也不收，保证「界面上能选的 = 后端能收的」。
-    返回的总是一个 libsndfile 能读的文件，所以 prompts/ 里不会再有「上传成功、
-    推理时才炸」的缓存文件；同一段 m4a 重复上传转出的 WAV 字节一致，内容哈希
-    仍然命中同一个缓存路径。
+    即使 ffmpeg 能解也不收，保证「界面上能选的 = 后端能收的」。返回的总是
+    libsndfile 能读的文件，所以 prompts/ 里不会再有「上传成功、推理时才炸」的
+    缓存文件；同一段音频重复上传转出的 WAV 字节一致，内容哈希仍命中同一路径。
     """
     _check_audio_upload_size(data, label)
     kind = _audio_kind(data)
-    if kind in ("wav", "mp3", "flac", "ogg"):
+    if kind not in (*_BASE_AUDIO_KINDS, *_FFMPEG_AUDIO_KINDS):
+        raise HTTPException(400, _audio_reject_detail(label))
+    if not _ffmpeg_bin():
+        # m4a/aac/wma 仍必须在落盘前拒收，否则会一路走到推理阶段才炸成
+        # NoBackendError；基础格式保持原字节，无需 ffmpeg 也能正常使用。
+        if kind in _BASE_AUDIO_KINDS:
+            return data
+        raise HTTPException(400, _audio_reject_detail(label))
+
+    wav = _transcode_to_wav(data, label)
+    if kind in _BASE_AUDIO_KINDS and len(wav) > AUDIO_MAX_BYTES:
+        # 有损源解成 PCM 会膨胀十倍以上（32MB 的 mp3 → 数百 MB WAV），而落盘
+        # 缓存与内容哈希都按 32MB 口径设计。这类超长音频退回原始字节，保持
+        # 旧的可用性，不为「统一解码」撑爆磁盘。m4a/aac/wma 不能降级：原字节
+        # libsndfile 读不了，仍返回转码结果（与旧行为一致）。
+        logger.info(
+            "%s 转码后 %.1f MB 超过参考音频缓存上限，保持原始字节",
+            label, len(wav) / 1048576,
+        )
         return data
-    if kind in ("m4a", "aac", "wma") and _ffmpeg_bin():
-        return _transcode_to_wav(data, label)
-    raise HTTPException(400, _audio_reject_detail(label))
+    return wav
 
 
 def _read_upload_capped(f: UploadFile, label: str) -> bytes:
@@ -1442,9 +1613,11 @@ def _reject_if_generating():
 _MODEL_CONFIG_KEYS = frozenset({
     "fp16", "s2mel_fp16", "w2v_fp16", "qwen_fp16", "cudnn_benchmark",
     "diffusion_steps", "inference_cfg_rate", "gpt_batch_size",
+    "vram_tier", "cond_cache_enabled",
 })
 # 每个字段的类型与生效区间（与模型页滑轨、set_runtime 的兜底取同一档位）。
-_MODEL_CONFIG_BOOL = ("fp16", "s2mel_fp16", "w2v_fp16", "qwen_fp16", "cudnn_benchmark")
+_MODEL_CONFIG_BOOL = ("fp16", "s2mel_fp16", "w2v_fp16", "qwen_fp16", "cudnn_benchmark",
+                      "cond_cache_enabled")
 _MODEL_CONFIG_INT = {"diffusion_steps": (1, 50), "gpt_batch_size": (-1, 12)}
 _MODEL_CONFIG_FLOAT = {"inference_cfg_rate": (0.0, 1.0)}
 
@@ -1527,6 +1700,14 @@ def _model_config_value(key: str, val):
         if not isinstance(val, bool):
             raise HTTPException(400, f"参数 {key} 需要 true/false，当前是 {type(val).__name__}")
         return val
+    if key == "vram_tier":
+        # 合法值从 vram_tier 模块读，避免与策略表两处副本漂移。非法值归一为
+        # auto 并留痕，不 500（与「坏配置不该让服务起不来」的既有约定一致）。
+        from indextts.utils.vram_tier import TIER_CHOICES
+        if not isinstance(val, str) or val.strip().lower() not in TIER_CHOICES:
+            logger.warning("Invalid vram_tier=%r, falling back to 'auto'", val)
+            return "auto"
+        return val.strip().lower()
     if key in _MODEL_CONFIG_INT:
         lo, hi = _MODEL_CONFIG_INT[key]
         return int(max(lo, min(hi, _model_config_number(key, val))))
@@ -1829,6 +2010,10 @@ def do_tts(
     # 一段最多装几整句：1=一句一段（默认）；2/3=合并，段数减少但段内句号的
     # 停顿交回模型。只影响切段粒度，不改其它参数。
     max_sentences_per_segment: int = Form(1),
+    # 「每句一段」开关：True=句末标点单独成段（停顿可控、段数多）；
+    # False（产品默认）=按 max_text_tokens_per_segment 把相邻句子合并，
+    # 段数少、长文本音色更一致。库层默认 True，这里显式给 False 才是用户看到的默认。
+    sentence_boundary_split: bool = Form(False),
     do_sample: bool = Form(True),
     top_p: float = Form(0.8),
     top_k: int = Form(30),
@@ -1914,6 +2099,9 @@ def do_tts(
         raise HTTPException(400, f"max_sentences_per_segment 必须是整数：{max_sentences_per_segment!r}")
     if not 1 <= max_sentences_per_segment <= 8:
         raise HTTPException(400, f"max_sentences_per_segment 超出范围（1~8）：{max_sentences_per_segment}")
+    # FastAPI 注入的是 bool；但进程内直接调用时默认值会是 Form(False) 对象，
+    # bool(那个对象) 反而是 True。显式判等保证两条路径都按「默认关闭」走。
+    sentence_boundary_split = sentence_boundary_split is True
     # 在请求线程取一次快照：生成途中切场景/改规则不影响本次任务。
     glossary_snapshot = _glossary_snapshot(scenario_id)
     text_warn = None
@@ -1931,7 +2119,8 @@ def do_tts(
             )
             est_segs = len(tts.tokenizer.split_segments(
                 _tokens, max_text_tokens_per_segment=max_text_tokens_per_segment,
-                max_sentences_per_segment=max_sentences_per_segment))
+                max_sentences_per_segment=max_sentences_per_segment,
+                sentence_boundary_split=sentence_boundary_split))
         except Exception as e:
             logger.warning("long-text warn: tokenizer unavailable (%s)", e)
         if est_segs:
@@ -2194,6 +2383,7 @@ def do_tts(
                 verbose=cmd_args.verbose,
                 max_text_tokens_per_segment=max_text_tokens_per_segment,
                 max_sentences_per_segment=max_sentences_per_segment,
+                sentence_boundary_split=sentence_boundary_split,
                 do_sample=do_sample,
                 top_p=top_p,
                 top_k=top_k if top_k > 0 else None,
@@ -2347,16 +2537,22 @@ def audio(name: str):
 # ---- tempo (pitch-preserving time stretch) ----------------------------------
 # Pure CPU work: deliberately NOT guarded by _INFER_LOCK. A queued long-text
 # generation must never be blocked by someone dragging the speed slider.
-# Engine: audiotsm's WSOLA (time-domain overlap-add, MIT licensed). The old
-# engine was a bare phase vocoder (librosa.effects.time_stretch) which rewrites
-# phase without touching magnitude -- overlapping frames then cancel each other
-# out, so it sounds metallic ("电音") and the peak came out at ~50% of source.
-# WSOLA searches for the best alignment before overlap-add, so energy and
-# transients survive (measurements in docs/TEMPO_ENGINE_LICENSE_REVIEW_zh.md).
-# audiotsm is imported lazily -- it is only ever needed here, and pulling it in
-# at startup would slow down every boot for a feature most runs never touch.
+#
+# 首选引擎 ffmpeg atempo（同样是基于时域波形相似度的 WSOLA 变体，保音高）。
+# 实测它比 audiotsm WSOLA 更忠实于原能量：3s 调幅复合音输入 RMS 0.0849，
+# atempo 五档倍率输出 RMS 均 0.0840~0.0843，而 WSOLA 输出约 0.093（+10%），
+# 重叠相加把能量抬高了；峰值两者相当，能量包络相关 0.986~0.989。
+# ffmpeg 在便携包里是可选件（增量升级包不带二进制），所以没有 ffmpeg 时
+# 完整降级回 audiotsm WSOLA，不让那批用户的变速功能直接失效。
+# 更早的相位声码器（librosa.effects.time_stretch）会出「电音」，见
+# docs/TEMPO_ENGINE_LICENSE_REVIEW_zh.md，不要退回去。
 _TEMPO_MIN, _TEMPO_MAX = 0.5, 2.0
 _WSOLA_FRAME = 1024          # audiotsm 的默认帧长；显式写出来，补帧时要用
+# ffmpeg 子进程超时，与前端 fetch 的超时对齐（见 web/edit.js 的 TEMPO_TIMEOUT /
+# VOLUME_TIMEOUT）。前端已经放弃的请求，后端不该再跑两分钟——用户重试一次就
+# 多一个 ffmpeg 进程，几个叠起来就是「越拖越卡」。
+_TEMPO_FFMPEG_TIMEOUT = 45.0
+_VOLUME_FFMPEG_TIMEOUT = 15.0
 _wsola = None
 
 
@@ -2369,7 +2565,10 @@ def _get_wsola():
 
 
 def _stretch_wav(in_path: str, rate: float) -> bytes:
-    """Read wav -> WSOLA time-stretch -> write 16bit PCM wav into memory."""
+    """降级引擎：Read wav -> audiotsm WSOLA -> write 16bit PCM wav into memory.
+
+    只有本机没有 ffmpeg 时才会走到这里；实现保持原样，便于逐字节对照旧行为。
+    """
     import numpy as np  # noqa: PLC0415
     import soundfile as sf  # noqa: PLC0415
     from audiotsm.io.array import ArrayReader, ArrayWriter  # noqa: PLC0415
@@ -2398,13 +2597,60 @@ def _stretch_wav(in_path: str, rate: float) -> bytes:
     return buf.getvalue()
 
 
-def _stretch_from_bytes(data: bytes, rate: float) -> bytes:
-    """写临时文件 + WSOLA 整段放进 executor，事件循环不碰磁盘 I/O。"""
+def _atempo_from_bytes(data: bytes, rate: float) -> bytes:
+    """ffmpeg atempo，并把输出长度对齐到 n/rate。
+
+    atempo 的输出长度并不精确等于理想值（实测 0.5× 时短 803 采样、2.0× 时长
+    101 采样）。旧 WSOLA 路径特意补一帧再裁回 want，保证尾音不被吃掉、前端
+    「结果 x.xx s」也对得上；这里沿用同一口径，两条引擎的时长完全一致。
+    """
+    import numpy as np  # noqa: PLC0415
+    import soundfile as sf  # noqa: PLC0415
+
+    want = int(round(sf.info(io.BytesIO(data)).frames / rate))
+    wav = _ffmpeg_audio_filter(
+        data, f"atempo={rate:.6f}", "变速", timeout=_TEMPO_FFMPEG_TIMEOUT
+    )
+    y, sr = sf.read(io.BytesIO(wav), dtype="float32")
+    if y.ndim > 1:                     # -ac 1 已保证单声道，留个防御
+        y = y.mean(axis=1)
+    if y.shape[0] < want:
+        y = np.concatenate([y, np.zeros(want - y.shape[0], dtype=y.dtype)])
+    else:
+        y = y[:want]
+    buf = io.BytesIO()
+    sf.write(buf, y, sr, subtype="PCM_16", format="WAV")
+    return buf.getvalue()
+
+
+def _wsola_from_bytes(data: bytes, rate: float) -> bytes:
+    """无 ffmpeg 时的降级引擎：写临时文件 + WSOLA 整段放进 executor。"""
     with tempfile.TemporaryDirectory() as td:
         in_path = os.path.join(td, "in.wav")
         with open(in_path, "wb") as f:
             f.write(data)
         return _stretch_wav(in_path, rate)
+
+
+def _stretch_from_bytes(data: bytes, rate: float) -> bytes:
+    """变速统一入口：有 ffmpeg 走 atempo，没有或调用失败则退回 audiotsm WSOLA。
+
+    便携包里的 ffmpeg 是动态链接的 exe，对方机器缺 VC++ 运行库时「文件在、
+    跑不起来」（见项目笔记）。这种情况下不能让变速直接 500，降级回旧引擎。
+    """
+    if _ffmpeg_bin():
+        try:
+            return _atempo_from_bytes(data, rate)
+        except HTTPException as e:
+            # 超时是「这段太长/机器太慢」，不是「ffmpeg 坏了」：再跑一遍纯 Python
+            # 的 WSOLA 只会更慢，前端早已 abort，等于白白多吃一份 CPU。
+            if e.status_code == 504:
+                raise
+            logger.warning(
+                "ffmpeg atempo 不可用（%s），rate=%.3f 降级回 audiotsm WSOLA",
+                e.detail, rate,
+            )
+    return _wsola_from_bytes(data, rate)
 
 
 def _warmup_tempo():
@@ -2413,8 +2659,33 @@ def _warmup_tempo():
     WSOLA has no JIT to warm up (that was the old phase vocoder's numba kernel,
     ~8s on a fresh install), so this only pulls numpy + audiotsm in and proves
     the dependency is importable -- a missing audiotsm then shows up as a boot
-    warning instead of a user staring at "变速计算中…" forever.
+    warning instead of a user staring at "处理中…" forever.
+    有 ffmpeg 时主引擎是 atempo，audiotsm 只在降级路径用，不必在启动时导入。
+
+    但「文件在」不等于「能跑」：便携包里的 ffmpeg 是动态链接的 MSVC 程序，
+    对方机器缺 VC++ 运行库时启动即失败，而 _ffmpeg_bin() 只做存在性判断。
+    这里真跑一次 -version，把问题在启动日志里说清楚（含修复方法），
+    免得用户第一次拖滑块只看到「变速变慢」却不知道原因。
     """
+    ff = _ffmpeg_bin()
+    if ff:
+        problem = ""
+        try:
+            probe = subprocess.run([ff, "-version"], capture_output=True, timeout=5)
+            if probe.returncode != 0:
+                problem = _ffmpeg_launch_hint(probe.returncode) or f"返回码 {probe.returncode}"
+        except subprocess.TimeoutExpired:
+            problem = "启动超时（5s 未返回）"
+        except (OSError, subprocess.SubprocessError) as e:
+            problem = _ffmpeg_launch_hint(e) or str(e)
+        if problem:
+            logger.warning(
+                "ffmpeg 存在但无法运行（%s）。变速会全程降级到 WSOLA：功能可用，"
+                "但更慢、能量保真略差。", problem,
+            )
+        else:
+            logger.info("ffmpeg atempo ready (WSOLA kept as fallback)")
+        return
     try:
         import numpy as np  # noqa: PLC0415
         from audiotsm.io.array import ArrayReader, ArrayWriter  # noqa: PLC0415
@@ -2436,7 +2707,7 @@ async def audio_tempo(file: UploadFile = File(...), rate: float = Form(...)):
     data = await file.read(AUDIO_MAX_BYTES + 1)
     if len(data) > AUDIO_MAX_BYTES:
         raise HTTPException(413, f"音频过大（上限 {AUDIO_MAX_BYTES // 1048576} MB）")
-    # 这个接口的调用方只有裁剪弹窗的「变速」，源文件必然已经过浏览器解码；
+    # 这个接口（以及 /audio/volume）的源文件必然已经过浏览器解码；
     # 文案里只列基础格式，不提需要 ffmpeg 的 m4a/aac/wma。
     _validate_audio_upload(data, "音频", allow_ffmpeg=False)
     if not (_TEMPO_MIN <= rate <= _TEMPO_MAX):
@@ -2454,8 +2725,52 @@ async def audio_tempo(file: UploadFile = File(...), rate: float = Form(...)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("tempo failed")
+        # 带上倍率与体量：只留一句 "tempo failed" 的话，用户报「变速失败」时
+        # 看日志也无从判断是极端倍率、超大文件还是引擎本身的问题。
+        logger.exception("tempo failed (rate=%.3f, %.1f MB)", rate, len(data) / 1048576)
         raise HTTPException(500, f"变速失败：{e}")
+    return Response(content=wav, media_type="audio/wav", headers={"Cache-Control": "no-cache"})
+
+
+# ---- volume (gain in dB) ----------------------------------------------------
+_GAIN_MIN, _GAIN_MAX = -24.0, 24.0        # 与 index.html #gainRange 的 min/max 一致
+
+
+@api.post("/audio/volume")
+async def audio_volume(file: UploadFile = File(...), db: float = Form(...)):
+    """增益（dB），返回 16bit PCM WAV，不落盘。
+
+    剪辑台的增益原本在浏览器里用 JS 逐样本乘 10^(dB/20)；改由 ffmpeg 的
+    volume 滤镜处理，与变速共用同一套上传校验和 PCM 规格。实测两条路径只差
+    1 个 16bit 量化单位（3e-5），超 0dBFS 时 ffmpeg 截到满刻度、与前端硬截
+    一致。没有 ffmpeg 时返回 503，前端会自动退回浏览器本地增益。
+    """
+    # 与 /audio/tempo 同款：先按元数据挡，再限量读取
+    if getattr(file, "size", None) is not None and file.size > AUDIO_MAX_BYTES:
+        raise HTTPException(413, f"音频过大（上限 {AUDIO_MAX_BYTES // 1048576} MB）")
+    data = await file.read(AUDIO_MAX_BYTES + 1)
+    if len(data) > AUDIO_MAX_BYTES:
+        raise HTTPException(413, f"音频过大（上限 {AUDIO_MAX_BYTES // 1048576} MB）")
+    _validate_audio_upload(data, "音频", allow_ffmpeg=False)
+    if not (_GAIN_MIN <= db <= _GAIN_MAX):
+        raise HTTPException(
+            400, f"增益超出范围（{db} dB，允许 {_GAIN_MIN}–{_GAIN_MAX} dB）"
+        )
+    loop = asyncio.get_running_loop()
+    try:
+        # run_in_executor 只吃位置参数，超时是 keyword-only，用 partial 绑进去
+        wav = await loop.run_in_executor(
+            None,
+            functools.partial(
+                _ffmpeg_audio_filter, data, f"volume={db:.4f}dB", "音量增益",
+                timeout=_VOLUME_FFMPEG_TIMEOUT, mono=False,
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("volume failed (db=%.2f, %.1f MB)", db, len(data) / 1048576)
+        raise HTTPException(500, f"音量处理失败：{e}")
     return Response(content=wav, media_type="audio/wav", headers={"Cache-Control": "no-cache"})
 
 
@@ -2734,6 +3049,9 @@ def presets_create(
     max_mel_tokens: int = Form(1500),
     max_text_tokens_per_segment: int = Form(120),
     interval_silence: int = Form(INTERVAL_SILENCE_DEFAULT),
+    # 切段方式随预设一起存：它和 max_text_tokens_per_segment 一样决定「怎么念」，
+    # 老预设没有该字段时前端保持当前值不动（不强行回默认）。
+    sentence_boundary_split: bool = Form(False),
     prompt_audio: UploadFile | None = File(None),
     emo_audio: UploadFile | None = File(None),
     overwrite: bool = Form(False),
@@ -2785,6 +3103,7 @@ def presets_create(
             # 与 do_tts 同款校验：以前只 int() 不查范围，越界值照样入库
             "max_text_tokens_per_segment": _clamp_seg_tokens(max_text_tokens_per_segment),
             "interval_silence": max(INTERVAL_SILENCE_MIN, min(INTERVAL_SILENCE_MAX, int(interval_silence))),
+            "sentence_boundary_split": sentence_boundary_split is True,
         },
     }
 
@@ -2832,13 +3151,14 @@ def presets_detail(name: str, legacy: bool = False):
         raise HTTPException(422, str(e))
     if data is None:
         raise HTTPException(404, "Preset not found")
-    # 兼容老客户端：带 ?legacy=1 时退回不含 interval_silence 的旧结构。
+    # 兼容老客户端：带 ?legacy=1 时退回不含后加字段的旧结构。
     # 新增字段本身是向后兼容的加法，但严格 schema 校验（extra=forbid /
     # additionalProperties:false）的第三方插件会因此报错，留一个逃生门。
     if legacy:
         adv = data.get("advanced_params")
         if isinstance(adv, dict):
             adv.pop("interval_silence", None)
+            adv.pop("sentence_boundary_split", None)
     # load_preset 把音频字段转成了服务器绝对路径，只对内使用；
     # 响应里换成语 URL，避免把服务器目录结构暴露给客户端
     if data.get("prompt_audio"):
@@ -3542,6 +3862,9 @@ def segments_preview(
     text: str = Form(""),
     max_text_tokens_per_segment: int = Form(120),
     max_sentences_per_segment: int = Form(1),
+    # 与 /tts 同口径：预览必须按「每句一段」开关的当前状态切，
+    # 否则用户会看到与实际生成不一致的段数。默认 False（合并）。
+    sentence_boundary_split: bool = Form(False),
     scenario_id: str | None = Form(None),
     interval_silence: int = Form(INTERVAL_SILENCE_DEFAULT),
 ):
@@ -3581,6 +3904,8 @@ def segments_preview(
         tokens,
         max_text_tokens_per_segment=max_text_tokens_per_segment,
         max_sentences_per_segment=max(1, min(8, int(max_sentences_per_segment or 1))),
+        # 同 /tts：Form(False) 在进程内直接调用时是对象，显式判等才不会误判成 True。
+        sentence_boundary_split=sentence_boundary_split is True,
     )
 
     # 词元拼回可读文本的实现在 indextts/utils/subtitle.py，与字幕共用一份。
@@ -3744,34 +4069,82 @@ def _subtitle_load_or_404(name: str) -> dict:
     return data
 
 
+def _subtitle_view(data, start=None, end=None, rate=None):
+    """按需把字幕映射到剪辑后的时间轴，返回 ``(cues, segments, mapped)``。
+
+    三个参数全缺省时完全不碰 cue：旧客户端、旧缓存、旧单测都走原路径。
+    ``segments`` 与 ``cues`` 必须分别映射 —— ``cues_from_sidecar`` 会优先读
+    ``sentences``，若先改 ``data["segments"]`` 再取 cues，句级字幕（默认路径）
+    就会漏映射，响应内部出现两条不同的时间轴。
+    """
+    mapped = start is not None or end is not None or (rate is not None and rate != 1.0)
+    if not mapped:
+        return cues_from_sidecar(data), data.get("segments"), False
+    if (start is None) != (end is None):
+        raise HTTPException(400, "start / end 必须成对出现")
+    if rate is not None and not (_TEMPO_MIN <= rate <= _TEMPO_MAX):
+        raise HTTPException(
+            400, f"变速倍率超出范围（{rate}，允许 {_TEMPO_MIN}–{_TEMPO_MAX}）"
+        )
+    try:
+        cues = remap_cues(cues_from_sidecar(data), start, end, rate)
+        segments = remap_cues(data.get("segments"), start, end, rate)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    return cues, segments, True
+
+
 @api.get("/subtitle", include_in_schema=False)
-def subtitle_get(file: str = ""):
-    """字幕条目（前端字幕面板用）。句级优先、旧缓存自动回退段级；不占推理锁。"""
+def subtitle_get(
+    file: str = "",
+    start: float | None = None,
+    end: float | None = None,
+    rate: float | None = None,
+):
+    """字幕条目（前端字幕面板用）。句级优先、旧缓存自动回退段级；不占推理锁。
+
+    ``start`` / ``end`` / ``rate`` 用于剪辑后的时间轴重映射：三者全缺省时
+    行为与旧版一致，只是多返回一个 ``mapped`` 字段。
+    """
     data = _subtitle_load_or_404(file)
+    cues, segments, mapped = _subtitle_view(data, start, end, rate)
     return JSONResponse({
         "file": data["file"],
         "granularity": data.get("granularity") or "segment",
         "align_method": data.get("align_method") or "",
         "text_source": data.get("text_source") or "",
         "created_at": data.get("created_at"),
-        "segments": data["segments"],
-        "cues": cues_from_sidecar(data),
+        "segments": segments,
+        "cues": cues,
+        "mapped": mapped,
     })
 
 
 @api.get("/subtitle/export", include_in_schema=False)
-def subtitle_export(file: str = "", fmt: str = "srt"):
+def subtitle_export(
+    file: str = "",
+    fmt: str = "srt",
+    start: float | None = None,
+    end: float | None = None,
+    rate: float | None = None,
+):
     """导出 SRT / WebVTT 文本。浏览器直接下载，所以文件名走 filename*。
 
     SRT 用 UTF-8 带 BOM：中文 Windows 上 PotPlayer / Premiere 之类别的文件不写
     BOM 就当 ANSI 读，字幕直接变乱码。VTT 按规范纯 UTF-8。
+
+    带 ``start`` / ``end`` / ``rate`` 时按剪辑后的时间轴导出；缺省时逐字节不变。
     """
     fmt = (fmt or "srt").lower()
     if fmt not in ("srt", "vtt"):
         raise HTTPException(400, f"字幕格式只支持 srt / vtt，收到 {fmt}")
     data = _subtitle_load_or_404(file)
-    cues = cues_from_sidecar(data)
+    cues, _segments, mapped = _subtitle_view(data, start, end, rate)
     if not cues:
+        if mapped:
+            raise HTTPException(
+                404, "当前剪辑区间内没有字幕条目：裁剪把这段全切掉了，或区间落在静音上"
+            )
         raise HTTPException(404, "这份音频的字幕条目是空的（文本被全部过滤）")
     if fmt == "srt":
         body = format_srt(cues).encode("utf-8-sig")
@@ -4141,7 +4514,7 @@ if __name__ == "__main__":
     # 孤儿清理已在 import 期执行（见 _clean_stale_outputs 之后的调用）
     logger.info("IndexTTS2 server starting... port %d", cmd_args.port)
     # 后台加载 numpy + audiotsm：变速引擎的 import 成本提前付掉，顺便让「包内
-    # 缺少 audiotsm」在启动日志里就报出来，而不是等用户拖滑块时卡在「变速计算中…」。
+    # 缺少 audiotsm」在启动日志里就报出来，而不是等用户拖滑块时卡在「处理中…」。
     # 失败不影响服务。
     threading.Thread(target=_warmup_tempo, daemon=True, name="tempo-warmup").start()
     uvicorn.run(app, host=cmd_args.host, port=cmd_args.port, log_level="warning")

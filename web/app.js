@@ -279,6 +279,7 @@ function saveDraft() {
     maxMel: $("maxMel").value,
     segTokens: $("segTokens").value,
     gapMs: $("gapMs").value,
+    sentencePerSegment: $("sentencePerSegment").checked,
     emoVector: vec,
     savedAt: Date.now(),
   };
@@ -293,6 +294,7 @@ function saveDraft() {
 function syncDraftUi() {
   $("charCount").textContent = `${textUnits($("text").value.trim())} 字`;
   syncParams();
+  syncSentenceNote();
   emoVisible();
   updateGenSummary();
   scheduleSegments();
@@ -317,6 +319,8 @@ function applyDraft(draft) {
     if (draft.maxMel != null) $("maxMel").value = draft.maxMel;
     if (draft.segTokens != null) $("segTokens").value = draft.segTokens;
     if (draft.gapMs != null) $("gapMs").value = Math.max(GAP_MS_MIN, Number(draft.gapMs) || GAP_MS_MIN);
+    // 老草稿没有这个字段：保持 HTML 的未勾选状态，也就是产品默认「关闭」。
+    if (draft.sentencePerSegment != null) $("sentencePerSegment").checked = !!draft.sentencePerSegment;
     if (Array.isArray(draft.emoVector)) setVecInputs(draft.emoVector);
   }
   syncDraftUi();
@@ -1230,7 +1234,15 @@ const LOCKED_IDS = ["doSample", ...PARAMS.filter((p) => p.lock).map((p) => p.id)
 // gapMs 下限 200 与服务端 INTERVAL_SILENCE_MIN 同口径：infer_v2 会把每段头/尾多余
 // 空白各裁到 100ms，头尾已占 200ms，再短的接缝物理上做不到。
 const GAP_MS_MIN = 200;
-const DEFAULTS = { emoWeight: 0.65, temperature: 0.8, topP: 0.8, topK: 30, numBeams: 3, maxMel: 1500, segTokens: 120, repPen: 10, lenPen: 0, gapMs: 300, doSample: true };
+// 产品默认「关闭」= 按 Token 上限合并句子，长文本音色一致性更好。
+const DEFAULTS = { emoWeight: 0.65, temperature: 0.8, topP: 0.8, topK: 30, numBeams: 3, maxMel: 1500, segTokens: 120, repPen: 10, lenPen: 0, gapMs: 300, doSample: true, sentencePerSegment: false };
+
+/* 「每句一段」和 segTokens 一样属于「怎么切句」，不进参数锁定白名单。
+   草稿回填 / 恢复默认 / 应用预设都会直接改 checked 而不触发 change，
+   所以提示条显隐统一走这里，避免「开关是开的却没提醒」。 */
+function syncSentenceNote() {
+  $("sentencePerSegmentNote").hidden = !$("sentencePerSegment").checked;
+}
 
 // 前 5 项参数是 range + 配套的 <id>Num 数字框；repPen / lenPen / gapMs 天生就是
 // number 输入，本身即数字框，此时 numEl 直接返回它自己。
@@ -1508,11 +1520,17 @@ $("resetParams").addEventListener("click", () => {
     else setParam(k, v);
   }
   syncParams();
+  syncSentenceNote();
   scheduleSegments();
   updateGenSummary();
   scheduleDraftSave();
 });
 $("segTokens").addEventListener("input", scheduleSegments);
+$("sentencePerSegment").addEventListener("change", () => {
+  syncSentenceNote();
+  // 开关直接改变段数，分句预览与耗时估算要立刻重算，别留着上一档的数字。
+  scheduleSegments();
+});
 
 /* ---------------- segments preview (collapsible, capped scroll) ---------------- */
 const segList = $("segList");
@@ -1532,6 +1550,8 @@ async function updateSegments() {
   const fd = new FormData();
   fd.append("text", text);
   fd.append("max_text_tokens_per_segment", $("segTokens").value);
+  // 预览必须与 /tts 用同一套切段口径，否则界面显示的段数与实际生成不符。
+  fd.append("sentence_boundary_split", $("sentencePerSegment").checked);
   glAppendScenario(fd);
   try {
     const r = await fetch(`${API}/segments`, { method: "POST", body: fd });
@@ -1573,7 +1593,7 @@ async function updateSegments() {
     // 粗略值只为给长文本用户一个心理预期，不是精确基准）。
     // 注意不含【首次模型加载】（实测冷启动约 30~60 秒），也不含排队等待。
     const estSec = Math.round(segs.length * 4 + totalTok * 0.06);
-    segEst = { text, segTokens: $("segTokens").value, estSec };
+    segEst = { text, segTokens: $("segTokens").value, perSentence: $("sentencePerSegment").checked, estSec };
     // 只说一次「约」：原来是「预估 约 8 秒」，两个词表达同一件事
     const est = estSec >= 60 ? `${Math.round(estSec / 60)} 分钟` : `${estSec} 秒`;
     $("estDurEcho").textContent =
@@ -1839,7 +1859,7 @@ function updateGenSummary() {
   $(id).addEventListener("input", updateGenSummary);
   $(id).addEventListener("change", updateGenSummary);
 });
-["emoText", "emoRandom", "doSample", "topP", "topK", "temperature", "lenPen", "numBeams", "repPen", "maxMel", "segTokens", "emoWeight", "gapMs"].forEach((id) => {
+["emoText", "emoRandom", "doSample", "topP", "topK", "temperature", "lenPen", "numBeams", "repPen", "maxMel", "segTokens", "emoWeight", "gapMs", "sentencePerSegment"].forEach((id) => {
   $(id).addEventListener("input", scheduleDraftSave);
   $(id).addEventListener("change", scheduleDraftSave);
 });
@@ -1966,6 +1986,9 @@ function clearPrecheckError(msg) {
 }
 
 function showActionError(msg) {
+  // 界面上只有一行提示，控制台里必须留一条：用户反馈「处理失败」时，
+  // 没有这条就只能靠猜是哪一步。调用方传的都是本地文案，不含音频内容。
+  console.error("[action]", msg);
   const hint = $("loadHint");
   hint.textContent = msg;
   hint.classList.add("error");
@@ -2272,7 +2295,10 @@ function setCandN(n) {
    估算优先复用分句预览的真实 token 数；预览还没回来时用同一套经验公式兜底。 */
 const LONG_TEXT_CAND_SEC = 600;
 function estimateGenSeconds(text, segTok) {
-  if (segEst && segEst.text === text && segEst.segTokens === String(segTok)) return segEst.estSec;
+  // 开关改变真实段数，缓存必须把它算进键里，否则长文候选提示会用旧档的耗时。
+  const perSentence = $("sentencePerSegment").checked;
+  if (segEst && segEst.text === text && segEst.segTokens === String(segTok)
+      && segEst.perSentence === perSentence) return segEst.estSec;
   const chars = textUnits(text);
   const toks = Math.ceil(chars * 1.9);
   const segs = Math.max(1, Math.ceil(toks / Math.max(1, Number(segTok) || 120)));
@@ -2854,6 +2880,8 @@ genBtn.addEventListener("click", async () => {
   if (mode === "1" && ea) fd.append("emo_audio", ea);
   if (mode === "2") vecInputs().forEach((s) => fd.append("vec" + (parseInt(s.dataset.i) + 1), s.value));
   fd.append("max_text_tokens_per_segment", $("segTokens").value);
+  // 每句一段（默认关闭）：关掉时服务端按 Token 上限合并相邻句子。
+  fd.append("sentence_boundary_split", $("sentencePerSegment").checked);
   fd.append("do_sample", $("doSample").checked);
   fd.append("top_p", $("topP").value);
   fd.append("top_k", $("topK").value);
@@ -3344,6 +3372,8 @@ function updateDlName() {
   // 由 edit.js 的 paintResult() 随结果区一起显隐（默认不显示，有编辑结果才出现）
   $("dlBtn").title = `下载剪辑后的音频（${outName}）`;
   $("dlSrcBtn").title = `下载未经剪辑的生成音频（${srcName}）`;
+  // 每次剪辑状态变化都经过这里：字幕的模式、文件名、提醒条跟着一起同步
+  if (typeof syncSubEdMode === "function") syncSubEdMode();
 }
 
 // edit.js 在状态变化后回调：把源波形的选区高亮与选区文案拉回同步
@@ -3383,6 +3413,8 @@ async function doDownloadSrc() {
 }
 
 async function doDownloadEdit() {
+  // 剪辑状态是即时生效的，结果音频要等服务端算完；不等会把上一档倍率发出去
+  if (typeof ED.whenSettled === "function") await ED.whenSettled();
   const buf = ED.getRendered();
   if (!buf || !ED.hasOps()) return;
   // 下载与试听同源（都是 ED.rendered），不存在两套实现算出不同结果的可能
@@ -3418,13 +3450,28 @@ $("fmtSeg").addEventListener("keydown", (e) => {
 });
 syncFmtSeg();
 
-/* ---------------- 字幕（段级） ----------------
-   数据来自服务端在生成收尾时存下的段边界缓存（data/subtitles/<同名>.json）。
-   时间是每段波形 + 段间静音的物理累加，不是按字数估的；粒度是「一段一条」，段内不切句。
-   整行只在确认有缓存时才出现——不留一个点了才报 404 的按钮。 */
-let subFormat = "srt";
-let subCues = [];          // 当前音频的字幕条目
-let subTick = null;        // player 上的 timeupdate：换音频必须摘掉，否则高亮跳到别处
+/* ---------------- 字幕（段级 / 句级 · 剪辑后重映射） ----------------
+   数据来自服务端在生成收尾时存下的段边界缓存（data/subtitles/<同名>.json），
+   时间是物理累加，不是按字数估的。整行只在确认有缓存时才出现。
+
+   剪辑后（裁剪 / 变速）字幕不再与源音频同轴：这里把 start/end/rate 带给
+   后端重算一份映射后的 cue，再按「当前是哪份音频」切换播放器。判定拆成两个
+   函数：subMode() 管 UI 五态，subEdParams() 管时间轴参数（null = 源轴）。
+
+   下面用 var 而不是 let：updateDlName() 在 ED.setSource() 里就会被调用，
+   可能早于本块执行；let 的 TDZ 会让那次调用直接抛错，var 只是 undefined。 */
+var subFormat = "srt";
+var subCues = [];          // 当前模式下的字幕条目
+var subCuesKey = "";       // 上面这批 cue 对应的 query：模式变了必须作废
+var subCuesErr = "";       // 非空 = 这个 key 取数失败了：列表给「重试」，别一直转圈
+var subReady = false;      // refreshSubRow 探测完之前不写提醒，避免半初始化
+var subActiveEl = null;    // 最后播放的那个 <audio>：高亮按它的时间读
+var subStopAt = null;      // 纯裁剪点条起播：播到该句末就停
+var subStopFrom = null;    // 该句起点：判断用户是否已把进度拖离这条字幕
+var subStopTimer = 0;      // 50ms 轮询；timeupdate 只有 4Hz，句末会多播 250ms
+var subReloadTimer = 0;    // 剪辑参数变化后的重取防抖
+var subTick = null;        // timeupdate 回调（两个播放器共用）
+var subTickEls = [];       // 当前绑了 timeupdate 的元素，换模式必须摘干净
 const subHas = new Map();  // 文件名 -> 有没有缓存：历史列表来回点时不重复请求
 
 const SUB_TEXT_SOURCE = {
@@ -3433,14 +3480,110 @@ const SUB_TEXT_SOURCE = {
   readable: "模型词元还原",
 };
 
+// 面板底部那句提示：随模式变，说明「点一条会从哪里起播」。
+const SUB_HINT = {
+  none: "点一条字幕可从该句开始播放 · 时间对应未剪辑的源音频；有剪辑时会自动切换",
+  gain: "点一条字幕可从该句开始播放 · 音量不改变时间轴，字幕与源音频一致",
+  trim: "点一条会从源音频对应位置起播，播到该句结束 · 时间已按裁剪区间映射",
+  trim_gain: "点一条从编辑结果起播 · 时间已按裁剪区间映射",
+  tempo: "点一条从编辑结果起播 · 时间已按裁剪与变速倍率映射",
+};
+
 function subFile() {
   return curServerFile || (curUrl || "").split("/").pop() || "";
+}
+
+/* 五态：none / gain / trim / trim_gain / tempo。
+   gain 不改时间轴，但会让「编辑结果」区出现，所以 trim+gain 与 trim 必须分开：
+   前者的下载按钮叫「下载编辑结果」、文件名带 _edit，归进 trim 会把文案指错。 */
+function subMode() {
+  if (typeof ED === "undefined" || !ED.src) return "none";
+  const st = ED.getState();
+  const trim = !!st.trim, tempo = !!st.tempo, gain = !!st.gain;
+  if (tempo) return "tempo";
+  if (trim && gain) return "trim_gain";
+  if (trim) return "trim";
+  if (gain) return "gain";
+  return "none";
+}
+
+/* 时间轴参数：null = 源轴，不需要重映射。gain-only 也返回 null。
+   rate 优先用实测：span / 成品时长，能吸收 atempo / WSOLA 的帧边界误差；
+   与用户档位差超过 2% 说明数据异常，退回档位。 */
+function subEdParams() {
+  if (typeof ED === "undefined" || !ED.src) return null;
+  const st = ED.getState();
+  if (!st.trim && !st.tempo) return null;
+  const D = ED.src.duration;
+  const round3 = (x) => Math.round(x * 1000) / 1000;
+  const start = st.trim ? round3(st.trim[0] * D) : null;
+  const end = st.trim ? round3(st.trim[1] * D) : null;
+  const span = (end == null ? D : end) - (start == null ? 0 : start);
+  let rate = 1;
+  if (st.tempo) {
+    /* 实测只在「这份结果确实属于当前 trim/tempo」时才算数：渲染有 1~3s 在飞，
+       这段时间 ED.rendered 还是上一档。两档倍率接近（差 < 2%）时旧时长会被
+       当成有效实测，字幕就按上一档的倍率映射，整段偏 1% 以上，而且点条
+       守卫（subIsStale）也认不出参数变过。gain 不参与比较：它不改时长。 */
+    const rd = typeof ED.getRendered === "function" ? ED.getRendered() : null;
+    const rs = typeof ED.getRenderedSnap === "function" ? ED.getRenderedSnap() : null;
+    const fresh = !!rs && rs.tempo === st.tempo && String(rs.trim) === String(st.trim);
+    const measured = fresh && rd && rd.duration > 0 && span > 0 ? span / rd.duration : 0;
+    rate = (measured > 0 && Math.abs(measured - st.tempo) <= 0.02 * st.tempo)
+      ? measured : st.tempo;
+    // 2× / 0.5× 边界实测可能得到 2.0001 / 0.4999，不夹紧会被后端 400 拒掉
+    rate = Math.min(2, Math.max(0.5, rate));
+  }
+  return { start, end, rate: Math.round(rate * 10000) / 10000 };
+}
+
+// 查询串同时是字幕缓存的 key：file 相同但剪辑参数变了，必须重新取。
+function subQuery() {
+  const file = subFile();
+  const p = subEdParams();
+  if (!p) return `file=${encodeURIComponent(file)}`;
+  const q = [`file=${encodeURIComponent(file)}`];
+  if (p.start != null) q.push(`start=${p.start.toFixed(3)}`, `end=${p.end.toFixed(3)}`);
+  if (p.rate !== 1) q.push(`rate=${p.rate.toFixed(4)}`);
+  return q.join("&");
+}
+
+/* 手上这批 cue 是不是属于当前时间轴。key 为空（还没取过）也算 stale。
+   为什么必须单独判一次：变速的渲染有 1~3s 在飞，ED.state 在松手那一刻就变了，
+   而 syncSubEdMode() 要等渲染完成（paintResult → notifyDlName）才跑，中间这段时间
+   subCues 还是旧轴、subQuery() 已经是新轴 —— 这时点条会拿新倍率去映射旧时间，
+   落点偏出这条字幕，甚至落到裁剪区间外。 */
+function subIsStale() {
+  return subCuesKey !== subQuery();
+}
+
+/* 字幕轴 <-> 播放器轴。outAudio 播的就是映射后的音频，恒等；
+   源播放器要逆映射：t' = t * rate + start。 */
+function subTimeMap(el) {
+  const p = subEdParams();
+  if (!p || el !== player) return { to: (t) => t, from: (t) => t };
+  const off = p.start || 0, rate = p.rate || 1;
+  return {
+    to: (t) => t * rate + off,
+    from: (t) => (t - off) / rate,
+  };
+}
+
+// 点条的目标播放器：有结果区就用结果播放器，纯裁剪只能回源播放器（结果区是隐藏的）。
+function subTargetEl() {
+  const m = subMode();
+  return (m === "tempo" || m === "trim_gain" || m === "gain") ? $("outAudio") : player;
+}
+
+// 字幕文件名与音频配套：无操作时 dlName 就是源名，剪辑后自带 _trim / _edit。
+function subOutName() {
+  return swapExt($("dlName").textContent || srcFileName(), "." + subFormat);
 }
 
 // 右侧显示「导出后叫什么」，与源音频行同一套布局。名字跟着格式开关走，
 // 免得切到 VTT 后显示的还是 .srt。
 function syncSubName() {
-  $("subName").textContent = swapExt($("dlSrcName").textContent || srcFileName(), "." + subFormat);
+  $("subName").textContent = subOutName();
 }
 
 function setSubPanel(open) {
@@ -3488,18 +3631,48 @@ function subAlignHint(d) {
   };
 }
 
-// 与 selStopTick 同一套收尾：监听器挂在 <audio> 上，换音频/清空时必须显式移除
+// 与 selStopTick 同一套收尾：监听器挂在 <audio> 上，换音频/清空时必须显式移除。
+// 剪辑态会改绑到 outAudio，所以记元素列表，逐个摘。
 function subDetach() {
-  if (subTick) { player.removeEventListener("timeupdate", subTick); subTick = null; }
+  if (!subTick) return;
+  subTickEls.forEach((el) => el.removeEventListener("timeupdate", subTick));
+  subTick = null;
+  subTickEls = [];
+}
+
+function subAttach() {
+  if (subTick) return;
+  // 把派发者带进回调：高亮要按「刚刚在播的那个播放器」读时间
+  subTick = (e) => subMarkActive(e.currentTarget);
+  subTickEls = [player, $("outAudio")];
+  subTickEls.forEach((el) => el.addEventListener("timeupdate", subTick));
+}
+
+function subStopStop() {
+  subStopAt = null;
+  subStopFrom = null;
+  if (subStopTimer) { clearInterval(subStopTimer); subStopTimer = 0; }
 }
 
 function subReset() {
   subCues = [];
+  subCuesKey = "";
+  subCuesErr = "";
+  subReady = false;
+  subActiveEl = null;
+  subStopStop();
+  clearTimeout(subReloadTimer);
+  subReloadTimer = 0;
+  subDetach();
   $("subRow").hidden = true;
+  $("subEdNote").hidden = true;
   subShowNote("");
   setSubPanel(false);
   $("subList").textContent = "";
-  subDetach();
+  // 条数/文本来源是上一份音频的结论：不清掉会挂在新音频的同一行上
+  $("subGrain").textContent = "";
+  $("subGrain").title = "";
+  $("subPanelHint").textContent = SUB_HINT.none;
 }
 
 /** 查这份音频有没有字幕缓存。known 传 done 事件的权威值，可以省掉这一次请求。 */
@@ -3519,18 +3692,28 @@ async function refreshSubRow(known) {
       has = false;
     }
   }
+  // 快速切候选时旧探测可能后返回：文件已经换了就丢弃，别把上一份的结论写上去
+  if (subFile() !== file) return;
   subHas.set(file, has);
   $("subRow").hidden = !has;
+  subReady = true;
   if (has) syncSubName();
+  syncSubEdMode();
 }
 
 async function loadSubCues() {
   const file = subFile();
   if (!file) return false;
+  const q = subQuery();
+  // 拖动变速时请求会连着发：回来发现参数或文件已经变了，直接丢掉
+  const stale = () => subQuery() !== q || subFile() !== file;
   try {
-    const r = await apiFetch(`/subtitle?file=${encodeURIComponent(file)}`);
+    const r = await apiFetch(`/subtitle?${q}`);
     const d = await r.json();
+    if (stale()) return false;
     subCues = d.cues || [];
+    subCuesKey = q;
+    subCuesErr = "";
     const subGrain = d.granularity === "sentence"
       ? "句级（每句一条）" : "段级（每段一条）";
     const hint = subAlignHint(d);
@@ -3542,9 +3725,64 @@ async function loadSubCues() {
     renderSubList();
     return true;
   } catch (e) {
-    subShowNote(`字幕读取失败：${e.message || e}`);
+    if (stale()) return false;
+    /* 失败也要落到一个「有终点」的状态。原来只写一条提示就 return：
+       subCuesKey 还是空 → 列表永远显示「正在按当前剪辑重新计算…」；
+       而 syncSubEdMode() 的重取条件带着 !subCues.length，于是每一次剪辑状态
+       变化都会再发一条注定失败的请求。这里把 key 记上、把失败写进列表，
+       让它是「结论 + 重试入口」，而不是「还在算」。 */
+    subCues = [];
+    subCuesKey = q;
+    subCuesErr = e.message || String(e);
+    renderSubList();
+    subShowNote(`字幕读取失败：${subCuesErr}`);
     return false;
   }
+}
+
+/* 点一条字幕：从该句起播。cue 的时间在「成品轴」上，源播放器要逆映射。 */
+function jumpToCue(cue) {
+  // cue 还属于旧时间轴（渲染在飞的 1~3s、或刚改完参数还没重取）：
+  // 这时 subQuery() 已是新倍率，拿着它映射旧时间会落偏，先挡住。
+  if (subIsStale()) {
+    subShowNote("字幕正在按新的剪辑重新计算，稍后再点");
+    return;
+  }
+  let el = subTargetEl();
+  // 编辑结果还没渲染出来（第一次变速、或上次变速失败回滚）时 #outAudio 没有
+  // src：这时给 currentTime 赋值会抛 InvalidStateError，后面的 play() 根本
+  // 执行不到，表现是「点了一下毫无反应」。退回另一个播放器：字幕轴是映射后
+  // 的轴，源播放器走逆映射，位置依然对得上，只是听到的是未变速的源音频。
+  if (!el.src) {
+    const alt = el === player ? $("outAudio") : player;
+    if (alt.src) el = alt;
+  }
+  if (!el.src) { showActionError("编辑结果还没准备好，稍后再试"); return; }
+  const map = subTimeMap(el);
+  (el === player ? $("outAudio") : player).pause();
+  el.currentTime = Math.max(0, map.to(cue.start));
+  // 纯裁剪时源播放器播的是全长：播到本句末就停，别把裁剪区间外的内容带出来
+  subStopStop();
+  if (el === player && subEdParams()) {
+    subStopAt = cue.end;
+    subStopFrom = cue.start;
+    subStopTimer = setInterval(() => {
+      if (subStopAt == null) { subStopStop(); return; }
+      const t = map.from(el.currentTime);
+      // 用户把进度拖离这条字幕（点波形 / 拖进度条）：句末暂停点已经失效，
+      // 再按它暂停会在他要听的位置突然断掉。这里**不能**改去监听 seeking —
+      // 上面那句 el.currentTime = ... 本身就是一次 seek，同样会派发 seeking，
+      // 回调里清空会让「播到句末暂停」永远不生效。所以改成每 tick 校验位置：
+      // 落在窗口外就静默取消；窗口上界留 0.5s 余量，避免 tick 被节流后误判。
+      if (t < subStopFrom - 0.05 || t > subStopAt + 0.5) { subStopStop(); return; }
+      if (t >= subStopAt - 0.01) {
+        el.pause();
+        subStopStop();
+      }
+    }, 50);
+  }
+  const p = el.play();
+  if (p && p.catch) p.catch(() => { /* 自动播放被拦：时间点已经落好 */ });
 }
 
 function renderSubList() {
@@ -3552,8 +3790,21 @@ function renderSubList() {
   box.textContent = "";
   if (!subCues.length) {
     const li = document.createElement("li");
-    li.className = "sub-item";
-    li.textContent = "这份音频没有可显示的字幕条目";
+    if (subCuesErr && !subIsStale()) {
+      // 取数失败是「结论」不是「还在算」：给一句能读的话加一个重试入口
+      li.className = "sub-item sub-item-act";
+      li.textContent = "字幕读取失败 · 点这里重试";
+      li.title = subCuesErr;
+      li.addEventListener("click", () => {
+        if (!$("subPanel").hidden) loadSubCues();
+      });
+    } else {
+      // 占位文案不能带手型光标：它点不动
+      li.className = "sub-item sub-item-note";
+      li.textContent = subIsStale()
+        ? "正在按当前剪辑重新计算…"
+        : "这份音频没有可显示的字幕条目";
+    }
     box.appendChild(li);
     return;
   }
@@ -3567,20 +3818,35 @@ function renderSubList() {
     x.className = "sub-text";
     x.textContent = cue.text;          // textContent：字幕正文永不按 HTML 解析
     li.append(t, x);
-    li.addEventListener("click", () => {
-      player.currentTime = cue.start;
-      const p = player.play();
-      if (p && p.catch) p.catch(() => { /* 自动播放被拦：时间点已经落好 */ });
-    });
+    li.addEventListener("click", () => jumpToCue(cue));
     box.appendChild(li);
   });
 }
 
+/* 高亮该按哪个播放器读时间。
+   首选 timeupdate 的派发者 —— 它必然就是正在播的那个；面板刚打开时它还没响过，
+   再按「有 src 且未暂停」→「当前模式的播放器」→「最后播过的」逐级回落。
+   不能只看 subActiveEl：paintOutPlayer 换 src 之后它的 src 依然非空，
+   但播放位置已经归零/换了一份音频，高亮会卡在第一条。 */
+function pickSubEl(fromEl) {
+  if (fromEl && fromEl.src) return fromEl;
+  const live = [player, $("outAudio")].find((x) => x.src && !x.paused);
+  if (live) return live;
+  const target = subTargetEl();
+  if (target.src) return target;
+  return (subActiveEl && subActiveEl.src) ? subActiveEl : target;
+}
+
 /* 播放到哪条高亮哪条。段与段之间有静音，落在间隙里时保持上一条——
    一句说完就闪掉高亮看起来像坏了。 */
-function subMarkActive() {
+function subMarkActive(fromEl) {
   if (!subCues.length) return;
-  const t = player.currentTime;
+  // cue 属于旧时间轴时任何高亮都是错的：等重取完再来（列表已经在显示「正在重新计算」）
+  if (subIsStale()) return;
+  const el = pickSubEl(fromEl);
+  // 两个播放器都没有 src（撤销到无操作、编辑结果回滚）：别对着空播放器读 0 时间
+  if (!el.src) return;
+  const t = subTimeMap(el).from(el.currentTime);
   let idx = -1;
   for (let i = 0; i < subCues.length; i++) {
     if (subCues[i].start > t + 0.05) break;
@@ -3600,27 +3866,75 @@ function subMarkActive() {
 $("subToggle").addEventListener("click", async () => {
   const open = $("subPanel").hidden;      // hidden 是唯一状态源，不另存一份布尔
   setSubPanel(open);
-  if (!open) return;
-  if (!subCues.length) {
-    const ok = await loadSubCues();
-    if (!ok) { setSubPanel(false); return; }
-  }
-  if (!subTick) {
-    subTick = subMarkActive;
-    player.addEventListener("timeupdate", subTick);
-    subMarkActive();
-  }
+  if (!open) { subDetach(); subStopStop(); return; }
+  // 面板关着时切了剪辑模式：subCues 还是旧时间轴，必须按 key 重取。
+  // 失败也保持打开——列表里写着原因和重试入口，比直接弹回去什么都不说更清楚。
+  if (subIsStale()) await loadSubCues();
+  subAttach();
+  subMarkActive();
 });
-$("subClose").addEventListener("click", () => { setSubPanel(false); subDetach(); });
+$("subClose").addEventListener("click", () => {
+  setSubPanel(false);
+  subDetach();
+  subStopStop();
+});
 
-$("subDlBtn").addEventListener("click", () => {
-  const file = subFile();
-  if (!file) { showActionError("当前没有可导出的音频"); return; }
-  const name = swapExt($("dlSrcName").textContent || file, "." + subFormat);
-  // 同源 GET + <a download>：任何浏览器都行，也不必把整份文本读进 JS 再造 blob
-  triggerDownload(`${API}/subtitle/export?file=${encodeURIComponent(file)}&fmt=${subFormat}`, name);
-  $("subDlLabel").textContent = "已导出";
-  setTimeout(() => { $("subDlLabel").textContent = "导出字幕"; }, 1600);
+/* 剪辑状态变化的唯一同步点：updateDlName() 末尾调（每次状态变化必经），
+   refreshSubRow() 探测完再调一次定初始模式。
+   注意 subReady：ED.setSource() 内部就会触发 updateDlName，那时字幕行还没探测，
+   写提醒会把上一份音频的结论挂到新音频上。 */
+function syncSubEdMode() {
+  if (!subReady) return;
+  const m = subMode();
+  const q = subQuery();
+  const p = subEdParams();
+
+  // 参数变了：这批 cue 属于旧时间轴，先清掉，别让 300ms 防抖窗口里点到它
+  if (subCuesKey && subCuesKey !== q) {
+    subCues = [];
+    subCuesKey = "";
+    subCuesErr = "";       // 新参数要重算，上一次的失败结论作废
+    subStopStop();
+    renderSubList();
+    subShowNote("");
+  }
+
+  $("subEdNote").hidden = !(p && !$("subRow").hidden);
+  $("subPanelHint").textContent = SUB_HINT[m] || SUB_HINT.none;
+  if (!$("subRow").hidden) syncSubName();
+
+  // 撤销到无操作后 outAudio 的 src 会被摘掉，活动播放器跟着回退
+  if (subActiveEl && !subActiveEl.src) subActiveEl = null;
+
+  // 只在「确实没有对应当前参数的结论」时重取。不能按 !subCues.length 判：
+  // 「这份音频没有字幕条目」本身就是一个结论，那样每改一次剪辑参数都会重发请求；
+  // 取数失败也一样（key 已记、subIsStale() 为假），等参数真的变了才会重试。
+  if (!$("subPanel").hidden && subIsStale()) {
+    clearTimeout(subReloadTimer);
+    subReloadTimer = setTimeout(() => {
+      subReloadTimer = 0;
+      if (!$("subPanel").hidden) loadSubCues();
+    }, 300);
+  }
+}
+
+$("subDlBtn").addEventListener("click", async () => {
+  if (!subFile()) { showActionError("当前没有可导出的音频"); return; }
+  // 剪辑状态是即时生效的，成品要等服务端算完；不等会拿上一档倍率去映射
+  if (subEdParams() && typeof ED.whenSettled === "function") await ED.whenSettled();
+  const q = subQuery();                    // 渲染结束后重算，rate 用最终时长
+  const name = subOutName();
+  try {
+    const r = await apiFetch(`/subtitle/export?${q}&fmt=${subFormat}`);
+    // 不能用 r.text()：按 UTF-8 解码会把 SRT 的 BOM 剥掉，中文 Windows 又乱码
+    const bytes = await r.arrayBuffer();
+    const type = r.headers.get("content-type") || "application/octet-stream";
+    triggerDownload(URL.createObjectURL(new Blob([bytes], { type })), name);
+    $("subDlLabel").textContent = "已导出";
+    setTimeout(() => { $("subDlLabel").textContent = "导出字幕"; }, 1600);
+  } catch (e) {
+    showActionError(`字幕导出失败：${e.message || e}`);
+  }
 });
 
 $("subFmtSeg").addEventListener("click", (e) => {
@@ -3639,6 +3953,11 @@ $("subFmtSeg").addEventListener("keydown", (e) => {
   const next = subFormat === "srt" ? "vtt" : "srt";
   const btn = $("subFmtSeg").querySelector(`button[data-sfmt="${next}"]`);
   if (btn) { btn.focus(); btn.click(); }
+});
+
+// 高亮跟「最后播放的那个」走：源播放器与结果播放器是两份音频，时间轴不同
+[player, $("outAudio")].forEach((el) => {
+  el.addEventListener("play", () => { subActiveEl = el; });
 });
 
 /* ---------------- 保存到指定目录（服务端落盘，任何浏览器都能用） ----------------
@@ -3802,6 +4121,8 @@ async function uploadBlob(blob, name) {
 /* 按当前格式编码并上传。MP3 失败时改成 WAV 再传一次（音频不能丢），
    文件名后缀随之换成 .wav——上传入口会校验后缀与内容一致。 */
 async function encodeForExport(which, mp3, onProgress) {
+  // 同上：保存到目录走另一条入口，也要等编辑结果落定
+  if (which !== "src" && typeof ED.whenSettled === "function") await ED.whenSettled();
   const buf = which === "src" ? await sourceBufferForExport() : ED.getRendered();
   if (!buf) throw new Error(which === "src" ? "当前没有可保存的音频" : "当前没有可保存的编辑结果");
   return mp3 ? encodeMp3(buf, 0, 1, onProgress) : encodeWav(buf);
@@ -3932,6 +4253,8 @@ function applyPresetToForm(j) {
   if (adv.repetition_penalty != null) $("repPen").value = adv.repetition_penalty;
   if (adv.max_mel_tokens != null) $("maxMel").value = adv.max_mel_tokens;
   if (adv.max_text_tokens_per_segment != null) $("segTokens").value = adv.max_text_tokens_per_segment;
+  // 旧预设没有该字段时保持当前勾选状态，不强行回默认（与 interval_silence 同口径）。
+  if (adv.sentence_boundary_split != null) $("sentencePerSegment").checked = !!adv.sentence_boundary_split;
   // 旧预设没有 interval_silence 字段，保持当前值不动（不强行回默认值）。
   // 有字段但小于当前下限（改动前允许 10~199）时抬到下限，否则界面会显示一个
   // 提交后被服务端悄悄改成 200 的值——那正是「设了没反应」的观感来源。
@@ -3941,6 +4264,7 @@ function applyPresetToForm(j) {
   if (j.emo_random != null) $("emoRandom").checked = !!j.emo_random;
   setVecInputs(j.emo_vector || [0, 0, 0, 0, 0, 0, 0, 0]);
   syncParams();
+  syncSentenceNote();
   emoVisible();
   scheduleSegments();
   enforceParamLock();
@@ -3963,6 +4287,7 @@ function collectPresetState(fd) {
   fd.append("max_mel_tokens", $("maxMel").value);
   fd.append("max_text_tokens_per_segment", $("segTokens").value);
   fd.append("interval_silence", $("gapMs").value);
+  fd.append("sentence_boundary_split", $("sentencePerSegment").checked);
   vecInputs().forEach((s) => fd.append("vec" + (parseInt(s.dataset.i) + 1), s.value));
 }
 
@@ -6240,6 +6565,7 @@ function renderInspector(name) {
     ["max_mel_tokens", adv.max_mel_tokens ?? "—"],
     ["分句 Token 上限", adv.max_text_tokens_per_segment ?? "—"],
     ["段间停顿 ms", adv.interval_silence ?? "—"],
+    ["每句一段", adv.sentence_boundary_split == null ? "—" : (adv.sentence_boundary_split ? "开" : "关")],
   ];
   $("inspParams").replaceChildren(...rows.map(([k, v]) => {
     const row = document.createElement("div");
@@ -6335,9 +6661,19 @@ $("btnPmCreate").addEventListener("click", async () => {
 
 /* ---------------- model manage page ---------------- */
 const mmState = $("mmState"), mmRuntime = $("mmRuntime"), mmErr = $("mmErr");
-const CFG_KEYS = ["fp16", "s2mel_fp16", "w2v_fp16", "qwen_fp16", "cudnn_benchmark"];
+/* CFG_KEYS/CFG_BOX 只放复选框；vram_tier 是下拉框，单独在 mmFormCfg /
+   writeCfgControls / 两个 POST body 里处理，避免被 !!.checked 读成布尔值。 */
+const CFG_KEYS = ["fp16", "s2mel_fp16", "w2v_fp16", "qwen_fp16", "cudnn_benchmark",
+  "cond_cache_enabled"];
 const CFG_BOX = {
-  fp16: "cfgFp16", s2mel_fp16: "cfgS2melFp16", w2v_fp16: "cfgW2vFp16", qwen_fp16: "cfgQwenFp16", cudnn_benchmark: "cfgCudnnBench",
+  fp16: "cfgFp16", s2mel_fp16: "cfgS2melFp16", w2v_fp16: "cfgW2vFp16", qwen_fp16: "cfgQwenFp16",
+  cudnn_benchmark: "cfgCudnnBench", cond_cache_enabled: "cfgCondCacheEnabled",
+};
+const TIER_LABELS = { auto: "自动检测", "4g": "4G 轻量档", balanced: "平衡优化档", turbo: "性能档" };
+const TIER_HINTS = {
+  "4g": "轻量档：新音色算完立即彻底释放 w2v，批行固定 1 行、单段上限 60 token。4G 卡主干本身仍可能不够。",
+  balanced: "平衡档：w2v 用完搬到内存留着，下次 miss 秒回；批行最多 3 行、单段上限 80 token。8G 卡默认命中这一档。",
+  turbo: "性能档：w2v 常驻显存，不额外夹取批行与切段上限。适合 12G 以上显卡。",
 };
 const mmCfgSliders = [
   { id: "cfgSteps", out: "cfgStepsOut", dec: 0 },
@@ -6483,6 +6819,7 @@ let mmServerCfg = null;      // 最近一次写进控件的服务端配置，作
 function mmFormCfg() {
   const cfg = {};
   for (const k of CFG_KEYS) { const el = $(CFG_BOX[k]); cfg[k] = !!(el && el.checked); }
+  cfg.vram_tier = ($("cfgVramTier") && $("cfgVramTier").value) || "auto";
   cfg.diffusion_steps = parseInt($("cfgSteps").value, 10);
   cfg.inference_cfg_rate = parseFloat($("cfgRate").value);
   cfg.gpt_batch_size = cfgBatchValue();
@@ -6502,6 +6839,8 @@ function mmCfgDirty() {
 /** 把服务端配置写进控件，并以此重置差异基准。 */
 function writeCfgControls(s) {
   for (const k of CFG_KEYS) { const el = $(CFG_BOX[k]); if (el) el.checked = !!s[k]; }
+  const tierSel = $("cfgVramTier");
+  if (tierSel) tierSel.value = s.vram_tier || "auto";
   $("cfgSteps").value = s.diffusion_steps ?? 25;
   $("cfgRate").value = s.inference_cfg_rate ?? 0.7;
   for (const s2 of mmCfgSliders) {
@@ -6548,12 +6887,28 @@ function renderModelPage(s) {
   if (!mmCfgDirty()) writeCfgControls(s);
   mmBatchState = s.gpt_batch || null;
   $("cfgBatchLive").textContent = batchLiveText();
+  // 显存档位状态：effective_tier / detected_vram_gb 由服务端在 LazyTTS 层
+  // 提供，unload() 之后仍可回显，不需要模型已加载。
+  const reqTier = s.vram_tier || "auto", effTier = s.effective_tier || "unknown";
+  const gb = Number(s.detected_vram_gb || 0);
+  const tag = $("mmTierTag");
+  if (tag) {
+    tag.textContent = `${TIER_LABELS[reqTier] || reqTier} → ${TIER_LABELS[effTier] || effTier}`
+      + (gb > 0 ? `（${gb.toFixed(2)} GB）` : "");
+  }
+  const hint = $("mmTierHint");
+  if (hint) {
+    hint.textContent = (TIER_HINTS[effTier] || TIER_HINTS.balanced)
+      + ` 缓存命中 ${Number(s.cond_cache_hits || 0)} 次。`;
+  }
   mmRuntime.textContent = [
     `FP16=${s.fp16}  S2MEL_FP16=${s.s2mel_fp16}`,
     `W2V_FP16=${s.w2v_fp16}  QWEN_FP16=${s.qwen_fp16}`,
     `CUDNN_BENCHMARK=${s.cudnn_benchmark}`,
     `DIFFUSION_STEPS=${s.diffusion_steps}  CFG_RATE=${s.inference_cfg_rate}`,
     `GPT_BATCH=${s.gpt_batch_size}`,
+    `VRAM_TIER=${reqTier}  EFFECTIVE_TIER=${effTier}  DETECTED_VRAM_GB=${gb.toFixed(2)}`,
+    `COND_CACHE_ENABLED=${s.cond_cache_enabled}  HITS=${s.cond_cache_hits || 0}  CFG_FP=${s.cond_cfg_fp || "-"}`,
   ].join("\n");
 }
 async function refreshModelPage(keepError = false) {
@@ -6635,6 +6990,7 @@ $("btnModelRestart").addEventListener("click", async () => {
   await withBusyBtn($("btnModelRestart"), "重启中…", async () => {
     const body = {};
     for (const k of CFG_KEYS) body[k] = $(CFG_BOX[k]).checked;
+    body.vram_tier = ($("cfgVramTier") && $("cfgVramTier").value) || "auto";
     body.diffusion_steps = parseInt($("cfgSteps").value, 10);
     body.inference_cfg_rate = parseFloat($("cfgRate").value);
     body.gpt_batch_size = cfgBatchValue();
@@ -6650,7 +7006,9 @@ $("btnModelRestart").addEventListener("click", async () => {
   });
 });
 /* 推荐配置：FP16 + S2MEL_FP16 开（几乎无损、显著提速），W2V_FP16 开（8G 卡省 ~1GB 显存），
-   QWEN_FP16 开，cuDNN 自动调优关（实测负优化：BigVGAN 3.35s → 97s）；步数 25、CFG 0.7 */
+   QWEN_FP16 开，cuDNN 自动调优关（实测负优化：BigVGAN 3.35s → 97s）；步数 25、CFG 0.7。
+   显存档位 / 条件缓存 / 分段批处理都不进推荐配置：它们是独立的显存策略，
+   要不要改由用户在各自分组里单独决定，点「推荐配置」不应把它们重置。 */
 const RECOMMEND_CFG = {
   s2mel_fp16: true, fp16: true, w2v_fp16: true, qwen_fp16: true, cudnn_benchmark: false,
   diffusion_steps: 25, inference_cfg_rate: 0.7,
@@ -6673,6 +7031,7 @@ $("btnPresetCfg").addEventListener("click", () => {
 $("btnCfgSave").addEventListener("click", () => {
   const body = {};
   for (const k of CFG_KEYS) body[k] = $(CFG_BOX[k]).checked;
+  body.vram_tier = ($("cfgVramTier") && $("cfgVramTier").value) || "auto";
   body.diffusion_steps = parseInt($("cfgSteps").value, 10);
   body.inference_cfg_rate = parseFloat($("cfgRate").value);
   body.gpt_batch_size = cfgBatchValue();

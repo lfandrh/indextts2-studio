@@ -1148,6 +1148,19 @@ input[type="range"]:disabled { cursor: not-allowed; }
   background: color-mix(in srgb, var(--accent) 6%, transparent);
   border-left: 2px solid var(--accent);
 }
+/* 「每句一段」的权衡提醒：与信息型 .lockhint 同一套骨架，换成 warn 色，
+   表示「这是一个取舍」而不是错误或状态。深浅主题都由 --warn 自动适配。 */
+.segswitchrow { margin: var(--s3) 0 0; }
+.switchnote {
+  margin: var(--s2) 0 0;
+  padding: var(--s1) var(--s2);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-11);
+  line-height: 1.55;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+  border-left: 2px solid var(--warn);
+}
 #advFold.params-locked input[type="range"] { filter: grayscale(1); opacity: .45; cursor: not-allowed; }
 #advFold.params-locked input.pnum,
 #advFold.params-locked .nrow input[type="number"] { opacity: .55; background: var(--surface); cursor: not-allowed; }
@@ -1900,6 +1913,11 @@ input[type="range"]:disabled { cursor: not-allowed; }
 }
 .sub-item:last-child { border-bottom: 0; }
 .sub-item:hover { background: var(--surface); }
+/* 占位文案（正在重算 / 没有条目）点不动：别给它手型光标和悬停高亮，
+   否则用户会以为点了该有反应。可点的「读取失败 · 重试」保留 pointer。 */
+.sub-item-note { cursor: default; }
+.sub-item-note:hover { background: none; }
+.sub-item-act { color: var(--warn); }
 .sub-item.cur { background: color-mix(in srgb, var(--primary) 4%, var(--surface)); }
 .sub-item.cur .sub-time { color: var(--primary); font-weight: 600; }
 .sub-time {

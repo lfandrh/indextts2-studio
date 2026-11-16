@@ -654,6 +654,12 @@ class TextTokenizer:
         1（默认）= 严格一句一段；N>1 = 一段最多装 N 句，段数减少但段内句号
         的停顿交回模型。切成段的数量直接决定 s2mel/bigvgan/prefill 跑几次，
         所以这是速度与「停顿可控粒度」之间的取舍。
+
+        切分分两遍：第一遍只按句末标点切整句；第二遍只在「整句超过
+        max_text_tokens_per_segment」时，才在句内找断口（逗号 > 短横线 >
+        按长度硬切）。逗号因此是超长句的兜底，不是一级切分点。早期实现把
+        逗号分支排在句末标点之前，段里一出现逗号就整段递归拆开，段边界
+        常落在逗号上、句子被拦腰截断（见 11-04 诊断文档）。
         """
         if max_text_tokens_per_segment < 1:
             raise ValueError(
@@ -662,9 +668,12 @@ class TextTokenizer:
         # 处理特殊情况
         if len(tokenized_str) == 0:
             return []
-        segments: List[List[str]] = []
-        current_segment = []
-        current_segment_tokens_len = 0
+        # 第一遍：只按 split_tokens 切「整句」。顶层调用时 split_tokens 是
+        # 句末标点表，产出完整句子；这里不看长度，也不碰逗号/短横线。
+        # 早期实现把逗号分支排在句末之前，段里一出现逗号就整段递归拆开，
+        # 段边界因此常落在逗号上、句子被拦腰截断（见 11-04 诊断文档）。
+        units: List[List[str]] = []
+        current_unit: List[str] = []
         # 下面要把紧跟切分符的 "'" 一并吞掉；for 循环里改 i 不生效（下一轮会重取），
         # 所以用跳过集合显式表达「这个下标已经处理过了」。
         skipped: set = set()
@@ -672,61 +681,79 @@ class TextTokenizer:
             if i in skipped:
                 continue
             token = tokenized_str[i]
-            current_segment.append(token)
-            current_segment_tokens_len += 1
-            if not  ("," in split_tokens or "▁," in split_tokens ) and ("," in current_segment or "▁," in current_segment): 
-                # 如果当前tokens中有,，则按,分割
-                sub_segments = TextTokenizer.split_segments_by_token(
-                    current_segment, [",", "▁,"], max_text_tokens_per_segment=max_text_tokens_per_segment, quick_streaming_tokens = quick_streaming_tokens
-                )
-            elif "-" not in split_tokens and "-" in current_segment:
-                # 没有,，则按-分割
-                sub_segments = TextTokenizer.split_segments_by_token(
-                    current_segment, ["-"], max_text_tokens_per_segment=max_text_tokens_per_segment, quick_streaming_tokens = quick_streaming_tokens
-                )
-            elif current_segment_tokens_len <= max_text_tokens_per_segment:
-                if token in split_tokens and current_segment_tokens_len > 2:
-                    # 版本号里的点：`v2.1.3`、`1.0.0` 的点前后都是数字，
-                    # 它是小数点不是句号。规范化会把纯数字转成中文读法
-                    # （3.14 -> 三点一四），但带字母前后缀的版本号会保留原点号，
-                    # 不挡住就会被切成「v2.」+「1.3」，听感上中间多一次停顿。
-                    if TextTokenizer._is_decimal_point(tokenized_str, i):
-                        continue
-                    # 标点连用（？！ / ！？）：只在最后一个后面切。
-                    # 否则「你确定？！」会切成「你确定？」+「！这可不是……」，
-                    # 感叹号孤立跑到下一段开头。
-                    if TextTokenizer._followed_by_punct(tokenized_str, i, split_tokens):
-                        continue
-                    if i < len(tokenized_str) - 1:
-                        if tokenized_str[i + 1] in ["'", "▁'"]:
-                            # 后续token是'，则不切分
-                            current_segment.append(tokenized_str[i + 1])
-                            skipped.add(i + 1)
-                    segments.append(current_segment)
-                    current_segment = []
-                    current_segment_tokens_len = 0
+            current_unit.append(token)
+            if token in split_tokens and len(current_unit) > 2:
+                # 版本号里的点：`v2.1.3`、`1.0.0` 的点前后都是数字，
+                # 它是小数点不是句号。规范化会把纯数字转成中文读法
+                # （3.14 -> 三点一四），但带字母前后缀的版本号会保留原点号，
+                # 不挡住就会被切成「v2.」+「1.3」，听感上中间多一次停顿。
+                if TextTokenizer._is_decimal_point(tokenized_str, i):
+                    continue
+                # 标点连用（？！ / ！？）：只在最后一个后面切。
+                # 否则「你确定？！」会切成「你确定？」+「！这可不是……」，
+                # 感叹号孤立跑到下一段开头。
+                if TextTokenizer._followed_by_punct(tokenized_str, i, split_tokens):
+                    continue
+                if i < len(tokenized_str) - 1:
+                    if tokenized_str[i + 1] in ["'", "▁'"]:
+                        # 后续token是'，则不切分
+                        current_unit.append(tokenized_str[i + 1])
+                        skipped.add(i + 1)
+                units.append(current_unit)
+                current_unit = []
+        if current_unit:
+            units.append(current_unit)
+
+        # 第二遍：整句装得下就整段保留；只有装不下时才借句内标点断开，
+        # 优先级 逗号 > 短横线 > 按长度硬切。断口只在本句内部找，不会
+        # 跨句，也不会把词拦腰砍断。这里不递归调用本函数，避免降级链成环。
+        segments: List[List[str]] = []
+        limit = max_text_tokens_per_segment
+        for unit in units:
+            if len(unit) <= limit:
+                segments.append(unit)
                 continue
-            # 如果当前tokens的长度超过最大限制
+            if "," in unit or "▁," in unit:
+                marks = (",", "▁,")
+            elif "-" in unit:
+                marks = ("-",)
             else:
-                # 按照长度分割
-                sub_segments = []
-                for j in range(0, len(current_segment), max_text_tokens_per_segment):
-                    if j + max_text_tokens_per_segment < len(current_segment):
-                        sub_segments.append(current_segment[j : j + max_text_tokens_per_segment])
-                    else:
-                        sub_segments.append(current_segment[j:])
+                marks = ()
+            if not marks:
+                segments.extend(
+                    unit[j:j + limit] for j in range(0, len(unit), limit)
+                )
+                # 只打摘要：无标点长文可能上千 token，把整段塞进 warning
+                # 会刷爆日志。改动前每段最多 limit+1 个 token，两阶段后
+                # 这里拿到的可能是整句，必须截断。
                 warnings.warn(
-                    f"The tokens length of segment exceeds limit: {max_text_tokens_per_segment}, "
-                    f"Tokens in segment: {current_segment}."
+                    f"The tokens length of segment exceeds limit: {limit}, "
+                    f"total {len(unit)} tokens, no in-sentence punctuation. "
+                    f"Head: {unit[:6]} ... Tail: {unit[-6:]}. "
                     "Maybe unexpected behavior",
                     RuntimeWarning,
                 )
-            segments.extend(sub_segments)
-            current_segment = []
-            current_segment_tokens_len = 0
-        if current_segment_tokens_len > 0:
-            assert current_segment_tokens_len <= max_text_tokens_per_segment
-            segments.append(current_segment)
+                continue
+            clauses: List[List[str]] = []
+            clause: List[str] = []
+            for t in unit:
+                clause.append(t)
+                if t in marks:
+                    clauses.append(clause)
+                    clause = []
+            if clause:
+                clauses.append(clause)
+            # 句内小句按上限贪心装箱，段边界因此都落在标点上。
+            packed: List[List[str]] = []
+            for c in clauses:
+                if len(c) > limit:
+                    packed.extend(c[j:j + limit] for j in range(0, len(c), limit))
+                    continue
+                if packed and len(packed[-1]) + len(c) <= limit:
+                    packed[-1] = packed[-1] + c
+                else:
+                    packed.append(c)
+            segments.extend(packed)
         # 如果相邻的句子加起来长度小于最大限制，且此前token总数超过quick_streaming_tokens，则合并
         #
         # 但句末标点切出来的段不参与合并：合并的本意只是避免产生过短的碎片段，
