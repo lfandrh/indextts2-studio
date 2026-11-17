@@ -6671,9 +6671,9 @@ const CFG_BOX = {
 };
 const TIER_LABELS = { auto: "自动检测", "4g": "4G 轻量档", balanced: "平衡优化档", turbo: "性能档" };
 const TIER_HINTS = {
-  "4g": "轻量档：新音色算完立即彻底释放 w2v，批行固定 1 行、单段上限 60 token。4G 卡主干本身仍可能不够。",
-  balanced: "平衡档：w2v 用完搬到内存留着，下次 miss 秒回；批行最多 3 行、单段上限 80 token。8G 卡默认命中这一档。",
-  turbo: "性能档：w2v 常驻显存，不额外夹取批行与切段上限。适合 12G 以上显卡。",
+  "4g": "轻量档：新音色算完立即彻底释放 w2v，批行固定 1 行。4G 卡主干本身仍可能不够。",
+  balanced: "平衡档：w2v 用完搬到内存留着，下次 miss 秒回；批行最多 3 行。8G 卡默认命中这一档。",
+  turbo: "性能档：w2v 常驻显存，不额外夹取批行。适合 12G 以上显卡。",
 };
 const mmCfgSliders = [
   { id: "cfgSteps", out: "cfgStepsOut", dec: 0 },

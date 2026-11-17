@@ -168,7 +168,6 @@ class IndexTTS2:
         self.w2v_offload_after_use = bool(self._tier["w2v_offload_after_use"])
         self.offload_deep = bool(self._tier["offload_deep"])
         self.tier_max_gpt_batch_rows = self._tier["max_gpt_batch_rows"]
-        self.tier_max_text_tokens_per_segment = self._tier["max_text_tokens_per_segment"]
         self.cond_cfg_fp = None
         if self.cond_cache_enabled:
             # 指纹只纳入真正决定这 5 个缓存张量数值的权重与开关：
@@ -1011,12 +1010,6 @@ class IndexTTS2:
                   f"emo_vector:{emo_vector}, use_emo_text:{use_emo_text}, "
                   f"emo_text:{emo_text}")
         start_time = time.perf_counter()
-
-        # 低显存档收紧单段 token 上限（只在档位显式给出上限时夹取）。
-        # 不另起一套按字符切段算法，复用主项目已有的 token 级切段体系。
-        if self.tier_max_text_tokens_per_segment is not None:
-            max_text_tokens_per_segment = min(int(max_text_tokens_per_segment),
-                                             int(self.tier_max_text_tokens_per_segment))
 
         if use_emo_text or emo_vector is not None:
             # we're using a text or emotion vector guidance; so we must remove

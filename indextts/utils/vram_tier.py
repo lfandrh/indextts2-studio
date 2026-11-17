@@ -3,7 +3,7 @@
 刻意不依赖 ``indextts.infer_v2`` 的重推理栈：阈值与策略表可以在无 GPU、
 没装 transformers / modelscope 的环境里被单测直接导入验证。
 
-**重要语义**：分档只决定「辅助模型用完退不退、批行上限、切段上限」。
+**重要语义**：分档只决定「辅助模型用完退不退、批行上限」。
 它**不改变任何模型的推理设备**（推理恒在 ``IndexTTS2.device``），也**不改变
 精度 / 扩散步数 / CFG / 批处理算法**。所谓「offload 到 CPU」只指 w2v-bert
 的**权重存放位置**，绝不指把 w2v 放到 CPU 上做前向——参考项目 2.5 的 4g
@@ -25,19 +25,16 @@ TIER_POLICY: Dict[str, Dict[str, object]] = {
         "w2v_offload_after_use": True,
         "offload_deep": True,          # 用完彻底释放，下次 miss 重新 from_pretrained
         "max_gpt_batch_rows": 1,
-        "max_text_tokens_per_segment": 60,
     },
     "balanced": {
         "w2v_offload_after_use": True,
         "offload_deep": False,         # 权重搬到 CPU 内存留着，下次 .to(device) 秒回
         "max_gpt_batch_rows": 3,
-        "max_text_tokens_per_segment": 80,
     },
     "turbo": {
         "w2v_offload_after_use": False,
         "offload_deep": False,
         "max_gpt_batch_rows": None,
-        "max_text_tokens_per_segment": None,
     },
 }
 

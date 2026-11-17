@@ -257,9 +257,6 @@ class LazyTTS:
         # 这样 unload()/rebuild() 销毁实例后 /model 仍能回显 effective_tier，
         # 且启动阶段完全不需要 import torch（保持 startup torch-free）。
         self._tier_snapshot = None
-        # (requested_tier, seg_token_cap) 缓存：未加载模型时预览要按档位夹取
-        # 单段 token 上限，auto 档需要探测显存；总显存不会变，按请求档位缓存。
-        self._tier_cap_cache = None
         # 规则库在启动时只读两个小 YAML，不加载 torch；管理接口因此能秒开。
         # store 抛异常（磁盘损坏等）不能让服务起不来：失败时按空库继续，
         # 具体原因会写进 warning 列表并在界面横幅提示。
@@ -342,30 +339,6 @@ class LazyTTS:
             self.cfg = cfg
             logger.info("Light components ready in %.2fs", time.perf_counter() - t0)
         return self.cfg
-
-    def tier_seg_token_cap(self):
-        """当前生效的单段 token 上限（None = 档位不额外夹取）。
-
-        必须与 IndexTTS2 实例上的 tier_max_text_tokens_per_segment 同口径：
-        已加载时直接读实例；未加载时按配置档位解析（auto 需探测总显存）。
-        调用方必须先 _ensure_light()——auto 档会 import torch，而启动阶段
-        刻意保持 torch-free。
-        """
-        inst = self._tts
-        if inst is not None:
-            return getattr(inst, "tier_max_text_tokens_per_segment", None)
-        from indextts.utils.vram_tier import TIER_POLICY, normalize_tier
-        requested = normalize_tier(self.init_kwargs.get("vram_tier", "auto"))
-        cached = self._tier_cap_cache
-        if cached is not None and cached[0] == requested:
-            return cached[1]
-        if requested == "auto":
-            from indextts.utils.vram_tier import resolve_vram_tier
-            cap = resolve_vram_tier("auto")["max_text_tokens_per_segment"]
-        else:
-            cap = TIER_POLICY[requested]["max_text_tokens_per_segment"]
-        self._tier_cap_cache = (requested, cap)
-        return cap
 
     @property
     def loaded(self):
@@ -712,19 +685,6 @@ def _clamp_seg_tokens(value: int) -> int:
             "耗时反而暴涨",
         )
     return n
-
-
-def _effective_seg_tokens(value: int, tts) -> int:
-    """用户值与当前显存档位上限的较小者。
-
-    预览、长文估算和实际合成必须同一个口径：档位上限只在推理实例里
-    夹取过一次，预览走 light 不建模型，不在这里补上就会出现「预览按
-    120 切、实际合成按 80 切」的段数不一致。
-    """
-    value = _clamp_seg_tokens(value)
-    cap_fn = getattr(tts, "tier_seg_token_cap", None)
-    cap = cap_fn() if cap_fn else None
-    return min(value, int(cap)) if cap else value
 
 
 # 生成参数（前端"高级参数"折叠里的 8 个数值）的合法区间，与 web/index.html
@@ -2150,18 +2110,15 @@ def do_tts(
         # （首次加载失败等）才退回经验公式。tokenizer 一旦建好就常驻，
         # 这里只在超长文本上多一次几十毫秒的分词。
         est_segs = None
-        seg_tokens = max_text_tokens_per_segment
         try:
             tts._ensure_light()
-            # 与 /segments 和实际合成同一个档位上限，否则提示段数会偏少。
-            seg_tokens = _effective_seg_tokens(max_text_tokens_per_segment, tts)
             _tokens = tts.tokenizer.tokenize(
                 text,
                 glossary=glossary_snapshot.glossary if glossary_snapshot else None,
                 cascade=glossary_snapshot.cascade if glossary_snapshot else None,
             )
             est_segs = len(tts.tokenizer.split_segments(
-                _tokens, max_text_tokens_per_segment=seg_tokens,
+                _tokens, max_text_tokens_per_segment=max_text_tokens_per_segment,
                 max_sentences_per_segment=max_sentences_per_segment,
                 sentence_boundary_split=sentence_boundary_split))
         except Exception as e:
@@ -2169,7 +2126,7 @@ def do_tts(
         if est_segs:
             est_min = _estimated_minutes(est_segs)
         else:
-            est_segs, est_min = _estimate_long_text(len(text), seg_tokens)
+            est_segs, est_min = _estimate_long_text(len(text), max_text_tokens_per_segment)
         text_warn = _format_long_text_warn(len(text), est_segs, est_min)
     spk_data = _prepare_ref_audio(_read_upload_capped(spk_audio, "音色参考音频"), "音色参考音频")
     spk_path = _prompt_file("spk", spk_data)
@@ -3938,8 +3895,6 @@ def segments_preview(
     # 整个请求只取一次快照：分段、规范化文本、数字读音共用同一份词典。
     snapshot = _glossary_snapshot(scenario_id)
     tts._ensure_light()
-    # 档位上限在 light 之后取：auto 档需要 torch 探测总显存。
-    max_text_tokens_per_segment = _effective_seg_tokens(max_text_tokens_per_segment, tts)
     tokens = tts.tokenizer.tokenize(
         text,
         glossary=snapshot.glossary if snapshot else None,
