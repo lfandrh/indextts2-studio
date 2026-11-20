@@ -350,6 +350,9 @@ function applyJobSnapshot(job) {
   $("pElapsed").textContent = `${draftElapsed(job).toFixed(1)}s`;
   startElapsed();
   updateCancelUi();
+  // 历史列表置顶行的「生成中」进度跟着走（行不存在说明当前没在渲染它，跳过）
+  const rm = document.getElementById("histRunningMeta");
+  if (rm) rm.textContent = histRunningMetaText(job);
 }
 
 let jobReconnectTimer = null;
@@ -2714,6 +2717,8 @@ async function runOneGeneration(fd, index, total) {
           curJobId = ev.job_id || "";
           curJobState = "running";
           updateCancelUi();
+          // 历史列表立刻置顶出现「生成中」行（内部取 /jobs/current）
+          refreshHistory();
         } else if (ev.type === "queue") {
           curJobState = "queued";
           updateCancelUi();
@@ -4240,6 +4245,63 @@ async function fetchPresetAudio(url, inputEl, applyFn, seqKey, fileName) {
     return "error";
   }
 }
+/* 把一次生成的完整配置（history 条目的 params 或「生成中」任务的 params）
+   还原回表单。只动表单里真实存在的字段；音色/情感音频文件不还原（历史里
+   没存文件本体，恢复成"看似一样、实际不同"反而更糟）。 */
+/* 从服务端 prompts/ 拉参考音频装回输入框（历史/任务配置还原用）。
+   文件被 LRU 清掉就提示手选——音频没还原不影响文本和参数已经恢复的事实。 */
+async function restorePromptAudio(name, inputId, setter, label) {
+  try {
+    const r = await fetch(`${API}/prompts/${encodeURIComponent(name)}`);
+    if (!r.ok) throw new Error("gone");
+    const blob = await r.blob();
+    const file = new File([blob], name, { type: "audio/wav" });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    $(inputId).files = dt.files;
+    setter(file);
+    showActionHint(`${label}音频已还原`);
+  } catch (e) {
+    showActionError(`${label}音频已被清理，请手动重新选择`);
+  }
+}
+
+function applyParamsToForm(p) {
+  if (!p || typeof p !== "object") return false;
+  if (p.text != null) {
+    $("text").value = p.text;
+    $("charCount").textContent = `${textUnits(p.text.trim())} 字`;
+  }
+  if (p.emo_mode != null) $("emoMode").value = String(p.emo_mode);
+  if (p.emo_weight != null) $("emoWeight").value = p.emo_weight;
+  if (p.emo_text != null) $("emoText").value = p.emo_text || "";
+  if (Array.isArray(p.emo_vector)) setVecInputs(p.emo_vector);
+  if (p.use_random != null) $("emoRandom").checked = !!p.use_random;
+  if (p.do_sample != null) $("doSample").checked = !!p.do_sample;
+  if (p.top_p != null) $("topP").value = p.top_p;
+  if (p.top_k != null) $("topK").value = p.top_k;
+  if (p.temperature != null) $("temperature").value = p.temperature;
+  if (p.length_penalty != null) $("lenPen").value = p.length_penalty;
+  if (p.num_beams != null) $("numBeams").value = p.num_beams;
+  if (p.repetition_penalty != null) $("repPen").value = p.repetition_penalty;
+  if (p.max_mel_tokens != null) $("maxMel").value = p.max_mel_tokens;
+  if (p.max_text_tokens_per_segment != null) $("segTokens").value = p.max_text_tokens_per_segment;
+  if (p.sentence_boundary_split != null) $("sentencePerSegment").checked = !!p.sentence_boundary_split;
+  if (p.interval_silence != null) $("gapMs").value = Math.max(GAP_MS_MIN, Number(p.interval_silence) || GAP_MS_MIN);
+  // 音色/情感参考音频：文件名在 params 里、文件在服务端 prompts/，还在就装回；
+  // 异步进行，不阻塞表单字段还原
+  if (p.spk_prompt) restorePromptAudio(p.spk_prompt, "spkFile", setSpkFile, "音色参考");
+  if (p.emo_prompt) restorePromptAudio(p.emo_prompt, "emoFile", setEmoFile, "情感参考");
+  curPresetName = "";
+  syncParams();
+  syncSentenceNote();
+  emoVisible();
+  scheduleSegments();
+  scheduleDraftSave();
+  updateGenSummary();
+  return true;
+}
+
 function applyPresetToForm(j) {
   $("emoMode").value = String(j.emo_control_method ?? 0);
   $("emoWeight").value = j.emo_weight ?? 0.65;
@@ -4466,6 +4528,11 @@ function renderLib() {
       row.querySelector(".hmeta").title = row.querySelector(".hmeta").textContent;
       row.title = "点击加载示例音频与参数";
       row.addEventListener("click", async () => {
+        // 示例会连文本带参数一起覆盖并立刻存草稿，误点一次原文就没了。
+        // 草稿非空且与示例不同时先确认；空草稿直接放行，不多一步打扰。
+        const curText = ($("text").value || "").trim();
+        if (curText && curText !== (ex.text || "").trim()
+            && !confirm(`加载示例会覆盖当前文本（${curText.length} 字）和参数。\n\n确定要继续吗？`)) return;
         try {
           const audio = await fetch(ex.prompt_audio);
           if (!audio.ok) throw new Error("示例音频不存在");
@@ -4579,6 +4646,15 @@ const HIST_KEY = "histCollapsed";
 const EMO_LABEL = ["同参考", "情感音频", "向量", "文本"];
 let histItems = [];
 let histCurId = "";
+/* 正在生成/排队的任务快照（来自 /jobs/current），渲染成历史列表的置顶行。
+   刷新页面后这是找回进度与提交配置的入口。 */
+let runningJobEntry = null;
+
+function histRunningMetaText(j) {
+  const pct = Math.round((j.progress || 0) * 100);
+  const stage = j.state === "queued" ? "排队中" : (j.stage_desc || "正在生成");
+  return `生成中 · ${pct}% · ${stage} · 点击还原配置`;
+}
 
 function histSetCollapsed(collapsed, persist = true) {
   histBar.classList.toggle("collapsed", collapsed);
@@ -4615,7 +4691,30 @@ function renderHistory() {
   $("histCount").textContent = histItems.length;
   $("histRailCount").textContent = histItems.length;
   box.replaceChildren();
+  // 生成中的任务置顶：进度由 applyJobSnapshot 实时刷新，点击把这次提交的
+  // 文本与参数还原回表单（不触发 loadResult，和正在推送的进度事件不打架）。
+  if (runningJobEntry) {
+    const rj = runningJobEntry;
+    const row = document.createElement("div");
+    row.className = "hb-item running";
+    row.innerHTML = `<span class="hb-text"></span><span class="hb-meta" id="histRunningMeta"></span>`;
+    const rjText = (rj.params && rj.params.text) || "";
+    row.querySelector(".hb-text").textContent = rjText
+      ? (rjText.length > 40 ? rjText.slice(0, 40) + "…" : rjText)
+      : "(生成中)";
+    row.querySelector(".hb-meta").textContent = histRunningMetaText(rj);
+    row.title = "正在生成 · 点击还原本次提交的文本与参数";
+    row.addEventListener("click", () => {
+      if (rj.params && applyParamsToForm(rj.params)) {
+        showActionHint("已还原生成中的任务配置");
+      } else {
+        showActionHint("这次提交没有可还原的配置");
+      }
+    });
+    box.appendChild(row);
+  }
   if (!histItems.length) {
+    if (runningJobEntry) return;
     const empty = document.createElement("div");
     empty.className = "hb-empty";
     empty.textContent = "暂无记录 · 生成后会保留（最长 14 天）";
@@ -4656,6 +4755,13 @@ function renderHistory() {
       if (it.cand_group) await rebuildCandFromHistory(it.cand_group, it.id);
       else clearCandidates();
       await loadResult(it.url, it.elapsed, it.file);
+      // 顺手把这条记录的生成配置还原回表单：文本（未截断全文）、情感、
+      // 采样参数都在 params 里；没有 params 的旧条目静默跳过。
+      if (it.params && applyParamsToForm(it.params)) {
+        showActionHint(it.params._fallback
+          ? "已载入音频，并还原原文与情感模式（旧记录，采样参数当时未保存）"
+          : "已载入音频，并还原本次生成配置");
+      }
     });
     // 双击保护：第一击删完会重渲染，旧节点脱离 DOM，但第二击的事件可能已经在队列里，
     // 于是对同一条再发一次 DELETE 拿到 404，弹出红色"删除历史失败"（BUG-014）。
@@ -4688,6 +4794,13 @@ async function refreshHistory() {
   try {
     const r = await (await apiFetch("/history")).json();
     histItems = r.items || [];
+    // 「生成中」的任务也进历史列表（置顶行）：刷新页面后进度与提交配置
+    // 都从这里找回。取不到就按没有在跑的任务处理，绝不影响历史本体。
+    try {
+      const jr = await (await apiFetch("/jobs/current?client_id=" + encodeURIComponent(CLIENT_ID))).json();
+      const j = jr.job;
+      runningJobEntry = (j && ["queued", "running", "stop_requested", "stopping"].includes(j.state)) ? j : null;
+    } catch (e) { runningJobEntry = null; }
     $("histAuto").checked = !!r.auto_clean;
     // 写清上限，避免用户以为重启后永远都在：产物本身仍受 14 天保留期约束
     const lim = r.limit || 20;
@@ -7116,16 +7229,21 @@ updateSegments();
 updateGenSummary();
 switchLib(readDraft()?.libTab === "examples" ? "examples" : "presets");
 (async () => {
-  await Promise.all([restoreDraft(), refreshPresets(), loadExamples()]);
+  // 任何一步恢复失败都不能连累后续初始化：restoreJob 曾排在队尾，前面一个
+  // rejection 就让它静默跳过——刷新页面后正在生成的任务在界面上"丢"了
+  //（服务端其实还在跑，只是没人来恢复进度显示）。
+  const guarded = (p) => Promise.resolve(p).catch((e) => console.warn("[index-tts] 初始化恢复失败:", e));
+  await Promise.all([restoreDraft(), refreshPresets(), loadExamples()].map(guarded));
   // restoreDraft 与 refreshPresets 并发，草稿里的预设名可能晚于列表写入，
   // 所以两边都完成后再校验一次
-  pruneMissingPreset();
+  try { pruneMissingPreset(); } catch (e) { console.warn("[index-tts] pruneMissingPreset 失败:", e); }
   // 草稿恢复完再套锁定：锁定优先级最高，且先用本地缓存避免闪一下默认值
-  loadParamLockFromCache();
-  renderLib();
-  restoreJob();
+  try { loadParamLockFromCache(); } catch (e) { console.warn("[index-tts] loadParamLockFromCache 失败:", e); }
+  try { renderLib(); } catch (e) { console.warn("[index-tts] renderLib 失败:", e); }
   loadParamLockFromServer(); // 服务端为准，校正本地缓存
 })();
+// 任务恢复独立调用：不依赖草稿/预设/参数锁任何一步成功。
+restoreJob();
 refreshPmList();
 renderGlossary();
 /* 起始页签跟 URL hash（#gen/#presets/#model/#guide，指南可带章节锚点），刷新后不丢当前页 */

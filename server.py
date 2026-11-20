@@ -164,6 +164,11 @@ parser.add_argument("--port", type=int, default=7860)
 # so it must not be reachable from the LAN unless the user opts in.
 parser.add_argument("--host", type=str, default="127.0.0.1")
 parser.add_argument("--model_dir", type=str, default="./checkpoints")
+# 推理设备。None = infer_v2 自动探测（cuda→xpu→mps→cpu）。
+# 本机实测（Ultra 5 245K，4 Xe 核心核显）：同文本 cpu 30.9s < xpu 39.6s，
+# 核显共享内存带宽且每 token 多一次内核下发，更慢。故 bat 默认 cpu。
+parser.add_argument("--device", type=str, default=None,
+                    help="推理设备：cpu / xpu / cuda:0；缺省为自动探测")
 # 无参数启动时的默认配置与 start_server.bat / WebUI「推荐配置」保持一致：
 # FP16+S2MEL_FP16+W2V_FP16+QWEN_FP16 全开（w2v 省 ~1GB 显存；8G 卡经实测可跑），
 # cuDNN 自动调优关（实测负优化），steps 25 / cfg 0.7
@@ -370,6 +375,7 @@ class LazyTTS:
                             # 实测复用会把 emo_cond_emb 改掉（max|diff|=1.80），
                             # 默认保持关闭以守住「默认无损」；探针见 docs/probes/
                             reuse_spk_for_emo=self.init_kwargs.get("reuse_spk_for_emo", False),
+                            device=self.init_kwargs.get("device"),
                         )
                         t.normalizer = self.normalizer
                         t.tokenizer = self.tokenizer
@@ -593,6 +599,7 @@ tts = LazyTTS(
     vram_tier=cmd_args.vram_tier or "auto",
     cond_cache_enabled=(cmd_args.cond_cache_enabled
                         if cmd_args.cond_cache_enabled is not None else True),
+    device=cmd_args.device,
 )
 
 
@@ -2225,8 +2232,38 @@ def do_tts(
     if inflight >= TTS_QUEUE_MAX:
         raise HTTPException(429, f"排队任务已达上限（{TTS_QUEUE_MAX}），请等待现有任务完成")
     job_id, jobs_ahead = _register_job(client_id)
+    # 本次生成的完整配置随任务存档：/jobs/current 恢复路径与「生成中」历史
+    # 条目靠它还原表单；任务完成后原样进 history.json（_history_add 的
+    # params 参数）。全部是可 JSON 化的标量/列表，_job_public 直接透传。
+    job_params = {
+        "text": text,
+        "emo_mode": mode,
+        "emo_weight": emo_weight,
+        "emo_text": emo_text,
+        "emo_vector": vec,
+        "use_random": bool(use_random),
+        "seed": seed,
+        "max_text_tokens_per_segment": max_text_tokens_per_segment,
+        "max_sentences_per_segment": max_sentences_per_segment,
+        "sentence_boundary_split": sentence_boundary_split,
+        "do_sample": do_sample,
+        "top_p": top_p,
+        "top_k": top_k,
+        "temperature": temperature,
+        "length_penalty": length_penalty,
+        "num_beams": num_beams,
+        "repetition_penalty": repetition_penalty,
+        "max_mel_tokens": max_mel_tokens,
+        "interval_silence": interval_silence,
+        "scenario_id": scenario_id,
+        # 参考音频的文件名（prompts/ 下内容寻址存储，可能被 LRU 清掉，
+        # 还原时 404 由前端提示手选，不算错误）
+        "spk_prompt": os.path.basename(spk_path),
+        "emo_prompt": os.path.basename(emo_ref_path) if emo_ref_path else None,
+    }
     with _JOBS_LOCK:
         stop_event = _JOBS[job_id]["stop_event"]
+        _JOBS[job_id]["params"] = job_params
     logger.info("TTS job %s queued: chars=%d emo_mode=%s ahead=%d naming=%s",
                 job_id, len(text), emo_mode, jobs_ahead, file_naming)
 
@@ -2404,6 +2441,7 @@ def do_tts(
                 entry = _history_add(
                     wav_name, text, elapsed, mode,
                     cand_group=cand_group, cand_index=cand_index, cand_total=cand_total,
+                    params=job_params,
                 )
                 # 触到 max_mel_tokens 上限的生成是静默截断，前端必须提示
                 mel_capped = bool(getattr(model, "mel_tokens_capped", False))
@@ -2917,6 +2955,7 @@ def _history_add(
     cand_group: str = "",
     cand_index: int = -1,
     cand_total: int = 1,
+    params: dict | None = None,
 ) -> dict:
     """Record one successful generation and return the new entry."""
     try:
@@ -2940,6 +2979,10 @@ def _history_add(
         entry["cand_group"] = cand_group
         entry["cand_index"] = int(cand_index)
         entry["cand_total"] = int(cand_total)
+    # 完整生成配置（含未截断的原文）：点历史条目时据此还原表单。
+    # 展示用的 text 仍是 60 字标题，全文只在 params 里，不多占列表渲染。
+    if params:
+        entry["params"] = params
     with _HISTORY_LOCK:
         _history.insert(0, entry)
         victims = []
@@ -2958,16 +3001,57 @@ def _history_add(
 _load_history()
 
 
+def _history_params_fallback(entry: dict) -> dict | None:
+    """旧条目没有 params：从字幕 sidecar 拼回未截断全文 + 情感模式。
+
+    能还原多少算多少（采样参数旧记录本来就没存）；sidecar 缺失/损坏
+    一律返回 None，绝不让一条坏记录把整个历史列表打 500。
+    """
+    try:
+        data = load_sidecar(sidecar_path(SUBTITLE_DIR, entry.get("file") or ""))
+        if not data:
+            return None
+        text = "".join(
+            s.get("text", "") for s in (data.get("segments") or [])
+            if isinstance(s, dict)
+        )
+        if not text:
+            return None
+        return {"text": text, "emo_mode": entry.get("emo_mode", 0), "_fallback": True}
+    except Exception:
+        return None
+
+
 @api.get("/history")
 def history_list():
     with _HISTORY_LOCK:
         items = list(_history)          # 快照：避免边删边读拿到不一致的列表
+    # 旧条目（无 params）现场补一份兜底配置，前端点历史照样能还原文本；
+    # 用副本挂接：读路径不污染内存里的条目，history.json 保持磁盘原样
+    items = [({**it, "params": fb} if (fb := (None if it.get("params") else _history_params_fallback(it))) else it)
+             for it in items]
     return JSONResponse({
         "items": items,
         "limit": HISTORY_LIMIT,
         "auto_clean": _history_auto_clean,
         "count": len(items),
     })
+
+
+@api.get("/prompts/{name}")
+def prompts_audio(name: str):
+    """按文件名回传 prompts/ 下的参考音频（历史/任务配置还原用）。
+
+    只认纯文件名 + .wav 后缀，basename 不一致即 404，不给路径穿越留门。
+    """
+    base = os.path.basename(name)
+    if base != name or not base.lower().endswith(".wav"):
+        raise HTTPException(404, "Not found")
+    path = os.path.join(PROMPTS_DIR, base)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "参考音频已被清理")
+    return FileResponse(path, media_type="audio/wav",
+                        headers={"Cache-Control": "no-cache"})
 
 
 @api.post("/history/config")
