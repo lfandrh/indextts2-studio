@@ -84,6 +84,18 @@ set CUDNN_BENCHMARK=0
 set DIFFUSION_STEPS=25
 set CFG_RATE=0.7
 
+rem DEVICE=cpu     force CPU inference (MEASURED FASTER on this machine:
+rem                  Ultra 5 245K iGPU is 4 Xe cores sharing DDR5 bandwidth,
+rem                  same text: cpu 30.9s vs xpu 39.6s)
+rem DEVICE=xpu     force the Intel iGPU (works, validated, but slower here)
+rem DEVICE=auto    auto-detect (cuda -> xpu -> mps -> cpu)
+rem Can be preset from outside (start_server_xpu.bat does exactly this).
+if not defined DEVICE set DEVICE=cpu
+
+rem Intel XPU: keep the SYCL JIT kernel cache on disk. Without this the first
+rem synthesis after EVERY server start re-compiles kernels and takes minutes.
+set SYCL_CACHE_PERSISTENT=1
+
 rem Build the server args from the config above.
 rem Quoted SET is used everywhere so trailing spaces or & never leak in.
 set "SRV_ARGS=--port %PORT%"
@@ -93,6 +105,7 @@ if "%W2V_FP16%"=="1" (set "SRV_ARGS=%SRV_ARGS% --w2v_fp16") else if "%W2V_FP16%"
 if "%QWEN_FP16%"=="0" set "SRV_ARGS=%SRV_ARGS% --no-qwen_fp16"
 if "%CUDNN_BENCHMARK%"=="1" set "SRV_ARGS=%SRV_ARGS% --cudnn_benchmark"
 set "SRV_ARGS=%SRV_ARGS% --diffusion_steps %DIFFUSION_STEPS% --inference_cfg_rate %CFG_RATE%"
+if /i not "%DEVICE%"=="auto" set "SRV_ARGS=%SRV_ARGS% --device %DEVICE%"
 
 call :find_runner
 if errorlevel 1 goto :no_runner
